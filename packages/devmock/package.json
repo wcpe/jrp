@@ -1,0 +1,24 @@
+{
+  "name": "@jrp/devmock",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./browser": "./src/browser.ts",
+    "./server": "./src/server.ts"
+  },
+  "scripts": {
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "msw": "catalog:"
+  },
+  "devDependencies": {
+    "@jrp/eslint-config": "workspace:*",
+    "@jrp/tsconfig": "workspace:*",
+    "eslint": "catalog:",
+    "typescript": "catalog:"
+  }
+}

@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.x
+          cache-dependency-path: |
+            go.work.sum
+            apps/jrps/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: arduino/setup-task@v3
+        with:
+          version: 3.52.0
+      - run: task workspace:sync
+      - run: task lint:go
+      - run: task test:go
+      - run: task build:go
+
+  web-production:
+    name: Web 与生产构建 / Ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.x
+          cache-dependency-path: |
+            go.work.sum
+            apps/jrps/go.sum
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.11.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: arduino/setup-task@v3
+        with:
+          version: 3.52.0
+      - run: pnpm install --frozen-lockfile
+      - run: task workspace:sync
+      - run: task fmt:check
+      - run: task lint
+      - run: task typecheck
+      - run: task test
+      - run: task build

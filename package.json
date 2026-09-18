@@ -1,0 +1,29 @@
+{
+  "name": "jrp-workspace",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.11.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "dev:web": "turbo run dev --filter @jrp/web",
+    "format": "prettier --write package.json turbo.json pnpm-workspace.yaml Taskfile.yml .github/workflows/ci.yml \"scripts/*.mjs\" \"apps/web/**/*.{html,ts,tsx,css,json}\" \"packages/**/*.{js,ts,tsx,json}\" \"!apps/web/public/**\"",
+    "format:check": "prettier --check package.json turbo.json pnpm-workspace.yaml Taskfile.yml .github/workflows/ci.yml \"scripts/*.mjs\" \"apps/web/**/*.{html,ts,tsx,css,json}\" \"packages/**/*.{js,ts,tsx,json}\" \"!apps/web/public/**\"",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "typecheck": "turbo run typecheck"
+  },
+  "devDependencies": {
+    "prettier": "3.9.5",
+    "turbo": "2.10.13"
+  },
+  "prettier": {
+    "printWidth": 100,
+    "semi": true,
+    "singleQuote": true,
+    "trailingComma": "all",
+    "useTabs": false
+  }
+}

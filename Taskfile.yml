@@ -1,0 +1,159 @@
+version: '3'
+
+tasks:
+  bootstrap:
+    desc: 安装工作区依赖并同步 Go 模块
+    cmds:
+      - task: workspace:sync
+      - pnpm install --frozen-lockfile
+
+  workspace:sync:
+    desc: 同步 Go 工作区依赖
+    aliases:
+      - workspace-sync
+    cmds:
+      - go work sync
+
+  fmt:
+    desc: 格式化 Go 与 Web 工程文件
+    cmds:
+      - node scripts/format-go.mjs --write
+      - pnpm format
+
+  fmt:check:
+    desc: 检查 Go 与 Web 工程文件格式
+    cmds:
+      - node scripts/format-go.mjs --check
+      - pnpm format:check
+
+  lint:go:
+    desc: 检查 Go 格式、静态问题与依赖边界
+    cmds:
+      - node scripts/format-go.mjs --check
+      - task: vet:core
+      - task: vet:jrps
+      - task: vet:jrpc
+      - node scripts/check-dependencies.mjs
+
+  lint:web:
+    desc: 检查 Web 格式与 ESLint 规则
+    cmds:
+      - pnpm format:check
+      - pnpm lint
+
+  lint:
+    desc: 运行全部静态检查
+    cmds:
+      - task: lint:go
+      - task: lint:web
+
+  typecheck:
+    desc: 运行 Web TypeScript 类型检查
+    cmds:
+      - pnpm typecheck
+
+  test:core:
+    desc: 运行 Core 测试
+    dir: core
+    cmds:
+      - go test ./...
+
+  test:jrps:
+    desc: 运行 jrps 回退资源测试
+    dir: apps/jrps
+    cmds:
+      - go test ./...
+
+  test:jrps:webui:
+    desc: 运行 jrps 生产 Web 嵌入测试
+    dir: apps/jrps
+    cmds:
+      - go test -tags webui ./...
+
+  test:jrpc:
+    desc: 运行 jrpc 测试
+    dir: apps/jrpc
+    cmds:
+      - go test ./...
+
+  test:go:
+    desc: 运行全部 Go 测试
+    cmds:
+      - task: test:core
+      - task: test:jrps
+      - task: test:jrpc
+
+  test:web:
+    desc: 运行 Web 测试
+    cmds:
+      - pnpm test
+
+  test:
+    desc: 运行全部测试
+    cmds:
+      - task: test:go
+      - task: test:web
+
+  build:web:
+    desc: 构建 Web 生产资源到 jrps 内嵌目录
+    cmds:
+      - pnpm run build
+
+  build:jrps:
+    desc: 验证并构建内嵌 Web 生产资源的 jrps
+    cmds:
+      - task: build:web
+      - task: test:jrps:webui
+      - node scripts/build.mjs jrps
+
+  build:jrpc:
+    desc: 构建 jrpc
+    cmds:
+      - node scripts/build.mjs jrpc
+
+  build:go:
+    desc: 不依赖前端构建 Go 回退二进制
+    cmds:
+      - node scripts/build.mjs jrps-fallback
+      - node scripts/build.mjs jrpc
+
+  build:
+    desc: 构建 Web、jrps 与 jrpc 生产产物
+    cmds:
+      - task: build:jrps
+      - task: build:jrpc
+
+  dev:jrps:
+    desc: 使用回退页面启动 jrps 开发服务
+    dir: apps/jrps
+    cmds:
+      - go run ./cmd/jrps
+
+  dev:web:
+    desc: 启动 Web 开发服务
+    dir: apps/web
+    cmds:
+      - pnpm dev
+
+  clean:
+    desc: 清理构建与覆盖率产物
+    cmds:
+      - node scripts/clean.mjs
+
+  vet:core:
+    internal: true
+    dir: core
+    cmds:
+      - go vet ./...
+
+  vet:jrps:
+    internal: true
+    dir: apps/jrps
+    cmds:
+      - go vet ./...
+
+  vet:jrpc:
+    internal: true
+    dir: apps/jrpc
+    cmds:
+      - go vet ./...
