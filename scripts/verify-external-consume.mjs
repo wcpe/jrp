@@ -154,7 +154,10 @@ try {
   const env = { ...process.env, GOWORK: 'off', GOFLAGS: '-mod=mod' };
   runCommand('go', ['mod', 'tidy'], { cwd: workdir, env });
   // 校验只导入公共包：internal 路径不得出现在导入表中。
-  const imports = captureCommand('go', ['list', '-f', '{{join .Imports "\\n"}}'], { cwd: workdir, env });
+  const imports = captureCommand('go', ['list', '-f', '{{join .Imports "\\n"}}'], {
+    cwd: workdir,
+    env,
+  });
   const bad = imports
     .split(/\r?\n/u)
     .map((line) => line.trim())
