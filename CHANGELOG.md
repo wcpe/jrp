@@ -25,8 +25,8 @@
 - 引入 pnpm catalog 统一前端第三方依赖版本，并把「包内不得写死版本号」纳入依赖边界检查。
 - 全量审核文档并修复：`core/event` 并入根包以符合 ADR-0012、last-good 归属表述、PRD 验收口径、P1 允许范围补入 FR-25 至 FR-32、端点权威归属、`platform/service` 与 `core/VERSION` 的时态。
 - 架构文档补入 `platform/service` 作为 Core 与 apps 之外的第三个位置，并新增对应依赖规则。
-- Core 新增类型化配置构建器与校验 API（FR-32）：`core.NewClientConfig`、`core.NewServerConfig` 以选项函数组合客户端与服务端配置，构建末尾执行全量校验并聚合错误，供嵌入宿主在交给 Engine 前预检。
-- 配置值不可变：字段私有并只提供读取方法，读取集合返回深复制副本，宿主持有的入参切片在构建时即被复制。
-- 校验失败返回可判定的聚合错误：哨兵 `core.ErrConfigInvalid` 配合 `core.ConfigError` 的九类错误码与稳定字段路径，错误消息不回显 token 原文。
-- 新增 Core 导出上限常量 `MaxProxyCount`、`MaxClientCredentialCount`、`MaxProxyNameLength` 与默认时间常量 `DefaultHeartbeat`、`DefaultTimeout`；上限取值按 NFR 规模基线（200 客户端、2,000 代理）确定且宿主不可配置。
-- 依赖边界检查新增 Core 源码扫描：禁止 `os.Getenv`、`os.Open`、`os.ReadFile` 与 `database/sql`，保证 Core 不读取环境变量、文件或数据库。
+- 依赖边界检查新增 Core 源码扫描：禁止 `os.Getenv`、`os.Open`、`os.ReadFile` 与 `database/sql`，保证 Core 不读取环境变量、文件或数据库（只约束生产源码，不约束测试）。
+- 交付 FR-04 wire v1/v2 编解码：v1 帧编解码、带回放能力的预读版本判定、v2 帧头与 hello 协商、降级与拒绝判定表、加密/压缩状态机、有界缓冲池与统一拒绝出口。
+- 补充 FR-04 分层测试：字节层黄金帧、边界长度、畸形输入、状态机迁移、v1/v2 同端口共存与模糊测试入口。
+- 修正 `docs/PROTOCOL.md` 的 wire v2 契约：经黑盒取证确认版本魔数为 7 字节 `FRP\x00\x02\r\n`（原文档未记录取值），并补入 §3.1 已登记消息类型表。
+- 修正 `docs/specs/wire-v1-v2-codec.md` §3.4 的 hello 结构描述：能力集合按 `capabilities` 与 `selected` 嵌套分组承载，原规格未记录该结构。

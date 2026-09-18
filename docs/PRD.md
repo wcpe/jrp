@@ -45,7 +45,7 @@ frp 以配置文件为中心，适合直接部署，但个人与小团队在多�
 | FR-01 | 建立独立 Core、jrps、jrpc 与 Web 边界，并由 go.work 编排三个 Go module | P1 | 计划 |
 | FR-02 | 提供首次初始化和单管理员认证，不引入多管理员或 RBAC | P1 | 计划 |
 | FR-03 | `jrps` 接受固定兼容基线下的官方 frpc 连接 | P1 | 计划 |
-| FR-04 | Core 支持 wire v1 与 wire v2，具备明确协商、降级和拒绝行为 | P1 | 计划 |
+| FR-04 | Core 支持 wire v1 与 wire v2，具备明确协商、降级和拒绝行为 | P1 | 开发中 |
 | FR-05a | 支持 TCP 连接传输（不引入第三方依赖） | P1 | 计划 |
 | FR-05b | 支持 WebSocket 与 WSS 连接传输（依赖 `golang.org/x/net`，待批准引入） | P1 | 计划 |
 | FR-05c | 支持 KCP 与 QUIC 连接传输（依赖 `kcp-go`、`quic-go`，待批准引入） | P1 | 计划 |
