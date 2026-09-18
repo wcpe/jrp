@@ -94,7 +94,13 @@ func sliceConfigs(t *testing.T, control netip.AddrPort, target netip.AddrPort, g
 		core.WithListen(core.BindEndpoint{Address: control, Transport: core.TransportTCP}),
 		core.WithWire(core.WireV1),
 		core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: testClientToken}),
-		core.WithTCPProxyBinding(core.TCPProxyBinding{Name: testProxyName, ClientID: testClientID, RemotePort: guestPort}),
+		core.WithTCPProxyBinding(core.TCPProxyBinding{
+			Name:       testProxyName,
+			ClientID:   testClientID,
+			RemotePort: guestPort,
+			// 目标地址允许集合：目标即本地回显服务的实际地址，与客户端声明一致。
+			AllowedTargets: []netip.AddrPort{target},
+		}),
 		core.WithServerHeartbeat(200*time.Millisecond),
 		core.WithServerTimeout(2*time.Second),
 	)

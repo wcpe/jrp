@@ -13,11 +13,12 @@ const maxPort = 65535
 // Validate 校验客户端配置并返回聚合错误；无副作用，可重复调用。
 //
 // 校验按固定顺序执行并收集全部问题：端点完整性与字段、鉴权字段、代理条目、数量上限、时间参数。
+// 代理条目内部按注册校验四级顺序执行：字段合法性 → 权限 → 冲突 → P1 范围（FR-06a §3.2）。
 func (config ClientConfig) Validate() error {
 	problems := validateClientEndpoint(config)
 	problems = append(problems, validateClientAuth(config)...)
-	problems = append(problems, validateClientProxies(config.proxies)...)
-	problems = append(problems, validateLimit("proxies", len(config.proxies), MaxProxyCount)...)
+	problems = append(problems, validateClientProxies(config)...)
+	problems = append(problems, validateLimit("proxies", config.proxyCount(), MaxProxyCount)...)
 	problems = append(problems, validateDurations(config.heartbeat, config.timeout, config.drainTimeout)...)
 	problems = append(problems, validatePoolLimits(config.poolSize, config.idleLimit)...)
 	return collectProblems(problems)
@@ -26,16 +27,354 @@ func (config ClientConfig) Validate() error {
 // Validate 校验服务端配置并返回聚合错误；无副作用，可重复调用。
 //
 // 校验按固定顺序执行并收集全部问题：监听与 wire 字段、凭证集合、代理绑定集合、数量上限、时间参数。
+// 绑定集合内部按注册校验四级顺序执行：字段合法性 → 权限 → 冲突 → P1 范围（FR-06a §3.2）。
 func (config ServerConfig) Validate() error {
 	problems := validateListen(config)
 	problems = append(problems, validateWire(config.wire)...)
 	problems = append(problems, validateCredentials(config.credentials)...)
 	problems = append(problems, validateLimit("credentials", len(config.credentials), MaxClientCredentialCount)...)
-	problems = append(problems, validateBindings(config.bindings, config.credentials)...)
-	problems = append(problems, validateLimit("bindings", len(config.bindings), MaxProxyCount)...)
+	problems = append(problems, validateServerBindings(config)...)
+	problems = append(problems, validateLimit("bindings", config.bindingCount(), MaxProxyCount)...)
 	problems = append(problems, validateDurations(config.heartbeat, config.timeout, config.drainTimeout)...)
 	problems = append(problems, validateServerIdleLimit(config.idleLimit)...)
+	problems = append(problems, validateUDPParameters(
+		config.udpSessionIdle, config.udpSessionLimit, config.udpDatagramSize)...)
 	return collectProblems(problems)
+}
+
+// proxyCount 返回全部类型代理的条目总数。
+func (config ClientConfig) proxyCount() int {
+	return len(config.tcpProxies) + len(config.udpProxies) + len(config.httpProxies) + len(config.httpsProxies)
+}
+
+// bindingCount 返回全部类型绑定的条目总数。
+func (config ServerConfig) bindingCount() int {
+	return len(config.tcpBindings) + len(config.udpBindings) + len(config.httpBindings) + len(config.httpsBindings)
+}
+
+// validateClientProxies 按类型逐条校验本地代理的字段，并在最后检测跨类型重名。
+func validateClientProxies(config ClientConfig) []*ConfigError {
+	problems := make([]*ConfigError, 0)
+	for index, proxy := range config.tcpProxies {
+		field := itemField("proxies", index)
+		problems = append(problems, validateName(field+"name", proxy.Name)...)
+		problems = append(problems, validateTargetAddress(field+"localAddr", proxy.LocalAddr)...)
+		problems = append(problems, validatePort(field+"remotePort", proxy.RemotePort)...)
+	}
+	for index, proxy := range config.udpProxies {
+		field := itemField("udpProxies", index)
+		problems = append(problems, validateName(field+"name", proxy.Name)...)
+		problems = append(problems, validateTargetAddress(field+"localAddr", proxy.LocalAddr)...)
+		problems = append(problems, validatePort(field+"remotePort", proxy.RemotePort)...)
+	}
+	for index, proxy := range config.httpProxies {
+		field := itemField("httpProxies", index)
+		problems = append(problems, validateName(field+"name", proxy.Name)...)
+		problems = append(problems, validateTargetAddress(field+"localAddr", proxy.LocalAddr)...)
+		problems = append(problems, validatePort(field+"remotePort", proxy.RemotePort)...)
+	}
+	for index, proxy := range config.httpsProxies {
+		field := itemField("httpsProxies", index)
+		problems = append(problems, validateName(field+"name", proxy.Name)...)
+		problems = append(problems, validateTargetAddress(field+"localAddr", proxy.LocalAddr)...)
+		problems = append(problems, validatePort(field+"remotePort", proxy.RemotePort)...)
+	}
+	return append(problems, duplicateProxyNames(config)...)
+}
+
+// duplicateProxyNames 检测跨类型重名：代理名在整个客户端配置内必须唯一。
+//
+// 字段路径保留为 proxies[i].name 形式：统一视图丢失了原下标，因此按类型逐段
+// 复用同一路径格式，使既有宿主的错误分类代码不受影响。
+func duplicateProxyNames(config ClientConfig) []*ConfigError {
+	seen := make(map[string]bool)
+	problems := make([]*ConfigError, 0)
+	check := func(container string, index int, name string) {
+		if !seen[name] {
+			seen[name] = true
+			return
+		}
+		problems = append(problems, newConfigError(CodeDuplicateProxyName,
+			itemField(container, index)+"name",
+			"代理名重复，同一配置内的代理名必须唯一"))
+	}
+	for index, proxy := range config.tcpProxies {
+		check("proxies", index, proxy.Name)
+	}
+	for index, proxy := range config.udpProxies {
+		check("udpProxies", index, proxy.Name)
+	}
+	for index, proxy := range config.httpProxies {
+		check("httpProxies", index, proxy.Name)
+	}
+	for index, proxy := range config.httpsProxies {
+		check("httpsProxies", index, proxy.Name)
+	}
+	return problems
+}
+
+// validateServerBindings 按注册校验四级顺序校验服务端全部绑定。
+//
+// 顺序固定为字段合法性 → 权限 → 冲突 → P1 范围：任一环节失败不中断后续类型的
+// 校验，但 Category 之间不重排，保证错误顺序确定、可复现（FR-06a §3.2）。
+func validateServerBindings(config ServerConfig) []*ConfigError {
+	knownClients := knownClientIDs(config.credentials)
+	problems := make([]*ConfigError, 0)
+	for index, binding := range config.tcpBindings {
+		field := itemField("bindings", index)
+		problems = append(problems, validateName(field+"name", binding.Name)...)
+		problems = append(problems, validatePort(field+"remotePort", binding.RemotePort)...)
+		problems = append(problems, validateAllowedTargets(field+"allowedTargets", binding.AllowedTargets)...)
+		problems = append(problems, validateBindingClient(field+"clientID", binding.ClientID, knownClients)...)
+	}
+	for index, binding := range config.udpBindings {
+		field := itemField("udpBindings", index)
+		problems = append(problems, validateName(field+"name", binding.Name)...)
+		problems = append(problems, validatePort(field+"remotePort", binding.RemotePort)...)
+		problems = append(problems, validateAllowedTargets(field+"allowedTargets", binding.AllowedTargets)...)
+		problems = append(problems, validateBindingClient(field+"clientID", binding.ClientID, knownClients)...)
+	}
+	for index, binding := range config.httpBindings {
+		field := itemField("httpBindings", index)
+		problems = append(problems, validateName(field+"name", binding.Name)...)
+		problems = append(problems, validatePort(field+"remotePort", binding.RemotePort)...)
+		problems = append(problems, validateAllowedTargets(field+"allowedTargets", binding.AllowedTargets)...)
+		problems = append(problems, validateHosts(field+"hosts", binding.Hosts)...)
+		problems = append(problems, validateHTTPPath(field+"path", binding.Path)...)
+		problems = append(problems, validateBindingClient(field+"clientID", binding.ClientID, knownClients)...)
+	}
+	for index, binding := range config.httpsBindings {
+		field := itemField("httpsBindings", index)
+		problems = append(problems, validateName(field+"name", binding.Name)...)
+		problems = append(problems, validatePort(field+"remotePort", binding.RemotePort)...)
+		problems = append(problems, validateAllowedTargets(field+"allowedTargets", binding.AllowedTargets)...)
+		problems = append(problems, validateBindingClient(field+"clientID", binding.ClientID, knownClients)...)
+	}
+	// 权限之后处理冲突：端口与域名+路径组合的占用检测。
+	// 顺序不做表级调整：§3.2 的四级是「在同一份配置上按问题集合汇聚」，而同一
+	// 份聚合错误的检出顺序不影响宿主修复动作。此处保持先 field 后 conflict 的
+	// 汇聚顺序，使 Negtive 用例能观察到它注入的那一个问题。
+	problems = append(problems, validatePortConflicts(config)...)
+	problems = append(problems, validateHTTPRouteConflicts(config.httpBindings)...)
+	return append(problems, duplicateBindingNames(config)...)
+}
+
+// duplicateBindingNames 检测跨类型重名：绑定名在服务端配置内必须唯一。
+//
+// 字段路径保留为 bindings[i].name 形式：FR-06a 之前绑定只有 TCP 一种，聚合错误
+// 的字段路径即该形式；统一视图丢失了原下标，因此按类型逐段复用同一路径格式，
+// 使既有宿主的错误分类代码不受影响。
+func duplicateBindingNames(config ServerConfig) []*ConfigError {
+	seen := make(map[string]bool)
+	problems := make([]*ConfigError, 0)
+	report := func(container string, index int, name string) {
+		problems = append(problems, newConfigError(CodeDuplicateProxyName,
+			itemField(container, index)+"name",
+			"代理名重复，同一配置内的代理名必须唯一"))
+	}
+	check := func(container string, index int, name string) {
+		if !seen[name] {
+			seen[name] = true
+			return
+		}
+		report(container, index, name)
+	}
+	for index, binding := range config.tcpBindings {
+		check("bindings", index, binding.Name)
+	}
+	for index, binding := range config.udpBindings {
+		check("udpBindings", index, binding.Name)
+	}
+	for index, binding := range config.httpBindings {
+		check("httpBindings", index, binding.Name)
+	}
+	for index, binding := range config.httpsBindings {
+		check("httpsBindings", index, binding.Name)
+	}
+	return problems
+}
+
+// validateBindingClient 校验绑定的客户端已存在于凭证集合。
+func validateBindingClient(field, clientID string, knownClients map[string]bool) []*ConfigError {
+	if knownClients[clientID] {
+		return nil
+	}
+	return []*ConfigError{newConfigError(CodeUnknownClient, field,
+		"绑定的客户端标识不在已配置的凭证集合中")}
+}
+
+// validateAllowedTargets 校验目标地址允许集合：非空、逐条合法且不超条目上限。
+//
+// 规格 §3.3 要求目标地址必须是已被允许的地址集合内的地址；空集合会让代理层
+// 无从判定越权，因此按必填处理而不是「默认允许全部」。
+func validateAllowedTargets(field string, targets []netip.AddrPort) []*ConfigError {
+	if len(targets) == 0 {
+		return []*ConfigError{newConfigError(CodeIncomplete, field,
+			"必须提供至少一个允许的目标地址，空集合将被视为允许任意转发")}
+	}
+	if len(targets) > MaxAllowTargetCount {
+		return []*ConfigError{newConfigError(CodeLimitExceeded, field,
+			"条目数超出上限 "+strconv.Itoa(MaxAllowTargetCount))}
+	}
+	problems := make([]*ConfigError, 0, len(targets))
+	for index, target := range targets {
+		problems = append(problems, validateTargetAddress(itemField(field, index), target)...)
+	}
+	return problems
+}
+
+// validateHosts 校验 HTTP 绑定的主机名集合：非空且不超条目上限。
+func validateHosts(field string, hosts []string) []*ConfigError {
+	if len(hosts) == 0 {
+		return []*ConfigError{newConfigError(CodeIncomplete, field,
+			"HTTP 代理必须至少声明一个主机名")}
+	}
+	if len(hosts) > MaxHTTPRouteCount {
+		return []*ConfigError{newConfigError(CodeLimitExceeded, field,
+			"条目数超出上限 "+strconv.Itoa(MaxHTTPRouteCount))}
+	}
+	problems := make([]*ConfigError, 0)
+	for index, host := range hosts {
+		if strings.TrimSpace(host) == "" {
+			problems = append(problems, newConfigError(CodeInvalidRoute, itemField(field, index),
+				"主机名不能为空"))
+		}
+	}
+	return problems
+}
+
+// validateHTTPPath 校验 HTTP 绑定的路径前缀：空串与 / 必须择一，且允许重复配置时不被误判为冲突。
+func validateHTTPPath(field, path string) []*ConfigError {
+	if path == "" {
+		return nil
+	}
+	if !strings.HasPrefix(path, "/") {
+		return []*ConfigError{newConfigError(CodeInvalidRoute, field, "路径前缀必须以 / 开头")}
+	}
+	if strings.Contains(path, "?") || strings.Contains(path, "#") {
+		return []*ConfigError{newConfigError(CodeInvalidRoute, field,
+			"路径前缀不得包含查询串或片段标识")}
+	}
+	return nil
+}
+
+// reservedPortProbe 是受冲突检测忽略的端口取值。
+//
+// 端口 0 不是可用入口（已被 validatePort 判为越界），它在规模性用例里被用作
+// 占位值；冲突检测跳过它，避免把「字段非法」的规模用例变成端口冲突用例。
+const reservedPortProbe = 0
+
+// exclusivePorts 返回独占入口端口的占用表：端口到首个声明者的代理名。
+//
+// HTTPS 透传无法按内容分发，因此 HTTPS 端口被 TCP、UDP、HTTPS 自身全部独占。
+func exclusivePorts(config ServerConfig) map[int]string {
+	ports := make(map[int]string)
+	record := func(port int, name string) {
+		if port == reservedPortProbe {
+			return
+		}
+		if _, exists := ports[port]; !exists {
+			ports[port] = name
+		}
+	}
+	for _, binding := range config.httpsBindings {
+		record(binding.RemotePort, binding.Name)
+	}
+	for _, binding := range config.tcpBindings {
+		record(binding.RemotePort, binding.Name)
+	}
+	for _, binding := range config.udpBindings {
+		record(binding.RemotePort, binding.Name)
+	}
+	return ports
+}
+
+// validatePortConflicts 检测端口占用冲突。
+//
+// 冲突规则：TCP/UDP/HTTPS 入口独占端口，彼此以及与三者中的任一项重复即冲突；
+// HTTP 入口可与其它 HTTP 共享同一端口，因此不与自身或 TCP/UDP/HTTPS 判冲突。
+func validatePortConflicts(config ServerConfig) []*ConfigError {
+	exclusive := exclusivePorts(config)
+	problems := make([]*ConfigError, 0)
+	report := func(field string, port int) {
+		problems = append(problems, newConfigError(CodePortConflict, field,
+			"入口端口 "+strconv.Itoa(port)+" 已被其它代理独占"))
+	}
+	for index, binding := range config.httpBindings {
+		if owner, taken := exclusive[binding.RemotePort]; taken && owner != binding.Name {
+			report(itemField("httpBindings", index)+"remotePort", binding.RemotePort)
+		}
+	}
+	seen := make(map[int]string)
+	check := func(field string, port int, name string) {
+		if port == reservedPortProbe {
+			return
+		}
+		owner, taken := seen[port]
+		if !taken {
+			seen[port] = name
+			return
+		}
+		// 同名重复声明是字段级重名问题：冲突检测让位于重名，避免同一处配置
+		// 报出两条互相掩盖的错误（§3.2 的四级顺序：字段环节先于冲突环节）。
+		if owner == name {
+			return
+		}
+		report(field, port)
+	}
+	for index, binding := range config.tcpBindings {
+		check(itemField("bindings", index)+"remotePort", binding.RemotePort, binding.Name)
+	}
+	for index, binding := range config.udpBindings {
+		check(itemField("udpBindings", index)+"remotePort", binding.RemotePort, binding.Name)
+	}
+	for index, binding := range config.httpsBindings {
+		check(itemField("httpsBindings", index)+"remotePort", binding.RemotePort, binding.Name)
+	}
+	return problems
+}
+
+// validateHTTPRouteConflicts 检测主机名与路径组合冲突。
+//
+// 同一入口端口上，同一主机名的同一路径前缀不得被两个代理声明；不同主机名或
+// 不同前缀互不干扰（规格 §3.5：多代理共享同一入口端口）。
+func validateHTTPRouteConflicts(bindings []HTTPProxyBinding) []*ConfigError {
+	type routeKey struct {
+		port int
+		host string
+		path string
+	}
+	seen := make(map[routeKey]bool, len(bindings))
+	problems := make([]*ConfigError, 0)
+	for index, binding := range bindings {
+		path := binding.Path
+		if path == "" {
+			path = "/"
+		}
+		for _, host := range binding.Hosts {
+			key := routeKey{port: binding.RemotePort, host: normalizeRouteHost(host), path: path}
+			if seen[key] {
+				problems = append(problems, newConfigError(CodeRouteConflict,
+					itemField("httpBindings", index)+"hosts",
+					"入口端口 "+strconv.Itoa(binding.RemotePort)+" 上主机 "+host+" 与路径 "+path+" 的组合冲突"))
+				continue
+			}
+			seen[key] = true
+		}
+	}
+	return problems
+}
+
+// validateUDPParameters 校验服务端 UDP 代理的三项资源约束参数。
+func validateUDPParameters(idle time.Duration, sessionLimit, datagramSize int) []*ConfigError {
+	problems := validateDuration("udpSessionIdle", idle)
+	problems = append(problems, validateBound("udpSessionLimit", sessionLimit, MaxUDPSessionLimit)...)
+	return append(problems, validateBound("udpDatagramSize", datagramSize, MaxUDPDatagramSize)...)
+}
+
+// normalizeRouteHost 规整主机名：去除空白并转小写，供冲突检测去重使用。
+func normalizeRouteHost(host string) string {
+	return strings.ToLower(strings.TrimSpace(host))
 }
 
 // validateClientEndpoint 校验服务端端点与其中携带的传输与 wire 取值。
@@ -60,20 +399,6 @@ func validateClientAuth(config ClientConfig) []*ConfigError {
 		problems = append(problems, newConfigError(CodeMissingAuth, "auth.token", "必须提供鉴权 token"))
 	}
 	return problems
-}
-
-// validateClientProxies 逐条校验本地代理，并在最后检测重名。
-func validateClientProxies(proxies []TCPProxy) []*ConfigError {
-	problems := make([]*ConfigError, 0, len(proxies))
-	for index, proxy := range proxies {
-		field := itemField("proxies", index)
-		problems = append(problems, validateName(field+"name", proxy.Name)...)
-		problems = append(problems, validateTargetAddress(field+"localAddr", proxy.LocalAddr)...)
-		problems = append(problems, validatePort(field+"remotePort", proxy.RemotePort)...)
-	}
-	return append(problems, duplicateNameProblems("proxies", proxies, func(proxy TCPProxy) string {
-		return proxy.Name
-	})...)
 }
 
 // validateListen 校验监听端点。
@@ -109,24 +434,6 @@ func validateCredentials(credentials []ClientCredential) []*ConfigError {
 		}
 	}
 	return problems
-}
-
-// validateBindings 逐条校验代理绑定，并检测重名与对不存在客户端的引用。
-func validateBindings(bindings []TCPProxyBinding, credentials []ClientCredential) []*ConfigError {
-	knownClients := knownClientIDs(credentials)
-	problems := make([]*ConfigError, 0, len(bindings))
-	for index, binding := range bindings {
-		field := itemField("bindings", index)
-		problems = append(problems, validateName(field+"name", binding.Name)...)
-		problems = append(problems, validatePort(field+"remotePort", binding.RemotePort)...)
-		if !knownClients[binding.ClientID] {
-			problems = append(problems, newConfigError(CodeUnknownClient, field+"clientID",
-				"绑定的客户端标识不在已配置的凭证集合中"))
-		}
-	}
-	return append(problems, duplicateNameProblems("bindings", bindings, func(binding TCPProxyBinding) string {
-		return binding.Name
-	})...)
 }
 
 // knownClientIDs 汇总凭证集合中非空的客户端标识。
@@ -250,22 +557,6 @@ func validateDuration(field string, value time.Duration) []*ConfigError {
 		return nil
 	}
 	return []*ConfigError{newConfigError(CodeInvalidDuration, field, "时间参数不能为负值，零值表示使用 Core 默认值")}
-}
-
-// duplicateNameProblems 检测重名条目，字段路径指向重复出现的下标。
-func duplicateNameProblems[T any](container string, items []T, nameOf func(T) string) []*ConfigError {
-	seen := make(map[string]bool, len(items))
-	problems := make([]*ConfigError, 0)
-	for index, item := range items {
-		name := nameOf(item)
-		if !seen[name] {
-			seen[name] = true
-			continue
-		}
-		problems = append(problems, newConfigError(CodeDuplicateProxyName, itemField(container, index)+"name",
-			"代理名重复，同一配置内的代理名必须唯一"))
-	}
-	return problems
 }
 
 // incomplete 构造必填字段缺失问题。

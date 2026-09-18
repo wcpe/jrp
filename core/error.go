@@ -28,6 +28,12 @@ const (
 	CodeUnsupportedValue ErrorCode = "unsupported_value"
 	// CodeUnknownClient 表示服务端代理绑定引用了不存在的客户端标识。
 	CodeUnknownClient ErrorCode = "unknown_client"
+	// CodePortConflict 表示入口端口已被其它代理独占，对应注册校验的冲突环节。
+	CodePortConflict ErrorCode = "port_conflict"
+	// CodeRouteConflict 表示同一入口端口上主机名与路径组合重复。
+	CodeRouteConflict ErrorCode = "route_conflict"
+	// CodeInvalidRoute 表示 HTTP 路由项的主机名或路径前缀非法。
+	CodeInvalidRoute ErrorCode = "invalid_route"
 	// CodeInvalidDuration 表示心跳或超时为负值。
 	CodeInvalidDuration ErrorCode = "invalid_duration"
 	// CodeLimitExceeded 表示条目数量或名称长度超出 Core 常量上限。

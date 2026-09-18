@@ -8,10 +8,12 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
 	"github.com/wcpe/jrp/core"
+	"github.com/wcpe/jrp/core/internal/proxy"
 	"github.com/wcpe/jrp/core/internal/transport"
 	"github.com/wcpe/jrp/core/internal/wire"
 )
@@ -480,9 +482,10 @@ func (engine *Engine) failAbnormal(err error) {
 //
 // 每个代理独立循环：先占用池槽位（受池上限约束），再建链、声明归属并服务
 // 转发；连接结束后释放槽位并重建下一条。停止时全部待命连接随 Engine 一起关闭。
+// 四种代理共用本循环：差异只在本地目标的网络类型与转发形态。
 func (engine *Engine) maintainWorkConns(endpoint core.ServerEndpoint) {
 	defer engine.wg.Done()
-	for _, proxy := range engine.config.Proxies() {
+	for _, proxy := range engine.config.AllProxies() {
 		engine.wg.Add(1)
 		go engine.maintainOneProxy(endpoint, proxy)
 	}
@@ -492,7 +495,10 @@ func (engine *Engine) maintainWorkConns(endpoint core.ServerEndpoint) {
 //
 // 池槽位在整条工作连接的生命周期内持有：达到池上限时本循环退避后重试，
 // 绝不无限等待也不静默放弃（规格 §3.5）。
-func (engine *Engine) maintainOneProxy(endpoint core.ServerEndpoint, proxy core.TCPProxy) {
+// UDP 会话长期占用一条工作连接，若等它结束再建下一条，第二个对端将永远拿
+// 不到连接。因此 UDP 代理的转发交给独立 goroutine，本循环只负责持续补充待命
+// 连接，二者的生命周期解耦。
+func (engine *Engine) maintainOneProxy(endpoint core.ServerEndpoint, proxy core.ClientProxy) {
 	defer engine.wg.Done()
 	for {
 		select {
@@ -500,7 +506,7 @@ func (engine *Engine) maintainOneProxy(endpoint core.ServerEndpoint, proxy core.
 			return
 		default:
 		}
-		slot, err := engine.pool.Acquire(context.Background(), proxy.Name)
+		slot, err := engine.pool.Acquire(context.Background(), proxy.ProxyName())
 		if err != nil {
 			// 池已满：退避后重试，避免忙循环。
 			select {
@@ -510,14 +516,26 @@ func (engine *Engine) maintainOneProxy(endpoint core.ServerEndpoint, proxy core.
 				continue
 			}
 		}
+		if proxy.Type() == core.ProxyTypeUDP {
+			engine.wg.Add(1)
+			go func() {
+				defer engine.wg.Done()
+				defer slot.Release()
+				engine.serveOneWorkConn(endpoint, proxy)
+			}()
+			continue
+		}
 		engine.serveOneWorkConn(endpoint, proxy)
 		slot.Release()
 	}
 }
 
 // serveOneWorkConn 建链、声明归属并服务一条工作连接，直到连接结束。
-func (engine *Engine) serveOneWorkConn(endpoint core.ServerEndpoint, proxy core.TCPProxy) {
-	work, err := engine.dial(context.Background(), endpoint.Address.String(), transport.PurposeWork, proxy.Name)
+//
+// 声明载荷携带本地目标地址：服务端据此判定目标是否在该客户端被允许的地址
+// 集合内，越权即拒绝（FR-06a §3.3）。
+func (engine *Engine) serveOneWorkConn(endpoint core.ServerEndpoint, proxy core.ClientProxy) {
+	work, err := engine.dial(context.Background(), endpoint.Address.String(), transport.PurposeWork, proxy.ProxyName())
 	if err != nil {
 		select {
 		case <-engine.stopCh:
@@ -525,23 +543,28 @@ func (engine *Engine) serveOneWorkConn(endpoint core.ServerEndpoint, proxy core.
 		}
 		return
 	}
-	if err := declareWorkConn(work, proxy.Name); err != nil {
+	if err := declareWorkConn(work, proxy.ProxyName(), proxy.ProxyLocalAddr()); err != nil {
 		_ = work.Close()
 		return
 	}
-	// 声明已发送：服务端暂存该连接等待访客，本端拨号本地目标后进入双向转发。
+	// 声明已发送：服务端暂存该连接等待访客，本端拨号本地目标后进入转发。
 	engine.track(work)
-	engine.serveWorkConn(work, proxy.LocalAddr.String())
+	engine.serveWorkConn(work, proxy)
 	engine.untrack(work)
 	_ = work.Close()
 }
 
-// serveWorkConn 把一条已声明归属的工作连接桥接到本地目标。
+// serveWorkConn 把一条已声明归属的工作连接桥接或会话化到本地目标。
 //
-// 本地目标的拨号同样带配置超时，禁止无超时拨号。任一方向结束即关闭两端并
-// 返回，调用方负责释放池槽位并重建下一条待命连接。
-func (engine *Engine) serveWorkConn(work *transport.Conn, target string) {
-	targetConn, err := engine.dialer.Dial(context.Background(), target, transport.PurposeWork)
+// UDP 代理的本地目标是数据报语义，因此按会话形态转发而非字节流桥接
+// （规格 §3.4：不得用 TCP 的关闭语义推断 UDP 状态）。
+// 本地目标的拨号同样带配置超时，禁止无超时拨号。
+func (engine *Engine) serveWorkConn(work *transport.Conn, proxy core.ClientProxy) {
+	if proxy.Type() == core.ProxyTypeUDP {
+		engine.serveUDPWorkConn(work, proxy.ProxyLocalAddr())
+		return
+	}
+	targetConn, err := engine.dialer.Dial(context.Background(), proxy.ProxyLocalAddr().String(), transport.PurposeWork)
 	if err != nil {
 		return
 	}
@@ -549,9 +572,40 @@ func (engine *Engine) serveWorkConn(work *transport.Conn, target string) {
 	transport.Bridge(engine.stopCtx, work, targetConn)
 }
 
-// declareWorkConn 在新建的工作连接首帧声明代理归属，供服务端配对访客。
-func declareWorkConn(work *transport.Conn, proxyName string) error {
-	body, err := json.Marshal(map[string]string{"run_id": proxyName, "proxy_name": proxyName})
+// serveUDPWorkConn 把一条工作连接上的数据报往返转发到本地 UDP 目标。
+//
+// UDP 会话是长驻的：它会一直服务到会话空闲回收，不像 TCP 转发那样随任一端
+// 关闭而自然结束。因此这里必须显式响应停止信号：由 stopCh 与转发上下文共同
+// 收口，避免 Shutdown 被一条长驻会话悬挂。
+func (engine *Engine) serveUDPWorkConn(work *transport.Conn, target netip.AddrPort) {
+	socket, err := engine.dialer.DialUDP(target)
+	if err != nil {
+		return
+	}
+	defer func() { _ = socket.Close() }()
+
+	sessionCtx, stop := context.WithCancel(engine.stopCtx)
+	defer stop()
+	go func() {
+		// Engine 停止即关闭会话两侧的承载连接：会话无处可退，必须显式收口。
+		select {
+		case <-engine.stopCh:
+			_ = socket.Close()
+			stop()
+		case <-sessionCtx.Done():
+		}
+	}()
+	proxy.ServeUDPClient(work, socket, sessionCtx)
+}
+
+// declareWorkConn 在新建的工作连接首帧声明代理归属与本地目标地址，
+// 供服务端配对访客并校验目标地址是否在允许集合内（FR-06a §3.3）。
+func declareWorkConn(work *transport.Conn, proxyName string, target netip.AddrPort) error {
+	body, err := json.Marshal(workConnRequest{
+		RunID:  proxyName,
+		Proxy:  proxyName,
+		Target: target.String(),
+	})
 	if err != nil {
 		return err
 	}
@@ -561,4 +615,14 @@ func declareWorkConn(work *transport.Conn, proxyName string) error {
 	}
 	_, err = work.Write(encoded)
 	return err
+}
+
+// workConnRequest 是客户端向服务端声明新建工作连接的载荷。
+//
+// target 承载本条工作连接最终转发到的本地目标地址，服务端据此判定目标是否在
+// 该客户端被允许的地址集合内（FR-06a §3.3）。
+type workConnRequest struct {
+	RunID  string `json:"run_id"`
+	Proxy  string `json:"proxy_name"`
+	Target string `json:"target_addr"`
 }

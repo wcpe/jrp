@@ -105,6 +105,14 @@ func untrackBoth(untrack func(*transport.Conn), guest, work *transport.Conn) {
 	untrack(work)
 }
 
+// takeStaged 取出一条指定代理的待命工作连接；队列为空时返回 nil。
+//
+// UDP 会话需要一条独占的工作连接，因此直接索取而不经过访客配对：取不到即
+// 拒绝新会话并计数，绝不无限等待（规格 §3.5）。
+func (broker *workBroker) takeStaged(proxyName string) *transport.Conn {
+	return broker.works.Take(proxyName)
+}
+
 // closeStaged 关闭尚未配对的暂存连接并拒绝后续配对。
 //
 // 已配对并进入桥接的连接不在此处理：它们承载活动流，由 Engine 按排水上限
@@ -126,7 +134,11 @@ func (broker *workBroker) closeStaged() {
 }
 
 // workConnRequest 是客户端向服务端声明新建工作连接的载荷。
+//
+// Target 承载该工作连接最终转发到的本地目标地址，供服务端判定目标是否在该
+// 客户端被允许的地址集合内（FR-06a §3.3）。
 type workConnRequest struct {
-	RunID string `json:"run_id"`
-	Proxy string `json:"proxy_name"`
+	RunID  string `json:"run_id"`
+	Proxy  string `json:"proxy_name"`
+	Target string `json:"target_addr"`
 }

@@ -47,3 +47,36 @@ const DefaultIdleWorkConnLimit = 2
 // 待命连接已建链但不承载数据，每条都占用两端的文件描述符与暂存内存，必须由
 // Core 常量约束上界。
 const MaxIdleWorkConnLimit = 16
+
+// DefaultUDPSessionIdle 是 UDP 会话空闲上限为零值时采用的 Core 默认值。
+//
+// 规格 §6 把该取值列为待定项：这里按最小可用选取，使其在常见 NAT 映射超时
+// 之前回收而不过早切断突发间隔较长的会话，真实网络下的合适取值需用户实机确认。
+const DefaultUDPSessionIdle = 60 * time.Second
+
+// DefaultUDPSessionLimit 是单个 UDP 代理的会话数上限为零值时采用的 Core 默认值。
+const DefaultUDPSessionLimit = 8
+
+// MaxUDPSessionLimit 是单代理 UDP 会话数上限的上界。
+//
+// 每条会话独占一条工作连接与两个 goroutine，必须由 Core 常量约束上界。
+const MaxUDPSessionLimit = 256
+
+// DefaultUDPDatagramSize 是单个 UDP 数据报字节上限为零值时采用的 Core 默认值。
+//
+// 取值等于以太网 MTU 减去 IP 与 UDP 头部后的常见安全载荷，避免分片；
+// 需要更大的数据报时宿主应显式配置。
+const DefaultUDPDatagramSize = 1400
+
+// MaxUDPDatagramSize 是单个 UDP 数据报字节上限的上界，等于 IPv4 下 UDP 报文的最大载荷。
+const MaxUDPDatagramSize = 65507
+
+// MaxHTTPRouteCount 是单个入口端口上 HTTP 路由条数的上限。
+//
+// 每条路由参与一次线性匹配，必须由 Core 常量约束上界，避免线性查找无界增长。
+const MaxHTTPRouteCount = 256
+
+// MaxAllowTargetCount 是单个代理允许的目标地址条目数上限。
+//
+// 目标地址集合逐条参与越权判定，必须由 Core 常量约束上界。
+const MaxAllowTargetCount = 16

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -25,8 +26,13 @@ func validCredential(clientID string) core.ClientCredential {
 }
 
 // validBinding 返回一条合法的服务端代理绑定。
-func validBinding(name, clientID string) core.TCPProxyBinding {
-	return core.TCPProxyBinding{Name: name, ClientID: clientID, RemotePort: 6000}
+func validBinding(name, clientID string, remotePort int) core.TCPProxyBinding {
+	return core.TCPProxyBinding{
+		Name:           name,
+		ClientID:       clientID,
+		RemotePort:     remotePort,
+		AllowedTargets: []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:22")},
+	}
 }
 
 // validServerOptions 返回规格 §3.2 服务端示例对应的选项集合。
@@ -35,7 +41,7 @@ func validServerOptions() []core.ServerOption {
 		core.WithListen(validListenEndpoint()),
 		core.WithWire(core.WireV1),
 		core.WithClientCredential(validCredential(testCredentialName)),
-		core.WithTCPProxyBinding(validBinding("ssh", testCredentialName)),
+		core.WithTCPProxyBinding(validBinding("ssh", testCredentialName, 6000)),
 	}
 }
 
@@ -57,9 +63,10 @@ func TestNewServerConfigFromSpecExample(t *testing.T) {
 			Token:    testToken,
 		}),
 		core.WithTCPProxyBinding(core.TCPProxyBinding{
-			Name:       "ssh",
-			ClientID:   "client-a",
-			RemotePort: 6000,
+			Name:           "ssh",
+			ClientID:       "client-a",
+			RemotePort:     6000,
+			AllowedTargets: []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:22")},
 		}),
 	)
 	if err != nil {
@@ -87,7 +94,13 @@ func TestNewServerConfigFromSpecExample(t *testing.T) {
 		t.Fatalf("凭证集合不匹配：%+v", credentials)
 	}
 	bindings := config.Bindings()
-	if len(bindings) != 1 || bindings[0] != validBinding("ssh", "client-a") {
+	if len(bindings) != 1 {
+		t.Fatalf("代理绑定条目数不匹配：%d", len(bindings))
+	}
+	// 绑定含切片字段，不能整体比较：逐字段断言，保持断言强度不降低。
+	want := validBinding("ssh", "client-a", 6000)
+	if bindings[0].Name != want.Name || bindings[0].ClientID != want.ClientID ||
+		bindings[0].RemotePort != want.RemotePort || !slices.Equal(bindings[0].AllowedTargets, want.AllowedTargets) {
 		t.Fatalf("代理绑定集合不匹配：%+v", bindings)
 	}
 }
@@ -132,7 +145,8 @@ func TestServerConfigCountBoundaries(t *testing.T) {
 		credentials = append(credentials, validCredential(clientID))
 	}
 	for index := 0; index <= core.MaxProxyCount; index++ {
-		bindings = append(bindings, validBinding(fmt.Sprintf("proxy-%d", index), "client-0"))
+		// 入口端口逐条递增：TCP 入口独占端口，同一端口的 2000 条声明是真实冲突。
+		bindings = append(bindings, validBinding(fmt.Sprintf("proxy-%d", index), "client-0", 6000+index))
 	}
 
 	config, err := core.NewServerConfig(
@@ -175,7 +189,7 @@ func TestServerConfigPortBoundary(t *testing.T) {
 			}),
 			core.WithWire(core.WireV1),
 			core.WithClientCredential(validCredential(testCredentialName)),
-			core.WithTCPProxyBinding(validBinding("ssh", testCredentialName)),
+			core.WithTCPProxyBinding(validBinding("ssh", testCredentialName, 6000)),
 		)
 		if err != nil {
 			t.Fatalf("监听端口 %d 应当构建成功：%v", port, err)
@@ -196,13 +210,13 @@ func TestServerConfigPortBoundary(t *testing.T) {
 		core.WithListen(zeroPortListen),
 		core.WithWire(core.WireV1),
 		core.WithClientCredential(validCredential(testCredentialName)),
-		core.WithTCPProxyBinding(validBinding("ssh", testCredentialName)),
+		core.WithTCPProxyBinding(validBinding("ssh", testCredentialName, 6000)),
 	)
 	assertSingleErrorCode(t, err, core.CodePortOutOfRange, "listen.address")
 
 	for _, port := range []int{0, 65536} {
 		t.Run(fmt.Sprintf("代理入口端口%d", port), func(t *testing.T) {
-			binding := validBinding("ssh", testCredentialName)
+			binding := validBinding("ssh", testCredentialName, 6000)
 			binding.RemotePort = port
 			_, err := core.NewServerConfig(
 				core.WithListen(validListenEndpoint()),
@@ -225,12 +239,12 @@ func TestNewServerConfigValidationErrors(t *testing.T) {
 	emptyTransport.Transport = ""
 	unsupportedTransport := validListenEndpoint()
 	unsupportedTransport.Transport = "quic"
-	unknownClientBinding := validBinding("ssh", "client-b")
-	longNameBinding := validBinding(strings.Repeat("a", core.MaxProxyNameLength+1), testCredentialName)
-	emptyNameBinding := validBinding("", testCredentialName)
-	zeroPortBinding := validBinding("ssh", testCredentialName)
+	unknownClientBinding := validBinding("ssh", "client-b", 6000)
+	longNameBinding := validBinding(strings.Repeat("a", core.MaxProxyNameLength+1), testCredentialName, 6000)
+	emptyNameBinding := validBinding("", testCredentialName, 6000)
+	zeroPortBinding := validBinding("ssh", testCredentialName, 6000)
 	zeroPortBinding.RemotePort = 0
-	negativePortBinding := validBinding("ssh", testCredentialName)
+	negativePortBinding := validBinding("ssh", testCredentialName, 6000)
 	negativePortBinding.RemotePort = -1
 
 	cases := []struct {
@@ -289,7 +303,7 @@ func TestNewServerConfigValidationErrors(t *testing.T) {
 				return []core.ServerOption{
 					core.WithListen(validListenEndpoint()),
 					core.WithWire(core.WireV1),
-					core.WithTCPProxyBinding(validBinding("ssh", testCredentialName)),
+					core.WithTCPProxyBinding(validBinding("ssh", testCredentialName, 6000)),
 				}
 			},
 			code:  core.CodeIncomplete,
@@ -320,7 +334,7 @@ func TestNewServerConfigValidationErrors(t *testing.T) {
 		{
 			name: "绑定引用空客户端标识",
 			options: func() []core.ServerOption {
-				return withServerOptions(core.WithTCPProxyBinding(validBinding("web", "")))
+				return withServerOptions(core.WithTCPProxyBinding(validBinding("web", "", 6000)))
 			},
 			code:  core.CodeUnknownClient,
 			field: "bindings[1].clientID",
@@ -340,7 +354,7 @@ func TestNewServerConfigValidationErrors(t *testing.T) {
 		{
 			name: "绑定重名",
 			options: func() []core.ServerOption {
-				return withServerOptions(core.WithTCPProxyBinding(validBinding("ssh", testCredentialName)))
+				return withServerOptions(core.WithTCPProxyBinding(validBinding("ssh", testCredentialName, 6000)))
 			},
 			code:  core.CodeDuplicateProxyName,
 			field: "bindings[1].name",
@@ -400,7 +414,7 @@ func TestNewServerConfigValidationErrors(t *testing.T) {
 func TestServerConfigAggregatesAllProblems(t *testing.T) {
 	zeroPortListen := validListenEndpoint()
 	zeroPortListen.Address = netip.AddrPortFrom(netip.MustParseAddr("0.0.0.0"), 0)
-	overLimitBinding := validBinding("ssh", testCredentialName)
+	overLimitBinding := validBinding("ssh", testCredentialName, 6000)
 	overLimitBinding.RemotePort = 70000
 
 	_, err := core.NewServerConfig(
@@ -408,7 +422,7 @@ func TestServerConfigAggregatesAllProblems(t *testing.T) {
 		core.WithWire(""),
 		core.WithClientCredential(core.ClientCredential{ClientID: "client-a"}),
 		core.WithTCPProxyBinding(overLimitBinding),
-		core.WithTCPProxyBinding(validBinding("ssh", testCredentialName)),
+		core.WithTCPProxyBinding(validBinding("ssh", testCredentialName, 6000)),
 		core.WithServerTimeout(-time.Second),
 	)
 	if err == nil {
@@ -477,7 +491,7 @@ func TestServerConfigBindingNameBoundary(t *testing.T) {
 				core.WithListen(validListenEndpoint()),
 				core.WithWire(core.WireV1),
 				core.WithClientCredential(validCredential(testCredentialName)),
-				core.WithTCPProxyBinding(validBinding(testCase.binding, testCredentialName)),
+				core.WithTCPProxyBinding(validBinding(testCase.binding, testCredentialName, 6000)),
 			)
 			if testCase.expectOK {
 				if err != nil {

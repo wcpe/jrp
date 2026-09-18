@@ -49,7 +49,7 @@ frp 以配置文件为中心，适合直接部署，但个人与小团队在多�
 | FR-05a | 支持 TCP 连接传输（不引入第三方依赖） | P1 | 开发中 |
 | FR-05b | 支持 WebSocket 与 WSS 连接传输（依赖 `golang.org/x/net`，待批准引入） | P1 | 计划 |
 | FR-05c | 支持 KCP 与 QUIC 连接传输（依赖 `kcp-go`、`quic-go`，待批准引入） | P1 | 计划 |
-| FR-06a | 支持 TCP、UDP、HTTP、HTTPS 四种代理模式 | P1 | 计划 |
+| FR-06a | 支持 TCP、UDP、HTTP、HTTPS 四种代理模式 | P1 | 开发中 |
 | FR-06b | 支持 STCP 与 XTCP 代理，含访客连接与 NAT 打洞 | P1 | 计划 |
 | FR-07 | 每个客户端使用独立 token，支持创建、轮换、吊销和审计 | P1 | 计划 |
 | FR-08 | jrpc 通过独立 HTTPS/WSS 管理通道 enrollment 并接收版本化 desired state | P1 | 计划 |

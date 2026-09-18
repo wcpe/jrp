@@ -70,7 +70,12 @@ func startPairWithDrainTimeout(
 		core.WithListen(core.BindEndpoint{Address: control, Transport: core.TransportTCP}),
 		core.WithWire(core.WireV1),
 		core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: testClientToken}),
-		core.WithTCPProxyBinding(core.TCPProxyBinding{Name: testProxyName, ClientID: testClientID, RemotePort: guestPort}),
+		core.WithTCPProxyBinding(core.TCPProxyBinding{
+			Name:           testProxyName,
+			ClientID:       testClientID,
+			RemotePort:     guestPort,
+			AllowedTargets: []netip.AddrPort{target},
+		}),
 		core.WithServerHeartbeat(200*time.Millisecond),
 		core.WithServerTimeout(2*time.Second),
 		core.WithServerDrainTimeout(drainTimeout),
@@ -114,7 +119,12 @@ func TestDrainTimeoutComesFromConfig(t *testing.T) {
 		core.WithListen(core.BindEndpoint{Address: mustAddrPort(t, "127.0.0.1:7000"), Transport: core.TransportTCP}),
 		core.WithWire(core.WireV1),
 		core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: testClientToken}),
-		core.WithTCPProxyBinding(core.TCPProxyBinding{Name: testProxyName, ClientID: testClientID, RemotePort: freePort(t)}),
+		core.WithTCPProxyBinding(core.TCPProxyBinding{
+			Name:           testProxyName,
+			ClientID:       testClientID,
+			RemotePort:     freePort(t),
+			AllowedTargets: []netip.AddrPort{target},
+		}),
 		core.WithServerDrainTimeout(1500*time.Millisecond),
 	)
 	if err != nil {
@@ -202,7 +212,12 @@ func TestIdleWorkConnLimitFromConfig(t *testing.T) {
 		core.WithListen(core.BindEndpoint{Address: control, Transport: core.TransportTCP}),
 		core.WithWire(core.WireV1),
 		core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: testClientToken}),
-		core.WithTCPProxyBinding(core.TCPProxyBinding{Name: testProxyName, ClientID: testClientID, RemotePort: 6000}),
+		core.WithTCPProxyBinding(core.TCPProxyBinding{
+			Name:           testProxyName,
+			ClientID:       testClientID,
+			RemotePort:     6000,
+			AllowedTargets: []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:22")},
+		}),
 		core.WithServerIdleWorkConnLimit(3),
 	)
 	if err != nil {
@@ -221,7 +236,12 @@ func TestIdleWorkConnLimitRejectsOutOfRange(t *testing.T) {
 			core.WithListen(core.BindEndpoint{Address: control, Transport: core.TransportTCP}),
 			core.WithWire(core.WireV1),
 			core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: testClientToken}),
-			core.WithTCPProxyBinding(core.TCPProxyBinding{Name: testProxyName, ClientID: testClientID, RemotePort: 6000}),
+			core.WithTCPProxyBinding(core.TCPProxyBinding{
+				Name:           testProxyName,
+				ClientID:       testClientID,
+				RemotePort:     6000,
+				AllowedTargets: []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:22")},
+			}),
 			core.WithServerIdleWorkConnLimit(limit),
 		)
 		return err
@@ -252,7 +272,12 @@ func TestGuestListenAddrFollowsConfig(t *testing.T) {
 		core.WithListen(core.BindEndpoint{Address: control, Transport: core.TransportTCP}),
 		core.WithWire(core.WireV1),
 		core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: testClientToken}),
-		core.WithTCPProxyBinding(core.TCPProxyBinding{Name: testProxyName, ClientID: testClientID, RemotePort: freePort(t)}),
+		core.WithTCPProxyBinding(core.TCPProxyBinding{
+			Name:           testProxyName,
+			ClientID:       testClientID,
+			RemotePort:     freePort(t),
+			AllowedTargets: []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:22")},
+		}),
 	)
 	if err != nil {
 		t.Fatalf("构造服务端配置失败：%v", err)

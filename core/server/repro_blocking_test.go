@@ -140,7 +140,13 @@ func mustServerConfig(t *testing.T) core.ServerConfig {
 		core.WithListen(core.BindEndpoint{Address: listen, Transport: core.TransportTCP}),
 		core.WithWire(core.WireV1),
 		core.WithClientCredential(core.ClientCredential{ClientID: "repro", Token: "repro-token"}),
-		core.WithTCPProxyBinding(core.TCPProxyBinding{Name: "repro-proxy", ClientID: "repro", RemotePort: guestPort}),
+		core.WithTCPProxyBinding(core.TCPProxyBinding{
+			Name:       "repro-proxy",
+			ClientID:   "repro",
+			RemotePort: guestPort,
+			// 该用例不承载数据转发，允许集合取自身环回地址即可满足必填约束。
+			AllowedTargets: []netip.AddrPort{listen},
+		}),
 	)
 	if err != nil {
 		t.Fatalf("构造配置失败：%v", err)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"time"
 )
 
@@ -20,6 +21,25 @@ var ErrDialTimeoutMissing = errors.New("拨号必须配置超时")
 type Dialer struct {
 	// Timeout 是单次拨号的时间上限，必须为正值。
 	Timeout time.Duration
+}
+
+// DialUDP 建立一个指向 UDP 目标的数据报套接字。
+//
+// UDP 是无连接协议，因此不存在拨号动作：这里只解析地址并绑定一个本地端口。
+// 套接字不设截止时间：UDP 会话的存续由会话空闲上限决定，套用拨号超时会让
+// 会话在超时后立刻失效（规格 §3.4：UDP 的结束语义是空闲回收，不是连接超时）。
+func (dialer Dialer) DialUDP(target netip.AddrPort) (*net.UDPConn, error) {
+	if dialer.Timeout <= 0 {
+		return nil, ErrDialTimeoutMissing
+	}
+	if !target.Addr().IsValid() {
+		return nil, fmt.Errorf("目标地址必须指定 IP 与端口：%s", target.String())
+	}
+	socket, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(target))
+	if err != nil {
+		return nil, fmt.Errorf("建立 UDP 目标套接字 %s 失败：%w", target.String(), err)
+	}
+	return socket, nil
 }
 
 // Dial 按超时拨号并建立带用途标记的连接句柄。

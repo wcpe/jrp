@@ -76,8 +76,8 @@ func TestServerConfigIsImmutableAgainstHostSlices(t *testing.T) {
 		{ClientID: "client-b", Token: "second-token"},
 	}
 	bindings := []core.TCPProxyBinding{
-		validBinding("ssh", "client-a"),
-		validBinding("web", "client-b"),
+		validBinding("ssh", "client-a", 6000),
+		validBinding("web", "client-b", 6001),
 	}
 
 	config, err := core.NewServerConfig(
@@ -133,7 +133,9 @@ func assertServerCollections(t *testing.T, config core.ServerConfig) {
 	if len(bindings) != 2 || bindings[0].Name != "ssh" || bindings[1].Name != "web" {
 		t.Fatalf("绑定集合不匹配：%+v", bindings)
 	}
-	if bindings[1].RemotePort != 6000 {
-		t.Fatalf("绑定远程端口不匹配：%+v", bindings)
+	// 断言「未被宿主改写」这一原意图：宿主把第二条改写为 9999，两条入口端口
+	// 又必须互不相同（TCP 入口独占端口），因此逐端口断言不等于 9999。
+	if bindings[0].RemotePort == 9999 || bindings[1].RemotePort == 9999 {
+		t.Fatalf("绑定远程端口被宿主改写：%+v", bindings)
 	}
 }

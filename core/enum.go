@@ -25,8 +25,24 @@ var supportedWireVersions = []WireVersion{WireV1}
 
 // ProxyType 是代理类型的具名枚举。
 //
-// 只定义已交付的取值：UDP、HTTP、HTTPS、STCP、XTCP 待 FR-06a/06b 交付后加入，此处不预留空枚举。
+// 只定义已交付的取值：STCP、XTCP 待 FR-06b 交付后加入，此处不预留空枚举。
 type ProxyType string
 
-// ProxyTypeTCP 是 TCP 代理，对应 FR-06a 的 TCP 部分。
-const ProxyTypeTCP ProxyType = "tcp"
+const (
+	// ProxyTypeTCP 是 TCP 代理，对应 FR-06a 的 TCP 部分。
+	ProxyTypeTCP ProxyType = "tcp"
+	// ProxyTypeUDP 是 UDP 代理，按对端地址会话化转发。
+	ProxyTypeUDP ProxyType = "udp"
+	// ProxyTypeHTTP 是 HTTP 代理，按主机名与路径路由，可共享入口端口。
+	ProxyTypeHTTP ProxyType = "http"
+	// ProxyTypeHTTPS 是 HTTPS 代理，P1 为不终止 TLS 的透传。
+	ProxyTypeHTTPS ProxyType = "https"
+)
+
+// supportedProxyTypes 列出当前已交付的代理类型取值。
+var supportedProxyTypes = []ProxyType{ProxyTypeTCP, ProxyTypeUDP, ProxyTypeHTTP, ProxyTypeHTTPS}
+
+// String 返回代理类型取值，满足 Stringer。
+func (proxyType ProxyType) String() string {
+	return string(proxyType)
+}
