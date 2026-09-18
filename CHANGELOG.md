@@ -30,3 +30,8 @@
 - 补充 FR-04 分层测试：字节层黄金帧、边界长度、畸形输入、状态机迁移、v1/v2 同端口共存与模糊测试入口。
 - 修正 `docs/PROTOCOL.md` 的 wire v2 契约：经黑盒取证确认版本魔数为 7 字节 `FRP\x00\x02\r\n`（原文档未记录取值），并补入 §3.1 已登记消息类型表。
 - 修正 `docs/specs/wire-v1-v2-codec.md` §3.4 的 hello 结构描述：能力集合按 `capabilities` 与 `selected` 嵌套分组承载，原规格未记录该结构。
+- 落地 FR-09：`jrps` 与 `jrpc` 各自建立独立 SQLite 持久化层（GORM + `github.com/glebarez/sqlite` 纯 Go 驱动，CGO-free），含事务化迁移、追加写约束与 `--data-dir`、`--database` 引导参数。
+- FR-09 中 desired、active 与 last-good 分列表达：只有 desired 是持久化真源，另两者保存 Apply 结果记录，恢复时拒绝把 active 冒充真源。
+- FR-09 中请求元数据走有界批处理通道，采集关闭时不进入落库路径；通知采用事务 outbox，外部副作用只在事务提交后触发。
+- FR-09 中 token 只以摘要落库，读取视图与审计一律掩码。
+- OPERATIONS 补入 FR-09 已交付的 `--data-dir`、`--database` 引导参数与两侧数据库独立性约定。

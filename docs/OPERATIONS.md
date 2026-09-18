@@ -46,6 +46,13 @@ task build
 
 具体 CLI 和参数只有在对应 FR 交付后才可执行；数据目录、SQLite 路径和管理 API 根监听是引导参数，变更需要重启。
 
+FR-09 已交付的引导参数：
+
+- `jrps [--listen 地址] [--data-dir 目录] [--database 路径]`。
+- `jrpc run [--data-dir 目录] [--database 路径]`。
+
+`--data-dir` 缺省为 Linux `/var/lib/jrp/{jrps,jrpc}`、Windows `%ProgramData%\JRP\{jrps,jrpc}`；`--database` 缺省为数据目录下的 `jrps.db` 或 `jrpc.db`。两侧数据库互相独立，指向对方数据库文件或同一路径时进程拒绝启动并在日志中给出中文原因。
+
 ### 1.5 健康检查
 
 - `/healthz`：进程存活。
