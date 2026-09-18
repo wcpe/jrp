@@ -51,6 +51,8 @@
 - FR-09 规格移除在线备份验收项：该能力不在 PRD 需求列表内，属独立后续需求。
 - 收紧 SQLite 数据库文件权限：Linux 等平台的数据库与 WAL/SHM 由驱动默认 0644 改为 0600，符合「数据目录权限仅限运行账户」的验收要求。
 - S1 切片交付：FR-32 配置构建器、FR-04 wire v1/v2 编解码、FR-09 SQLite 配置存储通过验收并标记为已交付@0.1.0。
+- FR-25 通过全部 18 条验收标准：PRD §4 状态改为「已交付@0.1.0」，规格 §4 的十项任务全部勾选。
+- FR-25 取证记录：Core 全量测试、`-race` 全量测试、`task lint:go` 依赖门与外部消费 `GOWORK=off` 验证均通过；三平台 CI（`Go / ubuntu-latest`、`windows-latest`、`macos-latest`）全绿。
 - 补 FR-32 两处测试缺口：服务端绑定名的正向边界（单字节与恰为上限构建成功），以及取值类错误必须给出受支持取值列表的断言。
 - wire 层模糊测试接入 CI：新增 `task test:fuzz` 入口与独立 CI job，三个 fuzz 入口各跑 10 秒。
 - CI 升级 action 版本至 Node 24 运行时：checkout v7、setup-go v7、setup-node v7、pnpm/action-setup v6，消除 Node.js 20 弃用警告。

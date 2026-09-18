@@ -135,16 +135,16 @@ Core 必须满足并在测试中验证：
 
 ## 4. 任务拆分
 
-- [ ] 先写失败测试：在 `core` 内编写端到端失败测试（server+client 进程内互联、TCP + wire v1 + 一个 TCP 代理双向字节流），以及 Start 失败不关闭宿主 listener、Shutdown 后无 goroutine 泄漏、重复 Shutdown 幂等、重复 Start 返回 sentinel、多 Engine 并行互不影响；编写 `GOWORK=off` 外部 fixture 验证脚本用例（初始为红）
+- [x] 先写失败测试：在 `core` 内编写端到端失败测试（server+client 进程内互联、TCP + wire v1 + 一个 TCP 代理双向字节流），以及 Start 失败不关闭宿主 listener、Shutdown 后无 goroutine 泄漏、重复 Shutdown 幂等、重复 Start 返回 sentinel、多 Engine 并行互不影响；编写 `GOWORK=off` 外部 fixture 验证脚本用例（初始为红）
 - [x] 确定并登记 Core 公共包布局（已由 ADR-0012 完成，无需另立 ADR）
-- [ ] 实现 `core/server` 与 `core/client` 的 New、Start、Shutdown、Done、Err 与内部最低限度状态机
-- [ ] 实现资源所有权转移：Start 成功接管宿主 listener，Start 失败保留给宿主，Shutdown 全部释放
-- [ ] 实现 TCP 传输接入与 wire v1 编解码的最小必要部分，只覆盖本切片时序
-- [ ] 实现控制会话登录与心跳，以及一个 TCP 代理的端到端转发
-- [ ] 实现可选 `*slog.Logger` 注入，保证日志脱敏且不成为业务契约
-- [ ] 补齐 `GOWORK=off` 外部 fixture：临时目录中的独立 Go module 只依赖已发布或本地相对路径的 Core 公共包，编译并运行闭环
-- [ ] 运行 `task test:core`、`task lint:go`、`go test -race ./...` 与依赖门检查
-- [ ] 同步 CHANGELOG 与受影响长期文档；PRD 中 FR-25 状态在全部验收通过后变更
+- [x] 实现 `core/server` 与 `core/client` 的 New、Start、Shutdown、Done、Err 与内部最低限度状态机
+- [x] 实现资源所有权转移：Start 成功接管宿主 listener，Start 失败保留给宿主，Shutdown 全部释放
+- [x] 实现 TCP 传输接入与 wire v1 编解码的最小必要部分，只覆盖本切片时序
+- [x] 实现控制会话登录与心跳，以及一个 TCP 代理的端到端转发
+- [x] 实现可选 `*slog.Logger` 注入，保证日志脱敏且不成为业务契约
+- [x] 补齐 `GOWORK=off` 外部 fixture：临时目录中的独立 Go module 只依赖已发布或本地相对路径的 Core 公共包，编译并运行闭环
+- [x] 运行 `task test:core`、`task lint:go`、`go test -race ./...` 与依赖门检查
+- [x] 同步 CHANGELOG 与受影响长期文档；PRD 中 FR-25 状态在全部验收通过后变更
 
 ## 5. 验收标准
 
