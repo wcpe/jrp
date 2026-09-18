@@ -472,3 +472,45 @@ func TestNewClientConfigAggregatesAllProblems(t *testing.T) {
 	assertHasErrorCode(t, problems, core.CodeDuplicateProxyName, "proxies[1].name")
 	assertNoCredentialLeak(t, err)
 }
+
+// TestUnsupportedValueErrorListsSupportedValues 断言取值类错误给出受支持取值列表。
+//
+// 规格 §3.4 要求取值不受支持时「给出受支持的取值列表」，使宿主无需查文档
+// 即可知道可填什么。此处同时覆盖枚举与 wire 两个字段。
+func TestUnsupportedValueErrorListsSupportedValues(t *testing.T) {
+	endpoint := validServerEndpoint()
+	endpoint.Transport = "kcp"
+
+	_, err := core.NewClientConfig(
+		core.WithClientID("client-a"),
+		core.WithServerEndpoint(endpoint),
+		core.WithClientAuth(core.TokenAuth{Token: "token-a"}),
+	)
+	if err == nil {
+		t.Fatal("未交付的传输取值应当被拒绝")
+	}
+
+	var problems core.ConfigErrors
+	if !errors.As(err, &problems) {
+		t.Fatalf("错误未聚合为 ConfigErrors：%v", err)
+	}
+
+	found := false
+	for _, problem := range problems {
+		if problem.Code() != core.CodeUnsupportedValue {
+			continue
+		}
+		message := problem.Message()
+		// 必须列出当前已交付的取值，宿主据此可自行修正。
+		if !strings.Contains(message, string(core.TransportTCP)) {
+			t.Fatalf("取值列表未包含已交付取值 %q：%s", core.TransportTCP, message)
+		}
+		if !strings.Contains(message, "受支持的取值") {
+			t.Fatalf("错误消息未说明受支持取值：%s", message)
+		}
+		found = true
+	}
+	if !found {
+		t.Fatalf("期望命中 CodeUnsupportedValue：%v", err)
+	}
+}

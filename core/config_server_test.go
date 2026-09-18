@@ -456,3 +456,51 @@ func TestServerConfigZeroValueValidate(t *testing.T) {
 	}
 	assertNoCredentialLeak(t, err)
 }
+
+// TestServerConfigBindingNameBoundary 覆盖服务端绑定名的正向边界。
+//
+// 与客户端的代理名边界对称：长度为 1 与恰为上限时构建成功，
+// 空名与超长名归为超出上限。
+func TestServerConfigBindingNameBoundary(t *testing.T) {
+	for _, testCase := range []struct {
+		name     string
+		binding  string
+		expectOK bool
+	}{
+		{name: "单字节名称", binding: "a", expectOK: true},
+		{name: "恰为上限", binding: strings.Repeat("a", core.MaxProxyNameLength), expectOK: true},
+		{name: "空名", binding: "", expectOK: false},
+		{name: "超出上限一个字节", binding: strings.Repeat("a", core.MaxProxyNameLength+1), expectOK: false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			_, err := core.NewServerConfig(
+				core.WithListen(validListenEndpoint()),
+				core.WithWire(core.WireV1),
+				core.WithClientCredential(validCredential(testCredentialName)),
+				core.WithTCPProxyBinding(validBinding(testCase.binding, testCredentialName)),
+			)
+			if testCase.expectOK {
+				if err != nil {
+					t.Fatalf("长度 %d 的绑定名应当构建成功：%v", len(testCase.binding), err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("长度 %d 的绑定名应当被拒绝", len(testCase.binding))
+			}
+			var problems core.ConfigErrors
+			if !errors.As(err, &problems) {
+				t.Fatalf("错误未聚合为 ConfigErrors：%v", err)
+			}
+			found := false
+			for _, problem := range problems {
+				if problem.Code() == core.CodeLimitExceeded && strings.HasSuffix(problem.Field(), "name") {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("期望命中 CodeLimitExceeded 且字段指向绑定名：%v", err)
+			}
+		})
+	}
+}

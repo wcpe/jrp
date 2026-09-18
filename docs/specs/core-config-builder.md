@@ -145,13 +145,13 @@ scfg, err := core.NewServerConfig(
 
 ## 4. 任务拆分
 
-- [ ] 先写失败测试：为 §3.4 每一类校验规则编写表驱动用例，断言返回 `*core.ConfigError` 且错误码与字段路径正确，断言不 panic；同时编写不可变性测试（修改宿主入参切片后配置值不变、读取集合后改动返回值不影响配置值）与「Core 包内无 os.Getenv/os.Open 调用」的依赖门测试
-- [ ] 定义配置值类型、枚举常量与数量上限常量，字段全部私有并配套读取方法
-- [ ] 实现选项函数与 `NewClientConfig`、`NewServerConfig`，构建末尾执行全量校验并聚合错误
-- [ ] 实现 `Validate` 与错误模型（哨兵、错误码、`ConfigError`、`Unwrap`），保证消息脱敏
-- [ ] 实现深复制与不可变语义，覆盖切片、嵌套结构体与凭证字段
-- [ ] 运行 `task test:core`、`task lint:go` 与依赖门检查，确认 Core 依赖图无 Gin、GORM、SQLite、`apps/*` 与 frp
-- [ ] 同步 CHANGELOG 与受影响的长期文档；PRD 中 FR-32 的状态在全部验收通过后再变更
+- [x] 先写失败测试：为 §3.4 每一类校验规则编写表驱动用例，断言返回 `*core.ConfigError` 且错误码与字段路径正确，断言不 panic；同时编写不可变性测试（修改宿主入参切片后配置值不变、读取集合后改动返回值不影响配置值）与「Core 包内无 os.Getenv/os.Open 调用」的依赖门测试
+- [x] 定义配置值类型、枚举常量与数量上限常量，字段全部私有并配套读取方法
+- [x] 实现选项函数与 `NewClientConfig`、`NewServerConfig`，构建末尾执行全量校验并聚合错误
+- [x] 实现 `Validate` 与错误模型（哨兵、错误码、`ConfigError`、`Unwrap`），保证消息脱敏
+- [x] 实现深复制与不可变语义，覆盖切片、嵌套结构体与凭证字段
+- [x] 运行 `task test:core`、`task lint:go` 与依赖门检查，确认 Core 依赖图无 Gin、GORM、SQLite、`apps/*` 与 frp
+- [x] 同步 CHANGELOG 与受影响的长期文档；PRD 中 FR-32 的状态在全部验收通过后再变更
 
 ## 5. 验收标准
 

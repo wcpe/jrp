@@ -45,7 +45,7 @@ frp 以配置文件为中心，适合直接部署，但个人与小团队在多�
 | FR-01 | 建立独立 Core、jrps、jrpc 与 Web 边界，并由 go.work 编排三个 Go module | P1 | 计划 |
 | FR-02 | 提供首次初始化和单管理员认证，不引入多管理员或 RBAC | P1 | 计划 |
 | FR-03 | `jrps` 接受固定兼容基线下的官方 frpc 连接 | P1 | 计划 |
-| FR-04 | Core 支持 wire v1 与 wire v2，具备明确协商、降级和拒绝行为 | P1 | 开发中 |
+| FR-04 | Core 支持 wire v1 与 wire v2，具备明确协商、降级和拒绝行为 | P1 | 已交付@0.1.0 |
 | FR-05a | 支持 TCP 连接传输（不引入第三方依赖） | P1 | 计划 |
 | FR-05b | 支持 WebSocket 与 WSS 连接传输（依赖 `golang.org/x/net`，待批准引入） | P1 | 计划 |
 | FR-05c | 支持 KCP 与 QUIC 连接传输（依赖 `kcp-go`、`quic-go`，待批准引入） | P1 | 计划 |
@@ -53,7 +53,7 @@ frp 以配置文件为中心，适合直接部署，但个人与小团队在多�
 | FR-06b | 支持 STCP 与 XTCP 代理，含访客连接与 NAT 打洞 | P1 | 计划 |
 | FR-07 | 每个客户端使用独立 token，支持创建、轮换、吊销和审计 | P1 | 计划 |
 | FR-08 | jrpc 通过独立 HTTPS/WSS 管理通道 enrollment 并接收版本化 desired state | P1 | 计划 |
-| FR-09 | jrps 与 jrpc 分别以 SQLite 保存配置、revision 与必要运行元数据 | P1 | 开发中 |
+| FR-09 | jrps 与 jrpc 分别以 SQLite 保存配置、revision 与必要运行元数据 | P1 | 已交付@0.1.0 |
 | FR-10 | 配置按 prepare、health-check、atomic publish、drain 无中断应用，失败保留 last-good | P1 | 计划 |
 | FR-11 | 提供单管理员 React Web 管理客户端、代理、配置版本、采集与通知 | P1 | 计划 |
 | FR-12 | 记录请求与运行日志，并对敏感凭证和正文实施脱敏与访问控制 | P1 | 计划 |
@@ -76,7 +76,7 @@ frp 以配置文件为中心，适合直接部署，但个人与小团队在多�
 | FR-29 | 建立独立 `platform/service` module 和 jrps/jrpc 一致的系统服务安装、卸载、启停、重启、状态 CLI | P1 | 计划 |
 | FR-30 | 支持将 jrps 与 jrpc 安装为 Linux systemd 系统服务，使用低权限用户、开机启动、失败退避重启和优雅停止 | P1 | 计划 |
 | FR-31 | 支持将 jrps 与 jrpc 注册为 Windows SCM 系统服务，使用 LocalService、Automatic 启动、失败恢复动作和优雅停止 | P1 | 计划 |
-| FR-32 | Core 提供类型化配置构建器与校验 API，供嵌入宿主构造不可变配置快照；Core 不读取配置文件与环境变量 | P1 | 开发中 |
+| FR-32 | Core 提供类型化配置构建器与校验 API，供嵌入宿主构造不可变配置快照；Core 不读取配置文件与环境变量 | P1 | 已交付@0.1.0 |
 
 状态取值为“计划”“开发中”“已交付@版本”。只有验收标准、自动化测试和要求的实机验收均通过后，才能标记为已交付。
 
@@ -133,17 +133,18 @@ frp 以配置文件为中心，适合直接部署，但个人与小团队在多�
 
 切片顺序遵循「先地基、后上层」：每片内的条目互不依赖，可并行开发；下一片必须等上一片落定后才能开始。
 
-| 切片 | 包含 FR | 条数 | 前置 | 说明 |
-|---|---|---|---|---|
-| S1 | FR-32、FR-04、FR-09 | 3 | 无 | 配置构建、wire 编解码、SQLite 持久化 |
-| S2 | FR-25、FR-05a、FR-06a、FR-02、FR-15、FR-16 | 6 | S1 | Engine 门面与首个垂直切片、TCP 传输、四种代理、认证、通知、审计 |
-| S3 | FR-26、FR-27、FR-03、FR-06b、FR-07、FR-10、FR-13、FR-12 | 8 | S2 | Apply 与事件订阅、日志、官方 frpc 接入、STCP/XTCP、token、无中断热更、正文采集 |
-| S4 | FR-08、FR-11、FR-28、FR-14 | 4 | S3 | enrollment 与配置下发、Web 管理台、Core 版本政策、监控 |
-| S5 | FR-29、FR-30、FR-31、FR-17 | 4 | S4 | 系统服务 module、Linux systemd、Windows SCM、三平台构建 |
-| 后置 | FR-05b、FR-05c | 2 | 依赖批准 | WebSocket/WSS 与 KCP/QUIC 传输，第三方依赖获批后启动 |
+| 切片 | 包含 FR | 条数 | 前置 | 状态 | 说明 |
+|---|---|---|---|---|---|
+| S1 | FR-32、FR-04、FR-09 | 3 | 无 | 已交付@0.1.0 | 配置构建、wire 编解码、SQLite 持久化 |
+| S2 | FR-25、FR-05a、FR-06a、FR-02、FR-15、FR-16 | 6 | S1 | 进行中 | Engine 门面与首个垂直切片、TCP 传输、四种代理、认证、通知、审计 |
+| S3 | FR-26、FR-27、FR-03、FR-06b、FR-07、FR-10、FR-13、FR-12 | 8 | S2 | 计划 | Apply 与事件订阅、日志、官方 frpc 接入、STCP/XTCP、token、无中断热更、正文采集 |
+| S4 | FR-08、FR-11、FR-28、FR-14 | 4 | S3 | 计划 | enrollment 与配置下发、Web 管理台、Core 版本政策、监控 |
+| S5 | FR-29、FR-30、FR-31、FR-17 | 4 | S4 | 计划 | 系统服务 module、Linux systemd、Windows SCM、三平台构建 |
+| 后置 | FR-05b、FR-05c | 2 | 依赖批准 | 计划 | WebSocket/WSS 与 KCP/QUIC 传输，第三方依赖获批后启动 |
 
 - FR-01（多 module 工程骨架）不在切片内：它已在工程初始化阶段达成，待验收后另行判定状态。
 - FR-05b 与 FR-05c 已登记但处于依赖待批准状态，不计入 S1~S5 的完成度口径。
+- S2 的 FR-25 已实现并通过功能验收，其规格任务项与状态在 S2 整体验收后统一变更。
 - FR-12 依赖 FR-27 提供的有界事件通道，故与 FR-27 同属 S3；其日志等级、脱敏矩阵与查询接口本身不依赖 FR-27。
 - 切片不替代验收：每个 FR 仍须独立通过其验收标准才可标记交付。
 

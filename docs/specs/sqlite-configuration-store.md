@@ -109,15 +109,15 @@ JRP 的配置、revision 和必要运行元数据需要可审计、可断电恢�
 
 ## 4. 任务拆分
 
-- [ ] 先写失败测试：jrps 与 jrpc 打开同一数据库文件应失败；desired 与 active 混用场景应失败；采集关闭时数据面产生请求元数据行的用例应失败。
-- [ ] 定义 jrps 与 jrpc 各自的 GORM 模型与初始迁移，迁移在事务中执行，失败拒绝启动。
-- [ ] 实现配置版本表与 desired、active、last-good 三个 revision 的独立读写点与审计写入。
-- [ ] 实现不可变版本约束：版本记录只允许追加，修改历史版本内容必须被拒绝。
-- [ ] 实现重启恢复流程：启动时从 SQLite 读取 desired 并进入标准应用流程，不直接声称 active。
-- [ ] 实现有界批处理写入通道与降级策略，并验证队列满时不阻塞数据面。
-- [ ] 实现 outbox 读写与事务提交后触发边界，禁止事务内远程调用。
-- [ ] 补齐 token 摘要存储、秘密读取掩码与审计脱敏测试。
-- [ ] 运行 jrps、jrpc 测试、静态检查与构建；同步 PRD、ARCHITECTURE、API、OPERATIONS、SECURITY、CHANGELOG 中受影响内容。
+- [x] 先写失败测试：jrps 与 jrpc 打开同一数据库文件应失败；desired 与 active 混用场景应失败；采集关闭时数据面产生请求元数据行的用例应失败。
+- [x] 定义 jrps 与 jrpc 各自的 GORM 模型与初始迁移，迁移在事务中执行，失败拒绝启动。
+- [x] 实现配置版本表与 desired、active、last-good 三个 revision 的独立读写点与审计写入。
+- [x] 实现不可变版本约束：版本记录只允许追加，修改历史版本内容必须被拒绝。
+- [x] 实现重启恢复流程：启动时从 SQLite 读取 desired 并进入标准应用流程，不直接声称 active。
+- [x] 实现有界批处理写入通道与降级策略，并验证队列满时不阻塞数据面。
+- [x] 实现 outbox 读写与事务提交后触发边界，禁止事务内远程调用。
+- [x] 补齐 token 摘要存储、秘密读取掩码与审计脱敏测试。
+- [x] 运行 jrps、jrpc 测试、静态检查与构建；同步 PRD、ARCHITECTURE、API、OPERATIONS、SECURITY、CHANGELOG 中受影响内容。
 
 ## 5. 验收标准
 
