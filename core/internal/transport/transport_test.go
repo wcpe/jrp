@@ -258,17 +258,26 @@ func TestConnResetReleasesResources(t *testing.T) {
 	listener, stop := listenLocal(t)
 	defer stop()
 
-	// 对端接受后立即以 RST 断开：设置极短 linger 强制重置。
+	// 对端先确认连接已建立（写入一个字节并让客户端读到），再以 RST 断开。
+	//
+	// 直接 Accept 后立刻重置会与 Dial 产生竞态：负载高的机器上服务端可能早于
+	// 拨号完成就关闭，客户端在拨号阶段即吃到 connection reset，测试还没验证到
+	// 目标行为就已失败。先做一次单向握手即可消除该竞态。
+	ready := make(chan struct{})
 	go func() {
 		conn, err := listener.Accept()
 		if err != nil {
+			close(ready)
 			return
 		}
 		tcpConn, ok := conn.(*net.TCPConn)
 		if !ok {
 			_ = conn.Close()
+			close(ready)
 			return
 		}
+		_, _ = conn.Write([]byte("r"))
+		close(ready)
 		_ = tcpConn.SetLinger(0)
 		_ = tcpConn.Close()
 	}()
@@ -279,6 +288,9 @@ func TestConnResetReleasesResources(t *testing.T) {
 		t.Fatalf("拨号失败：%v", err)
 	}
 	defer conn.Close()
+
+	// 等到对端确实接受并写入后再让它重置，保证后续读到的是重置错误而非拨号期错误。
+	<-ready
 
 	deadline := time.Now().Add(3 * time.Second)
 	for {
