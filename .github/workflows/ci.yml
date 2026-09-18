@@ -5,13 +5,13 @@ on:
     paths-ignore:
       - 'docs/**'
       - '**/*.md'
-      - '.claude/rules/**'
+      - '.claude/**'
       - 'LICENSE'
   pull_request:
     paths-ignore:
       - 'docs/**'
       - '**/*.md'
-      - '.claude/rules/**'
+      - '.claude/**'
       - 'LICENSE'
 
 permissions:
@@ -29,14 +29,14 @@ jobs:
           - windows-latest
           - macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: 1.25.x
           cache-dependency-path: |
             go.work.sum
             apps/jrps/go.sum
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - uses: arduino/setup-task@v3
@@ -51,8 +51,8 @@ jobs:
     name: wire 模糊测试 / Ubuntu
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: 1.25.x
           cache-dependency-path: |
@@ -68,17 +68,17 @@ jobs:
     name: Web 与生产构建 / Ubuntu
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: 1.25.x
           cache-dependency-path: |
             go.work.sum
             apps/jrps/go.sum
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
           version: 10.11.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm

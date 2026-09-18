@@ -53,3 +53,6 @@
 - S1 切片交付：FR-32 配置构建器、FR-04 wire v1/v2 编解码、FR-09 SQLite 配置存储通过验收并标记为已交付@0.1.0。
 - 补 FR-32 两处测试缺口：服务端绑定名的正向边界（单字节与恰为上限构建成功），以及取值类错误必须给出受支持取值列表的断言。
 - wire 层模糊测试接入 CI：新增 `task test:fuzz` 入口与独立 CI job，三个 fuzz 入口各跑 10 秒。
+- CI 升级 action 版本至 Node 24 运行时：checkout v7、setup-go v7、setup-node v7、pnpm/action-setup v6，消除 Node.js 20 弃用警告。
+- CI 的文档路径忽略范围由 `.claude/rules/**` 扩至 `.claude/**`。
+- README 补入 CI、许可、Go 与 pnpm 徽章，登记 S1 已交付能力，并更新快速开始为当前可用命令。

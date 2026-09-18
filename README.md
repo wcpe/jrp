@@ -1,5 +1,10 @@
 # JRP
 
+[![CI](https://github.com/wcpe/jrp/actions/workflows/ci.yml/badge.svg)](https://github.com/wcpe/jrp/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Go 1.25](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](go.work)
+[![pnpm](https://img.shields.io/badge/pnpm-10.11-F69220?logo=pnpm&logoColor=white)](pnpm-workspace.yaml)
+
 > 面向个人与小团队、兼容官方 frpc 的高性能反向代理与 P2P 打洞平台，以数据库驱动配置、无中断热更、可观测性和通知能力简化运维。
 
 ## 状态
@@ -7,10 +12,20 @@
 - 产品版本：`0.1.0`
 - 初始化日期：2026-07-16
 - 仓库：`github.com/wcpe/jrp`
-- 阶段：初始化工程骨架；P1 功能按 `docs/PRD.md` 逐项交付
+- 阶段：P1 进行中，已交付 S1 切片（配置构建器、wire v1/v2 编解码、SQLite 配置存储）
 - 许可：MIT
 
-当前版本建立独立 Core、`jrps`、`jrpc` 与 Web 的工程边界。功能是否已交付以 PRD 状态、测试与实际代码为准，不因文档中存在目标契约而视为已经实现。
+功能是否已交付以 [`docs/PRD.md`](docs/PRD.md) 的 FR 状态、测试与实际代码为准，不因文档中存在目标契约而视为已经实现。
+
+### 已交付能力
+
+| FR | 能力 | 状态 |
+|---|---|---|
+| FR-32 | Core 类型化配置构建器与校验 API | 已交付@0.1.0 |
+| FR-04 | wire v1/v2 编解码，含版本协商、降级与拒绝 | 已交付@0.1.0 |
+| FR-09 | jrps 与 jrpc 各自的 SQLite 配置存储 | 已交付@0.1.0 |
+
+其余 P1 需求的状态、切片顺序与依赖关系见 PRD §4 与 §7.1。
 
 ## 架构一览
 
@@ -89,15 +104,17 @@ docs/             需求、架构、接口、协议、运维与 ADR
 
 ## 快速开始
 
-工程骨架完成后，以根 Taskfile 为跨平台命令真源，Makefile 仅转发同名目标：
+需要 Go 1.25+、Node.js 22+、pnpm 10.11 与 [Task](https://taskfile.dev)。以根 Taskfile 为跨平台命令真源，Makefile 仅转发同名目标：
 
 ```bash
-task bootstrap
-task test
-task build
+task bootstrap   # 安装依赖并同步 Go 工作区
+task test        # 运行全部 Go 与 Web 测试
+task build       # 构建 Web 并生成 jrps 与 jrpc
 ```
 
-预期构建产物为 `jrps` 与 `jrpc` 两个二进制。当前阶段不得把未实现的协议、数据库或分布式能力当作可用功能。
+其他常用入口：`task lint`、`task typecheck`、`task fmt:check`、`task test:fuzz`（wire 层模糊测试）、`task test:core:external`（外部消费验证）、`task dev:jrps`、`task dev:web`。
+
+构建产物为根 `bin/` 下的 `jrps` 与 `jrpc` 两个二进制。未在 [`docs/PRD.md`](docs/PRD.md) 中标为已交付的能力，不得视为可用功能。
 
 ## 兼容性与独立实现
 
