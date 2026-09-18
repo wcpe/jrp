@@ -36,3 +36,8 @@
 - FR-09 中 token 只以摘要落库，读取视图与审计一律掩码。
 - OPERATIONS 补入 FR-09 已交付的 `--data-dir`、`--database` 引导参数与两侧数据库独立性约定。
 - 交付 FR-25 首个真实垂直切片：`core/server` 与 `core/client` 双侧 Engine 门面，TCP 传输 + wire v1 控制会话 + 一个 TCP 代理端到端闭环；生命周期为 New、Start、Shutdown、Done，Start 成功接管宿主资源、失败保留给宿主，Shutdown 后无残留监听器、连接或 goroutine。
+- 修复 FR-25 的 Engine 异常可观测性：控制与心跳失败路径统一记录首个异常错误并关闭 Done，`Err()` 不再恒为 nil；Shutdown 保持 Err() 为 nil。
+- 修复 FR-25 双端 Start 并发竞态：认领启动位时原子置为 starting，失败回滚到 idle，重复启动返回哨兵错误。
+- 修复 FR-25 排水超时语义：`waitDrained` 超限返回可判定的超时错误，不再与正常排空混同为 nil；已过期的 ctx 直接返回其错误。
+- 修复 FR-25 桥接泄漏：配对成功的桥接纳入 WaitGroup 并追踪连接，Shutdown 按排水上限等待，不再依赖对端关闭。
+- 新增 `task test:core:external` 外部消费验证：独立 module 在 `GOWORK=off` 下只依赖 Core 公共包跑通端到端闭环。

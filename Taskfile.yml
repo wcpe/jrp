@@ -58,6 +58,11 @@ tasks:
     cmds:
       - go test ./...
 
+  test:core:external:
+    desc: 外部消费验证，独立 module 在 GOWORK=off 下只依赖 Core 公共包跑通闭环
+    cmds:
+      - node scripts/verify-external-consume.mjs
+
   test:jrps:
     desc: 运行 jrps 回退资源测试
     dir: apps/jrps

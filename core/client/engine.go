@@ -53,6 +53,7 @@ type engineState int
 
 const (
 	stateIdle engineState = iota
+	stateStarting
 	stateRunning
 	stateStopped
 )
@@ -101,6 +102,7 @@ func (engine *Engine) Start(ctx context.Context) error {
 
 	conn, err := dial(ctx, endpoint.Address.String())
 	if err != nil {
+		engine.releaseStartSlot()
 		return fmt.Errorf("客户端拨号失败：%w", err)
 	}
 
@@ -108,12 +110,11 @@ func (engine *Engine) Start(ctx context.Context) error {
 	control := &controlSession{conn: conn, done: controlDone}
 	if err := loginControl(ctx, control, engine.config); err != nil {
 		_ = conn.Close()
+		engine.releaseStartSlot()
 		return err
 	}
 
-	engine.mu.Lock()
-	engine.state = stateRunning
-	engine.mu.Unlock()
+	engine.commitRunning()
 
 	engine.track(conn)
 	engine.wg.Add(3)
@@ -124,6 +125,8 @@ func (engine *Engine) Start(ctx context.Context) error {
 }
 
 // claimStartSlot 校验配置并原子认领启动位，返回拨号器与服务端端点。
+//
+// 认领即把状态置为 starting，后续失败由调用方回滚到 idle。
 func (engine *Engine) claimStartSlot() (func(ctx context.Context, address string) (net.Conn, error), core.ServerEndpoint, error) {
 	if err := engine.config.Validate(); err != nil {
 		return nil, core.ServerEndpoint{}, err
@@ -131,16 +134,45 @@ func (engine *Engine) claimStartSlot() (func(ctx context.Context, address string
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	if engine.state != stateIdle {
-		if engine.state == stateRunning {
+		if engine.state == stateStarting || engine.state == stateRunning {
 			return nil, core.ServerEndpoint{}, ErrAlreadyStarted
 		}
 		return nil, core.ServerEndpoint{}, ErrStopped
 	}
+	engine.state = stateStarting
 	dial := engine.dial
 	if dial == nil {
 		dial = standardDial
 	}
 	return dial, engine.config.ServerEndpoint(), nil
+}
+
+// releaseStartSlot 把认领失败的启动位回滚到 idle。
+func (engine *Engine) releaseStartSlot() {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if engine.state == stateStarting {
+		engine.state = stateIdle
+	}
+}
+
+// commitRunning 把认领成功的启动位推进到 running。
+func (engine *Engine) commitRunning() {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	engine.state = stateRunning
+}
+
+// setFinalErr 记录导致停止的首个异常错误；正常 Shutdown 不调用。
+func (engine *Engine) setFinalErr(err error) {
+	if err == nil {
+		return
+	}
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if engine.finalErr == nil {
+		engine.finalErr = err
+	}
 }
 
 // Shutdown 幂等关闭：停止心跳与控制会话，按排水上限等待活动连接，随后释放全部资源。
@@ -169,6 +201,10 @@ func (engine *Engine) markStopped() {
 
 // waitDrained 等待活动连接按排水上限结束；超限后强制关闭并继续等待。
 func (engine *Engine) waitDrained(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		engine.closeConns()
+		return err
+	}
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
@@ -188,6 +224,7 @@ func (engine *Engine) waitDrained(ctx context.Context) error {
 	case <-timer.C:
 		engine.closeConns()
 		<-finished
+		return context.DeadlineExceeded
 	case <-ctx.Done():
 		engine.closeConns()
 		<-finished
@@ -349,7 +386,7 @@ func (control *controlSession) readLoginResponse(timeout time.Duration) error {
 	return nil
 }
 
-// serveControl 维持控制连接的读循环：服务端主动关闭或出错即退出。
+// serveControl 维持控制连接的读循环：服务端主动关闭或出错即记录异常并退出。
 func (engine *Engine) serveControl(control *controlSession) {
 	defer engine.wg.Done()
 	defer engine.untrack(control.conn)
@@ -362,13 +399,14 @@ func (engine *Engine) serveControl(control *controlSession) {
 		}
 		frame, err := reader.ReadFrame()
 		if err != nil {
+			engine.failAbnormal(err)
 			return
 		}
 		frame.Release()
 	}
 }
 
-// heartbeatLoop 按配置心跳间隔发送 ping。
+// heartbeatLoop 按配置心跳间隔发送 ping；写入失败即记录异常并退出。
 func (engine *Engine) heartbeatLoop(control *controlSession) {
 	defer engine.wg.Done()
 	interval := engine.config.Heartbeat()
@@ -384,16 +422,32 @@ func (engine *Engine) heartbeatLoop(control *controlSession) {
 		case <-ticker.C:
 			encoded, err := wire.EncodeV1Frame(wire.Frame{Type: wire.MessageTypePing, Payload: []byte(`{}`)})
 			if err != nil {
+				engine.failAbnormal(err)
 				return
 			}
 			control.mu.Lock()
 			_, err = control.conn.Write(encoded)
 			control.mu.Unlock()
 			if err != nil {
+				engine.failAbnormal(err)
 				return
 			}
 		}
 	}
+}
+
+// failAbnormal 记录异常停止的首个错误并关闭 Done。
+//
+// 正常 Shutdown 路径不得调用：Shutdown 后 Err() 必须保持 nil。
+func (engine *Engine) failAbnormal(err error) {
+	engine.setFinalErr(err)
+	engine.mu.Lock()
+	select {
+	case <-engine.done:
+	default:
+		close(engine.done)
+	}
+	engine.mu.Unlock()
 }
 
 // maintainWorkConns 为每个代理维持一条待命工作连接。

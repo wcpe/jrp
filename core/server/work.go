@@ -13,7 +13,8 @@ import (
 // workBroker 按代理名管理访客与工作连接的双向暂存配对。
 //
 // 配对语义：访客与工作连接到达顺序不确定，任一方先到都暂存，另一方到达时
-// 立即配对桥接。关闭后所有等待返回确定错误，不留悬挂 goroutine。
+// 立即配对桥接。桥接纳入 Engine 的 WaitGroup 管理，Shutdown 时按排水上限
+// 等待；关闭后暂存连接全部关闭，不留悬挂 goroutine。
 type workBroker struct {
 	mu     sync.Mutex
 	guests map[string][]net.Conn
@@ -33,7 +34,8 @@ func newWorkBroker() *workBroker {
 //
 // 返回的布尔值表示是否完成配对。未配对时访客已暂存，调用方不得关闭它；
 // 已配对时访客已移交给桥接，调用方同样不得再操作。
-func (broker *workBroker) parkGuest(proxyName string, guest net.Conn) bool {
+// 配对成功后桥接纳入 Engine 的 WaitGroup，由 Shutdown 按排水上限等待。
+func (broker *workBroker) parkGuest(proxyName string, guest net.Conn, track func(net.Conn), add func(int)) bool {
 	broker.mu.Lock()
 	defer broker.mu.Unlock()
 	if broker.closed {
@@ -42,15 +44,28 @@ func (broker *workBroker) parkGuest(proxyName string, guest net.Conn) bool {
 	if len(broker.works[proxyName]) > 0 {
 		work := broker.works[proxyName][0]
 		broker.works[proxyName] = broker.works[proxyName][1:]
-		go bridgeWorkConn(context.Background(), guest, work)
+		track(guest)
+		track(work)
+		add(1)
+		go func() {
+			defer add(-1)
+			defer untrackBoth(track, guest, work)
+			bridgeWorkConn(context.Background(), guest, work)
+		}()
 		return true
 	}
 	broker.guests[proxyName] = append(broker.guests[proxyName], guest)
 	return false
 }
 
+// untrackBoth 从活动集合移除一对已桥接的连接。
+func untrackBoth(untrack func(net.Conn), guest, work net.Conn) {
+	untrack(guest)
+	untrack(work)
+}
+
 // park 暂存一条待命工作连接；若已有等待访客，立即配对并返回真。
-func (broker *workBroker) park(proxyName string, work net.Conn) bool {
+func (broker *workBroker) park(proxyName string, work net.Conn, track func(net.Conn), add func(int)) bool {
 	broker.mu.Lock()
 	defer broker.mu.Unlock()
 	if broker.closed {
@@ -59,7 +74,14 @@ func (broker *workBroker) park(proxyName string, work net.Conn) bool {
 	if len(broker.guests[proxyName]) > 0 {
 		guest := broker.guests[proxyName][0]
 		broker.guests[proxyName] = broker.guests[proxyName][1:]
-		go bridgeWorkConn(context.Background(), guest, work)
+		track(guest)
+		track(work)
+		add(1)
+		go func() {
+			defer add(-1)
+			defer untrackBoth(track, guest, work)
+			bridgeWorkConn(context.Background(), guest, work)
+		}()
 		return true
 	}
 	broker.works[proxyName] = append(broker.works[proxyName], work)

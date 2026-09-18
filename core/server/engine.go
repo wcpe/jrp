@@ -61,6 +61,7 @@ type engineState int
 
 const (
 	stateIdle engineState = iota
+	stateStarting
 	stateRunning
 	stateStopped
 )
@@ -110,22 +111,21 @@ func (engine *Engine) Start(ctx context.Context) error {
 		return err
 	}
 	if listener == nil {
+		engine.releaseStartSlot()
 		return errors.New("服务端引擎缺少宿主注入的监听器")
 	}
 	if !listenerUsable(listener) {
+		engine.releaseStartSlot()
 		return errors.New("宿主注入的监听器已关闭或不可用")
 	}
 
 	guests, addresses, err := openGuestListeners(engine.config.Bindings())
 	if err != nil {
+		engine.releaseStartSlot()
 		return err
 	}
 
-	engine.mu.Lock()
-	engine.state = stateRunning
-	engine.guestLns = guests
-	engine.guestAddr = addresses
-	engine.mu.Unlock()
+	engine.commitRunning(guests, addresses)
 
 	engine.wg.Add(1)
 	go engine.serveControl(listener)
@@ -139,7 +139,8 @@ func (engine *Engine) Start(ctx context.Context) error {
 
 // claimStartSlot 校验配置并原子认领启动位。
 //
-// 返回宿主注入的监听器。重复启动返回哨兵错误而不触碰任何资源。
+// 认领即把状态置为 starting，后续失败由调用方回滚到 idle。重复启动返回哨兵
+// 错误而不触碰任何资源。返回宿主注入的监听器。
 func (engine *Engine) claimStartSlot() (net.Listener, error) {
 	if err := engine.config.Validate(); err != nil {
 		return nil, err
@@ -147,12 +148,34 @@ func (engine *Engine) claimStartSlot() (net.Listener, error) {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	if engine.state != stateIdle {
-		if engine.state == stateRunning {
+		if engine.state == stateStarting || engine.state == stateRunning {
 			return nil, ErrAlreadyStarted
 		}
 		return nil, ErrStopped
 	}
+	engine.state = stateStarting
 	return engine.listener, nil
+}
+
+// releaseStartSlot 把认领失败的启动位回滚到 idle。
+func (engine *Engine) releaseStartSlot() {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if engine.state == stateStarting {
+		engine.state = stateIdle
+	}
+}
+
+// commitRunning 把认领成功的启动位推进到 running。
+func (engine *Engine) commitRunning(
+	guests map[string]net.Listener,
+	addresses map[string]net.Addr,
+) {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	engine.state = stateRunning
+	engine.guestLns = guests
+	engine.guestAddr = addresses
 }
 
 // openGuestListeners 为每个代理绑定打开访客监听器。
@@ -200,8 +223,27 @@ func (engine *Engine) stopListenersLocked() {
 	engine.closeConns()
 }
 
+// setFinalErr 记录导致停止的首个异常错误；正常 Shutdown 不调用。
+//
+// 只保留首个错误，后续错误不覆盖。调用方必须保证传入的错误已脱敏，
+// 不含 token、密码、Authorization 或正文原文。
+func (engine *Engine) setFinalErr(err error) {
+	if err == nil {
+		return
+	}
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if engine.finalErr == nil {
+		engine.finalErr = err
+	}
+}
+
 // waitDrained 等待活动连接按排水上限结束；超限后强制关闭并继续等待。
 func (engine *Engine) waitDrained(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		engine.closeConns()
+		return err
+	}
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
@@ -221,6 +263,7 @@ func (engine *Engine) waitDrained(ctx context.Context) error {
 	case <-timer.C:
 		engine.closeConns()
 		<-finished
+		return context.DeadlineExceeded
 	case <-ctx.Done():
 		engine.closeConns()
 		<-finished
@@ -382,15 +425,18 @@ func (engine *Engine) handleControl(raw net.Conn) {
 	})
 	version, err := guard.DetectVersion(raw)
 	if err != nil {
+		engine.failAbnormal(err)
 		return
 	}
 	if version != wire.VersionV1 {
+		engine.failAbnormal(errors.New("服务端仅接受 wire v1"))
 		return
 	}
 	// 版本判定已把读取器绑定到回放后的流：用守卫统一入口读取，
 	// 不得重建 V1Reader，否则会重复消费版本判定阶段的预读字节。
 	first, err := guard.ReadFrame()
 	if err != nil {
+		engine.failAbnormal(err)
 		return
 	}
 	switch first.Type.Name {
@@ -398,6 +444,7 @@ func (engine *Engine) handleControl(raw net.Conn) {
 		clientID, err := engine.handleLogin(raw, first.Payload)
 		first.Release()
 		if err != nil {
+			engine.failAbnormal(err)
 			return
 		}
 		engine.registerClient(clientID, raw)
@@ -408,28 +455,50 @@ func (engine *Engine) handleControl(raw net.Conn) {
 		first.Release()
 	default:
 		first.Release()
+		engine.failAbnormal(errors.New("控制连接首帧类型非法"))
 	}
 }
 
 // serveControlLoop 在已登录的控制连接上处理心跳，直到连接结束。
+//
+// 心跳中断或未知帧都视为异常终止：记录首个异常错误并关闭 Done，
+// 使宿主可通过 Err() 判定。正常 Shutdown 不经过本路径。
 func (engine *Engine) serveControlLoop(conn net.Conn, guard *wire.ConnectionGuard, clientID string) {
 	_ = clientID
 	for {
 		frame, err := guard.ReadFrame()
 		if err != nil {
+			engine.failAbnormal(err)
 			return
 		}
 		switch frame.Type.Name {
 		case "ping":
 			frame.Release()
 			if err := engine.replyPong(conn); err != nil {
+				engine.failAbnormal(err)
 				return
 			}
 		default:
 			frame.Release()
+			engine.failAbnormal(errors.New("控制连接收到未知帧"))
 			return
 		}
 	}
+}
+
+// failAbnormal 记录异常停止的首个错误并关闭 Done。
+//
+// 正常 Shutdown 路径不得调用：Shutdown 后 Err() 必须保持 nil。
+// 传入的错误不得包含 token、密码、Authorization 或正文原文。
+func (engine *Engine) failAbnormal(err error) {
+	engine.setFinalErr(err)
+	engine.mu.Lock()
+	select {
+	case <-engine.done:
+	default:
+		close(engine.done)
+	}
+	engine.mu.Unlock()
 }
 
 // serveWorkDeclaration 处理一条工作连接的归属声明并与访客配对。
@@ -440,7 +509,8 @@ func (engine *Engine) serveWorkDeclaration(raw net.Conn, payload []byte) {
 		return
 	}
 	// 有等待访客则立即配对，否则暂存等待访客到达。
-	if !engine.workConns.park(proxyName, raw) {
+	// 配对成功后桥接纳入 WaitGroup，由 Shutdown 按排水上限等待。
+	if !engine.workConns.park(proxyName, raw, engine.track, engine.wg.Add) {
 		_ = raw.Close()
 	}
 }
@@ -589,7 +659,7 @@ func (engine *Engine) handleGuest(name string, guest net.Conn) {
 	engine.track(guest)
 	// parkGuest 接管访客的所有权：配对成功后桥接负责关闭，未配对时暂存；
 	// 暂存失败（引擎停止）时此处关闭。
-	paired := engine.workConns.parkGuest(name, guest)
+	paired := engine.workConns.parkGuest(name, guest, engine.track, engine.wg.Add)
 	if paired {
 		engine.untrack(guest)
 		return
