@@ -2,9 +2,11 @@ package wire
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -314,4 +316,200 @@ func mustEncodeV1(t *testing.T) []byte {
 		t.Fatalf("编码失败：%v", err)
 	}
 	return encoded
+}
+
+// TestEveryRejectionPublishesCloseEvent 断言每类拒绝分支都发布结构化关闭事件。
+//
+// 规格 §5 要求「每种拒绝情形都能观测到结构化关闭事件」，且事件不得携带
+// 载荷、密钥或内部字段路径。本测试逐类驱动拒绝路径并校验事件内容。
+func TestEveryRejectionPublishesCloseEvent(t *testing.T) {
+	cases := []struct {
+		name     string
+		options  Options
+		stream   []byte
+		category ErrorCategory
+	}{
+		{
+			name:     "hello 帧截断",
+			options:  Options{MaxWireVersion: VersionV2, V2Enabled: true},
+			stream:   append(append([]byte(nil), V2Magic...), truncatedHelloBytes(t)...),
+			category: CategoryNegotiationFrameInvalid,
+		},
+		{
+			name:     "hello 载荷结构畸形",
+			options:  Options{MaxWireVersion: VersionV2, V2Enabled: true},
+			stream:   append(append([]byte(nil), V2Magic...), malformedHelloBytes(t)...),
+			category: CategoryNegotiationFrameInvalid,
+		},
+		{
+			name:     "消息阶段收到非消息帧",
+			options:  Options{MaxWireVersion: VersionV2, V2Enabled: true},
+			stream:   append(append([]byte(nil), V2Magic...), messageStageNonMessageBytes(t)...),
+			category: CategoryFrameTypeInvalid,
+		},
+		{
+			name:     "v1 载荷长度超限",
+			options:  Options{MaxWireVersion: VersionV1},
+			stream:   overLimitV1FrameBytes(t),
+			category: CategoryLengthExceeded,
+		},
+		{
+			name:     "v1 载荷长度为负",
+			options:  Options{MaxWireVersion: VersionV1},
+			stream:   negativeLengthV1FrameBytes(),
+			category: CategoryLengthInvalid,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			// 用真实回环连接而非 net.Pipe：后者同步无缓冲，写入会阻塞到读方消费，
+			// 而本测试只需把字节送达解析器。
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("监听失败：%v", err)
+			}
+			defer listener.Close()
+
+			accepted := make(chan net.Conn, 1)
+			go func() {
+				conn, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				accepted <- conn
+			}()
+
+			client, err := net.Dial("tcp", listener.Addr().String())
+			if err != nil {
+				t.Fatalf("拨号失败：%v", err)
+			}
+			defer client.Close()
+			if _, err := client.Write(testCase.stream); err != nil {
+				t.Fatalf("写入失败：%v", err)
+			}
+
+			var server net.Conn
+			select {
+			case server = <-accepted:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("服务端未收到连接")
+			}
+			defer server.Close()
+			// 读超时兜底：输入可能短于解析器期望的前缀宽度，
+			// 无超时会让读取永久等待对端补字节。
+			_ = server.SetReadDeadline(time.Now().Add(3 * time.Second))
+
+			var mu sync.Mutex
+			var events []CloseEvent
+			guard := NewConnectionGuard(server, mustPool(t), Options{
+				MaxWireVersion: testCase.options.MaxWireVersion,
+				V2Enabled:      testCase.options.V2Enabled,
+				EventSink: func(event CloseEvent) {
+					mu.Lock()
+					events = append(events, event)
+					mu.Unlock()
+				},
+			})
+
+			version, err := guard.DetectVersion(server)
+			if err != nil {
+				assertCloseEventPublished(t, &mu, &events, testCase.category)
+				return
+			}
+
+			if version == VersionV2 {
+				if _, err := guard.Negotiate(); err != nil {
+					assertCloseEventPublished(t, &mu, &events, testCase.category)
+					return
+				}
+				if _, err := guard.ReadFrame(); err != nil {
+					assertCloseEventPublished(t, &mu, &events, testCase.category)
+					return
+				}
+			} else {
+				if _, err := guard.ReadFrame(); err != nil {
+					assertCloseEventPublished(t, &mu, &events, testCase.category)
+					return
+				}
+			}
+			t.Fatalf("该输入应被拒绝但通过了全部阶段")
+		})
+	}
+}
+
+// assertCloseEventPublished 校验拒绝路径已发布带正确类别的事件且内容脱敏。
+func assertCloseEventPublished(t *testing.T, mu *sync.Mutex, events *[]CloseEvent, category ErrorCategory) {
+	t.Helper()
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*events) == 0 {
+		t.Fatalf("拒绝路径未发布关闭事件（期望类别 %s）", category)
+	}
+	event := (*events)[len(*events)-1]
+	if event.Category != category {
+		t.Fatalf("事件类别不一致：实际 %s，期望 %s", event.Category, category)
+	}
+	if event.Succeeded {
+		t.Fatalf("拒绝事件不得标记为成功")
+	}
+	if event.Stage == "" {
+		t.Fatalf("拒绝事件必须携带阶段")
+	}
+	// 脱敏：事件不得携带内部字段路径或密钥材料。
+	digest := event.PeerDigest
+	for _, forbidden := range []string{"capabilities", "algorithms", "clientRandom", "serverRandom", "/"} {
+		if strings.Contains(digest, forbidden) {
+			t.Fatalf("事件摘要泄露内部信息：%q", digest)
+		}
+	}
+}
+
+// truncatedHelloBytes 返回一段被截断的 client hello 帧。
+func truncatedHelloBytes(t *testing.T) []byte {
+	t.Helper()
+	full := mustHello(t, clientHelloWith([]string{"json"}, []string{"none"}, nil, 4096))
+	return full[:len(full)/2]
+}
+
+// malformedHelloBytes 返回载荷结构畸形的 client hello 帧。
+func malformedHelloBytes(t *testing.T) []byte {
+	t.Helper()
+	frame, err := EncodeV2Frame(V2FrameTypeClientHello, []byte(`{"capabilities":`))
+	if err != nil {
+		t.Fatalf("编码失败：%v", err)
+	}
+	return frame
+}
+
+// messageStageNonMessageBytes 返回「合法 hello + 消息阶段送达的非消息帧」字节流。
+//
+// 消息阶段要求帧类型为 message；此处第二帧用 server hello，
+// 解析器应在消息阶段把它归为帧类型非法。
+func messageStageNonMessageBytes(t *testing.T) []byte {
+	t.Helper()
+	hello := mustHello(t, clientHelloWith([]string{"json"}, []string{"none"}, nil, 4096))
+	nonMessage, err := EncodeV2Frame(V2FrameTypeServerHello, []byte(`{"selected":{"maxPayload":65536}}`))
+	if err != nil {
+		t.Fatalf("编码失败：%v", err)
+	}
+	return append(hello, nonMessage...)
+}
+
+// overLimitV1FrameBytes 构造一条声明长度超过上限的 v1 帧。
+func overLimitV1FrameBytes(t *testing.T) []byte {
+	t.Helper()
+	raw := make([]byte, V1HeaderSize)
+	raw[0] = MessageTypeLogin.V1Byte
+	binary.BigEndian.PutUint64(raw[1:V1HeaderSize], uint64(DefaultV1PayloadLimit+1))
+	return raw
+}
+
+// negativeLengthV1FrameBytes 构造一条长度字段为负的 v1 帧。
+func negativeLengthV1FrameBytes() []byte {
+	raw := make([]byte, V1HeaderSize)
+	raw[0] = MessageTypeLogin.V1Byte
+	// 长度字段按有符号 int64 解释：最高位置 1 即负值。
+	binary.BigEndian.PutUint64(raw[1:V1HeaderSize], uint64(1)<<63)
+	return raw
 }

@@ -30,6 +30,3 @@ type ProxyType string
 
 // ProxyTypeTCP 是 TCP 代理，对应 FR-06a 的 TCP 部分。
 const ProxyTypeTCP ProxyType = "tcp"
-
-// supportedProxyTypes 列出当前已交付的代理类型取值。
-var supportedProxyTypes = []ProxyType{ProxyTypeTCP}

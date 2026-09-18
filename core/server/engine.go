@@ -653,36 +653,6 @@ func (engine *Engine) isStopped() bool {
 	return engine.state == stateStopped
 }
 
-// serveWorkConns 在已登录的控制连接上接受客户端建立的工作连接并配对访客。
-//
-// 客户端登录后为其每个代理维持一条待命工作连接；有新访客时服务端把访客
-// 与一条已建立的工作连接配对桥接，客户端随即补充一条新的待命连接。
-// 工作连接与控制连接共享同一个监听器：handleControl 按首帧类型分流，
-// 登录帧走控制路径，工作声明帧走配对路径，因此本函数无需额外监听。
-func (engine *Engine) serveWorkConns(control net.Conn, clientID string) {
-	_ = control
-	engine.mu.Lock()
-	proxies := make([]string, 0, len(engine.guestLns))
-	for name := range engine.guestLns {
-		if engine.bindingClient(name) == clientID {
-			proxies = append(proxies, name)
-		}
-	}
-	engine.mu.Unlock()
-
-	_ = proxies
-}
-
-// bindingClient 返回指定代理绑定归属的客户端标识。
-func (engine *Engine) bindingClient(name string) string {
-	for _, binding := range engine.config.Bindings() {
-		if binding.Name == name {
-			return binding.ClientID
-		}
-	}
-	return ""
-}
-
 // handleGuest 把访客连接交给配对中心：有待命工作连接立即桥接，否则暂存。
 func (engine *Engine) handleGuest(name string, guest net.Conn) {
 	defer engine.wg.Done()

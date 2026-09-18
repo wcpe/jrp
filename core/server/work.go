@@ -2,12 +2,9 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net"
 	"sync"
-
-	"github.com/wcpe/jrp/core/internal/wire"
 )
 
 // workBroker 按代理名管理访客与工作连接的双向暂存配对。
@@ -117,27 +114,6 @@ func (broker *workBroker) closeStaged() {
 type workConnRequest struct {
 	RunID string `json:"run_id"`
 	Proxy string `json:"proxy_name"`
-}
-
-// acceptWorkConn 在控制连接之外接受一条工作连接，读取其声明的归属代理。
-func acceptWorkConn(conn net.Conn) (string, error) {
-	reader := wire.NewV1Reader(conn, wire.DefaultV1PayloadLimit)
-	frame, err := reader.ReadFrame()
-	if err != nil {
-		return "", err
-	}
-	defer frame.Release()
-	if frame.Type.Name != "new-work-conn" {
-		return "", errors.New("工作连接首帧类型不符")
-	}
-	var request workConnRequest
-	if err := json.Unmarshal(frame.Payload, &request); err != nil {
-		return "", errors.New("工作连接声明载荷非法")
-	}
-	if request.Proxy == "" {
-		return "", errors.New("工作连接未声明代理归属")
-	}
-	return request.Proxy, nil
 }
 
 // bridgeWorkConn 把已配对的访客与工作连接双向桥接，直到任一方向结束。

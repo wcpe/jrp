@@ -548,3 +548,110 @@ func TestProtocolErrorInvariants(t *testing.T) {
 		t.Fatalf("错误文案不应回显原始字节：%v", err)
 	}
 }
+
+// TestV2UnknownMessageTypeIsRejected 断言 v2 未登记的消息类型 ID 被拒绝。
+//
+// 与 v1 的同类测试对称：v2 用 2 字节网络字节序 ID，未登记取值必须归为类型错误，
+// 不得猜测语义放行。
+func TestV2UnknownMessageTypeIsRejected(t *testing.T) {
+	// 登记表最大 ID 为 13，取其加一作为未登记取值。
+	unknownID := uint16(MessageTypeUDPPacket.V2ID + 1)
+	if _, ok := MessageTypeByV2ID(unknownID); ok {
+		t.Fatalf("测试前提失效：ID %d 已登记", unknownID)
+	}
+
+	body := []byte(`{"probe":true}`)
+	payload := make([]byte, V2MessageTypeIDSize+len(body))
+	binary.BigEndian.PutUint16(payload[0:V2MessageTypeIDSize], unknownID)
+	copy(payload[V2MessageTypeIDSize:], body)
+
+	raw := make([]byte, V2HeaderSize+len(payload))
+	binary.BigEndian.PutUint16(raw[0:2], V2FrameTypeMessage)
+	binary.BigEndian.PutUint32(raw[4:V2HeaderSize], uint32(len(payload)))
+	copy(raw[V2HeaderSize:], payload)
+
+	_, err := DecodeV2Frame(raw, DefaultV2PayloadLimit)
+	if !IsCategory(err, CategoryTypeInvalid) {
+		t.Fatalf("未登记类型 ID 必须归为类型错误，实际：%v", err)
+	}
+
+	// 编码侧同样拒绝：不得产出对端无法识别的帧。
+	unregistered := MessageType{Name: "unregistered", V1Byte: '?', V2ID: unknownID}
+	if _, err := EncodeV2MessageFrame(unregistered, body); !IsCategory(err, CategoryTypeInvalid) {
+		t.Fatalf("编码未登记类型必须被拒绝，实际：%v", err)
+	}
+}
+
+// TestV2ReaderTruncatedStreamIsRejected 断言 v2 流式读取的截断与传输错误被正确分类。
+//
+// 三个分支必须互相区分：帧头部分到达（截断）、载荷未读满（截断）、
+// 底层非 EOF 读错误（传输失败）。
+func TestV2ReaderTruncatedStreamIsRejected(t *testing.T) {
+	buildFrame := func(payloadSize int) []byte {
+		payload := make([]byte, V2MessageTypeIDSize+payloadSize)
+		binary.BigEndian.PutUint16(payload[0:V2MessageTypeIDSize], MessageTypeLogin.V2ID)
+		copy(payload[V2MessageTypeIDSize:], padPayload(payloadSize))
+		raw := make([]byte, V2HeaderSize+len(payload))
+		binary.BigEndian.PutUint16(raw[0:2], V2FrameTypeMessage)
+		binary.BigEndian.PutUint32(raw[4:V2HeaderSize], uint32(len(payload)))
+		copy(raw[V2HeaderSize:], payload)
+		return raw
+	}
+
+	t.Run("帧头部分到达", func(t *testing.T) {
+		full := buildFrame(16)
+		reader := NewV2Reader(bytes.NewReader(full[:V2HeaderSize-3]), DefaultV2PayloadLimit)
+		if _, err := reader.ReadFrame(); !IsCategory(err, CategoryPayloadTruncated) {
+			t.Fatalf("帧头截断必须归为载荷截断，实际：%v", err)
+		}
+	})
+
+	t.Run("载荷未读满", func(t *testing.T) {
+		full := buildFrame(64)
+		reader := NewV2Reader(bytes.NewReader(full[:len(full)-20]), DefaultV2PayloadLimit)
+		if _, err := reader.ReadFrame(); !IsCategory(err, CategoryPayloadTruncated) {
+			t.Fatalf("载荷截断必须归为载荷截断，实际：%v", err)
+		}
+	})
+
+	t.Run("帧边界 EOF 与截断可区分", func(t *testing.T) {
+		reader := NewV2Reader(bytes.NewReader(nil), DefaultV2PayloadLimit)
+		if _, err := reader.ReadFrame(); err != io.EOF {
+			t.Fatalf("空流在帧边界应返回 io.EOF，实际：%v", err)
+		}
+	})
+
+	t.Run("底层读错误归为传输失败", func(t *testing.T) {
+		full := buildFrame(32)
+		// 头部读到后注入非 EOF 错误，触发传输失败分支。
+		source := &failingReader{data: full, failAfter: V2HeaderSize}
+		reader := NewV2Reader(source, DefaultV2PayloadLimit)
+		if _, err := reader.ReadFrame(); !IsCategory(err, CategoryTransportFailure) {
+			t.Fatalf("底层读错误必须归为传输失败，实际：%v", err)
+		}
+	})
+}
+
+// failingReader 在读出 failAfter 字节后返回非 EOF 错误，用于覆盖传输失败分支。
+type failingReader struct {
+	data      []byte
+	offset    int
+	failAfter int
+}
+
+// Read 实现 io.Reader；越过门槛后返回确定错误而非 EOF。
+func (reader *failingReader) Read(p []byte) (int, error) {
+	if reader.offset >= reader.failAfter {
+		return 0, errInjectedTransport
+	}
+	remaining := reader.failAfter - reader.offset
+	if remaining > len(p) {
+		remaining = len(p)
+	}
+	copied := copy(p, reader.data[reader.offset:reader.offset+remaining])
+	reader.offset += copied
+	return copied, nil
+}
+
+// errInjectedTransport 是测试注入的传输层错误。
+var errInjectedTransport = errors.New("注入的传输层错误")
