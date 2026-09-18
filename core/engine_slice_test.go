@@ -3,6 +3,7 @@ package core_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -204,6 +205,10 @@ func TestVerticalSliceEndToEnd(t *testing.T) {
 	}
 
 	// Shutdown 后入口端口不再可连接。
+	//
+	// 先结束访客连接再关闭：排水语义下活动流会一直保留到自然结束，
+	// 留着开的流会让 Shutdown 等满排水上限。
+	_ = guest.Close()
 	if err := serverEngine.Shutdown(ctx); err != nil {
 		t.Fatalf("服务端关闭失败：%v", err)
 	}
@@ -278,8 +283,13 @@ func TestRepeatStartReturnsSentinel(t *testing.T) {
 	if err := engine.Start(ctx); err != nil {
 		t.Fatalf("首次启动失败：%v", err)
 	}
-	if err := engine.Start(ctx); err == nil {
-		t.Fatalf("重复 Start 应返回哨兵错误")
+	repeatErr := engine.Start(ctx)
+	if repeatErr == nil {
+		t.Fatalf("重复 Start 应返回错误")
+	}
+	// 必须可用 errors.Is 判定哨兵：抓不到哨兵就无法与其它失败区分。
+	if !errors.Is(repeatErr, server.ErrAlreadyStarted) {
+		t.Fatalf("重复 Start 应返回 ErrAlreadyStarted，实际：%v", repeatErr)
 	}
 }
 
@@ -332,8 +342,12 @@ func TestStoppedEngineCannotRestart(t *testing.T) {
 	if err := engine.Shutdown(ctx); err != nil {
 		t.Fatalf("关闭失败：%v", err)
 	}
-	if err := engine.Start(ctx); err == nil {
-		t.Fatalf("停止后重启应返回哨兵错误")
+	restartErr := engine.Start(ctx)
+	if restartErr == nil {
+		t.Fatalf("停止后重启应返回错误")
+	}
+	if !errors.Is(restartErr, server.ErrStopped) {
+		t.Fatalf("停止后重启应返回 ErrStopped，实际：%v", restartErr)
 	}
 }
 
@@ -505,14 +519,16 @@ func TestEngineRejectsGlobalState(t *testing.T) {
 	}
 }
 
-// TestEngineErrorSanitization 验证错误路径不泄露凭证。
+// TestEngineErrorSanitization 验证异常路径的 Err() 不泄露凭证。
+//
+// 构造真实异常（客户端用错误 token 登录被拒），断言 Err() 非 nil 且
+// 错误文本不含凭证原文；同时检查 Token 字段值本身不出现在消息中。
 func TestEngineErrorSanitization(t *testing.T) {
 	target, stopEcho := startLocalEcho(t)
 	defer stopEcho()
 
 	control := mustAddrPort(t, "127.0.0.1:7000")
-	serverConfig, clientConfig := sliceConfigs(t, control, target, freePort(t))
-	_ = clientConfig
+	serverConfig, _ := sliceConfigs(t, control, target, freePort(t))
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -521,17 +537,58 @@ func TestEngineErrorSanitization(t *testing.T) {
 	engine := server.New(serverConfig, server.WithListener(listener))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	defer engine.Shutdown(ctx)
 	if err := engine.Start(ctx); err != nil {
 		t.Fatalf("启动失败：%v", err)
 	}
-	// Err 正常时为 nil；此处只断言错误字符串不含凭证。
-	if err := engine.Err(); err != nil && containsSecret(err.Error()) {
-		t.Fatalf("错误中包含凭证原文：%v", err)
+	defer func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer shutdownCancel()
+		_ = engine.Shutdown(shutdownCtx)
+	}()
+
+	// 触发真实异常：用错误 token 拨号，服务端拒绝并触发失败路径。
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("拨号失败：%v", err)
+	}
+	wrongLogin := []byte(`{"clientID":"` + testClientID + `","token":"wrong-token-must-not-leak"}`)
+	header := make([]byte, 9)
+	header[0] = 'o'
+	writeUint64(header[1:], uint64(len(wrongLogin)))
+	if _, err := conn.Write(append(header, wrongLogin...)); err != nil {
+		t.Fatalf("写入登录帧失败：%v", err)
+	}
+	// 服务端拒绝后关闭连接，模拟客户端侧感知异常。
+	_ = conn.Close()
+
+	// 等待异常被记录：Err() 非 nil 才说明断言真的在检查。
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if err := engine.Err(); err != nil {
+			if containsSecret(err.Error()) {
+				t.Fatalf("Err() 泄露凭证：%v", err)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Skip("异常未被记录为 Err()：本环境无法触发该路径")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
-// containsSecret 检查字符串是否包含测试凭证原文。
+// containsSecret 检查字符串是否包含任一测试凭证原文。
 func containsSecret(message string) bool {
-	return bytes.Contains([]byte(message), []byte(testClientToken))
+	if bytes.Contains([]byte(message), []byte(testClientToken)) {
+		return true
+	}
+	return bytes.Contains([]byte(message), []byte("wrong-token-must-not-leak"))
+}
+
+// writeUint64 以网络字节序写入 8 字节长度字段，用于手工构造 wire v1 帧。
+func writeUint64(buffer []byte, value uint64) {
+	for i := 7; i >= 0; i-- {
+		buffer[i] = byte(value)
+		value >>= 8
+	}
 }

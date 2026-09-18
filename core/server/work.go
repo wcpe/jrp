@@ -88,8 +88,11 @@ func (broker *workBroker) park(proxyName string, work net.Conn, track func(net.C
 	return true
 }
 
-// close 关闭配对中心：关闭全部暂存连接并拒绝后续配对。
-func (broker *workBroker) close() {
+// closeStaged 关闭尚未配对的暂存连接并拒绝后续配对。
+//
+// 已配对并进入桥接的连接不在此处理：它们承载活动流，由 Engine 按排水上限
+// 等待自然结束。
+func (broker *workBroker) closeStaged() {
 	broker.mu.Lock()
 	defer broker.mu.Unlock()
 	if broker.closed {

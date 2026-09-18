@@ -203,6 +203,9 @@ func (guard *ConnectionGuard) Negotiate() (NegotiationResult, error) {
 	if err != nil {
 		return NegotiationResult{}, guard.fail(err)
 	}
+	// 协商上限必须回灌到消息读取路径：否则后续消息帧仍按实现上限解析，
+	// 对端声明的较小上限形同虚设，违反「取双方较小值」的协商语义。
+	reader.SetLimit(result.MaxPayload)
 
 	guard.mu.Lock()
 	guard.v2 = reader

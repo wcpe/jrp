@@ -556,3 +556,45 @@ func newTestGuard(t *testing.T, options Options) *ConnectionGuard {
 	}
 	return NewConnectionGuard(&recordingConn{Conn: &bufferConn{buffer: &bytes.Buffer{}}}, pool, options)
 }
+
+// TestNegotiatedLimitAppliesToConnectionReads 断言协商上限被回灌到连接读取路径。
+//
+// 这是验收发现的缺口：协商结果此前只停留在返回值上，连接读取器仍按实现上限
+// 解析，导致对端声明的较小上限形同虚设。
+func TestNegotiatedLimitAppliesToConnectionReads(t *testing.T) {
+	// 客户端声明 4096 上限，低于服务端实现上限。
+	// mustHello 返回的是完整帧（含帧头），不再二次封装。
+	helloFrame := mustHello(t, clientHelloWith([]string{"json"}, []string{"none"}, nil, 4096))
+
+	// 构造一条载荷超过协商上限（4096）但低于实现上限（64 KiB）的消息帧。
+	oversized := make([]byte, 8192)
+	binary.BigEndian.PutUint16(oversized[0:V2MessageTypeIDSize], MessageTypeLogin.V2ID)
+	oversizedFrame, err := EncodeV2FrameWithLimit(V2FrameTypeMessage, oversized, DefaultV2PayloadLimit)
+	if err != nil {
+		t.Fatalf("编码超限帧失败：%v", err)
+	}
+
+	// 同一条流：魔数 + hello + 超限消息帧。
+	stream := append(append(append([]byte(nil), V2Magic...), helloFrame...), oversizedFrame...)
+	pool, err := NewBufferPool(DefaultV2PayloadLimit, bufferedPoolSize)
+	if err != nil {
+		t.Fatalf("建立缓冲池失败：%v", err)
+	}
+	guard := NewConnectionGuard(nil, pool, Options{MaxWireVersion: VersionV2, V2Enabled: true})
+
+	if _, err := guard.DetectVersion(bytes.NewReader(stream)); err != nil {
+		t.Fatalf("版本判定失败：%v", err)
+	}
+	result, err := guard.Negotiate()
+	if err != nil {
+		t.Fatalf("协商失败：%v", err)
+	}
+	if result.MaxPayload != 4096 {
+		t.Fatalf("协商上限应为 4096，实际 %d", result.MaxPayload)
+	}
+
+	// 消息读取必须受协商上限约束：超限帧被拒绝而非按实现上限放行。
+	if _, err := guard.ReadFrame(); !IsCategory(err, CategoryLengthExceeded) {
+		t.Fatalf("超过协商上限的消息帧必须被拒绝，实际：%v", err)
+	}
+}

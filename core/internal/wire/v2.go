@@ -166,6 +166,17 @@ type V2Reader struct {
 	pool   *BufferPool
 }
 
+// SetLimit 收紧读取器的载荷上限。
+//
+// 协商达成后的上限取双方较小值：只能收紧不能放宽，放宽请求被忽略，
+// 避免对端通过声明超大上限绕过 Core 自身的实现上限。
+func (reader *V2Reader) SetLimit(limit int) {
+	if limit <= 0 || limit >= reader.limit {
+		return
+	}
+	reader.limit = limit
+}
+
 // NewV2Reader 建立 wire v2 读取器。
 func NewV2Reader(source io.Reader, limit int) *V2Reader {
 	return &V2Reader{source: source, limit: limit, header: make([]byte, V2HeaderSize)}

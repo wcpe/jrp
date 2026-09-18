@@ -18,6 +18,17 @@ const forbiddenCoreDependencies = [
     'SQLite',
     /^(?:modernc\.org\/sqlite|github\.com\/(?:mattn\/go-sqlite3|glebarez\/sqlite|ncruces\/go-sqlite3))(?:\/|$)/u,
   ],
+  // Web 框架：Core 不得承载管理面 Web 能力。
+  // 标准库 net/http 不在禁用范围：Core 用它做 TLS 握手与 HTTP 语义判断是合理的。
+  [
+    'Web',
+    /^github\.com\/(?:labstack\/echo|gofiber\/fiber|go-chi\/chi|gorilla\/mux|valyala\/fasthttp)(?:\/|$)/u,
+  ],
+  // 通知与邮件库：通知属于外壳适配器，Core 不得依赖。
+  [
+    '通知',
+    /^(?:github\.com\/(?:go-mail\/mail|jordan-wright\/email|wneessen\/go-mail)|gopkg\.in\/(?:mail\.v2|gomail\.v1))(?:\/|$)/u,
+  ],
   ['apps module', /^github\.com\/wcpe\/jrp\/apps(?:\/|$)/u],
 ];
 

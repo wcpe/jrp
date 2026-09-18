@@ -163,19 +163,9 @@ func (engine *Engine) commitRunning() {
 	engine.state = stateRunning
 }
 
-// setFinalErr 记录导致停止的首个异常错误；正常 Shutdown 不调用。
-func (engine *Engine) setFinalErr(err error) {
-	if err == nil {
-		return
-	}
-	engine.mu.Lock()
-	defer engine.mu.Unlock()
-	if engine.finalErr == nil {
-		engine.finalErr = err
-	}
-}
-
 // Shutdown 幂等关闭：停止心跳与控制会话，按排水上限等待活动连接，随后释放全部资源。
+//
+// 停止标记先于等待：读循环检查到停止状态后不再把连接关闭引发的读错误记为异常。
 func (engine *Engine) Shutdown(ctx context.Context) error {
 	engine.stopOnce.Do(func() {
 		engine.markStopped()
@@ -187,16 +177,18 @@ func (engine *Engine) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// markStopped 标记停止并关闭监听器与活动连接。
+// markStopped 标记停止、清理异常记录并关闭本地监听器。
+//
+// 不在此处关闭活动连接：它们交由 waitDrained 按排水上限等待。
 func (engine *Engine) markStopped() {
 	engine.mu.Lock()
 	engine.state = stateStopped
+	engine.finalErr = nil
 	close(engine.stopCh)
 	for _, listener := range engine.targetLn {
 		_ = listener.Close()
 	}
 	engine.mu.Unlock()
-	engine.closeConns()
 }
 
 // waitDrained 等待活动连接按排水上限结束；超限后强制关闭并继续等待。
@@ -439,9 +431,17 @@ func (engine *Engine) heartbeatLoop(control *controlSession) {
 // failAbnormal 记录异常停止的首个错误并关闭 Done。
 //
 // 正常 Shutdown 路径不得调用：Shutdown 后 Err() 必须保持 nil。
+// 引擎已进入停止流程时调用为空操作——此时连接关闭引发的读错误是 Shutdown
+// 的预期结果，不属于异常终止。
 func (engine *Engine) failAbnormal(err error) {
-	engine.setFinalErr(err)
 	engine.mu.Lock()
+	if engine.state == stateStopped {
+		engine.mu.Unlock()
+		return
+	}
+	if engine.finalErr == nil {
+		engine.finalErr = err
+	}
 	select {
 	case <-engine.done:
 	default:

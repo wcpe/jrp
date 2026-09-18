@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -35,17 +36,19 @@ type Engine struct {
 	logger   *slog.Logger
 	listener net.Listener
 
-	mu        sync.Mutex
-	state     engineState
-	done      chan struct{}
-	finalErr  error
-	stopOnce  sync.Once
-	wg        sync.WaitGroup
-	conns     map[net.Conn]struct{}
-	guestLns  map[string]net.Listener
-	guestAddr map[string]net.Addr
-	workConns *workBroker
-	clients   map[string]*clientSession
+	mu           sync.Mutex
+	state        engineState
+	stopping     bool
+	done         chan struct{}
+	finalErr     error
+	stopOnce     sync.Once
+	wg           sync.WaitGroup
+	conns        map[net.Conn]struct{}
+	controlConns map[net.Conn]struct{}
+	guestLns     map[string]net.Listener
+	guestAddr    map[string]net.Addr
+	workConns    *workBroker
+	clients      map[string]*clientSession
 
 	heartbeat time.Duration
 }
@@ -86,14 +89,15 @@ func WithLogger(logger *slog.Logger) Option {
 // New 构造服务端 Engine，只做纯内存装配，不绑定端口、不启动 goroutine。
 func New(config core.ServerConfig, options ...Option) *Engine {
 	engine := &Engine{
-		config:    config,
-		done:      make(chan struct{}),
-		conns:     make(map[net.Conn]struct{}),
-		guestLns:  make(map[string]net.Listener),
-		guestAddr: make(map[string]net.Addr),
-		workConns: newWorkBroker(),
-		clients:   make(map[string]*clientSession),
-		heartbeat: config.Heartbeat(),
+		config:       config,
+		done:         make(chan struct{}),
+		conns:        make(map[net.Conn]struct{}),
+		controlConns: make(map[net.Conn]struct{}),
+		guestLns:     make(map[string]net.Listener),
+		guestAddr:    make(map[string]net.Addr),
+		workConns:    newWorkBroker(),
+		clients:      make(map[string]*clientSession),
+		heartbeat:    config.Heartbeat(),
 	}
 	for _, option := range options {
 		option(engine)
@@ -112,17 +116,17 @@ func (engine *Engine) Start(ctx context.Context) error {
 	}
 	if listener == nil {
 		engine.releaseStartSlot()
-		return errors.New("服务端引擎缺少宿主注入的监听器")
+		return fmt.Errorf("服务端引擎缺少宿主注入的监听器：%w", ErrNotStarted)
 	}
 	if !listenerUsable(listener) {
 		engine.releaseStartSlot()
-		return errors.New("宿主注入的监听器已关闭或不可用")
+		return fmt.Errorf("宿主注入的监听器已关闭或不可用：%w", ErrNotStarted)
 	}
 
 	guests, addresses, err := openGuestListeners(engine.config.Bindings())
 	if err != nil {
 		engine.releaseStartSlot()
-		return err
+		return fmt.Errorf("打开访客监听器失败：%w", err)
 	}
 
 	engine.commitRunning(guests, addresses)
@@ -196,7 +200,8 @@ func openGuestListeners(bindings []core.TCPProxyBinding) (map[string]net.Listene
 	return guests, addresses, nil
 }
 
-// Shutdown 幂等关闭：停止接收新连接，等待活动连接按排水上限结束，随后释放全部资源。
+// Shutdown 幂等关闭：先停止接收新连接，再按排水上限等待活动连接自然结束，
+// 超限才强制关闭，最后关闭 Done。
 func (engine *Engine) Shutdown(ctx context.Context) error {
 	engine.stopOnce.Do(func() {
 		engine.stopListenersLocked()
@@ -208,33 +213,30 @@ func (engine *Engine) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// stopListenersLocked 标记停止并关闭全部监听器、配对中心与活动连接。
+// stopListenersLocked 停止接收新连接并释放暂存，但不触碰数据桥接。
+//
+// 排水语义分两类：控制连接不承载用户数据，立即释放；数据桥接承载活动流，
+// 交由 waitDrained 按排水上限等待自然结束。
+// 状态先置 stopping 再关监听器：各读循环检查到停止标记后不再把读错误记为异常。
 func (engine *Engine) stopListenersLocked() {
 	engine.mu.Lock()
-	engine.state = stateStopped
+	engine.stopping = true
 	if engine.listener != nil {
 		_ = engine.listener.Close()
 	}
 	for _, guestListener := range engine.guestLns {
 		_ = guestListener.Close()
 	}
-	engine.workConns.close()
-	engine.mu.Unlock()
-	engine.closeConns()
-}
-
-// setFinalErr 记录导致停止的首个异常错误；正常 Shutdown 不调用。
-//
-// 只保留首个错误，后续错误不覆盖。调用方必须保证传入的错误已脱敏，
-// 不含 token、密码、Authorization 或正文原文。
-func (engine *Engine) setFinalErr(err error) {
-	if err == nil {
-		return
+	controls := make([]net.Conn, 0, len(engine.controlConns))
+	for conn := range engine.controlConns {
+		controls = append(controls, conn)
 	}
-	engine.mu.Lock()
-	defer engine.mu.Unlock()
-	if engine.finalErr == nil {
-		engine.finalErr = err
+	// 暂存但未配对的工作连接由 broker 释放；它们尚不承载用户数据。
+	engine.workConns.closeStaged()
+	engine.mu.Unlock()
+
+	for _, conn := range controls {
+		_ = conn.Close()
 	}
 }
 
@@ -272,10 +274,11 @@ func (engine *Engine) waitDrained(ctx context.Context) error {
 	return nil
 }
 
-// closeDone 在完全停止后关闭 Done 通道；重复调用安全。
+// closeDone 标记完全停止并关闭 Done 通道；重复调用安全。
 func (engine *Engine) closeDone() {
 	engine.mu.Lock()
-	defer engine.mu.Unlock()
+	engine.state = stateStopped
+	engine.finalErr = nil
 	if engine.done != nil {
 		select {
 		case <-engine.done:
@@ -283,6 +286,7 @@ func (engine *Engine) closeDone() {
 			close(engine.done)
 		}
 	}
+	engine.mu.Unlock()
 }
 
 // Done 在完全停止后关闭；Stopped 之前永不关闭，也不返回 nil。
@@ -376,6 +380,22 @@ func (engine *Engine) track(conn net.Conn) {
 	engine.conns[conn] = struct{}{}
 }
 
+// trackControl 登记一条控制连接，供 Shutdown 立即释放。
+//
+// 控制连接不承载用户数据，排水时可直接关闭；数据桥接另有 conns 管理。
+func (engine *Engine) trackControl(conn net.Conn) {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	engine.controlConns[conn] = struct{}{}
+}
+
+// untrackControl 移除一条控制连接。
+func (engine *Engine) untrackControl(conn net.Conn) {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	delete(engine.controlConns, conn)
+}
+
 // untrack 移除一条活动连接。
 func (engine *Engine) untrack(conn net.Conn) {
 	engine.mu.Lock()
@@ -418,6 +438,8 @@ func (engine *Engine) handleControl(raw net.Conn) {
 	defer engine.wg.Done()
 	engine.track(raw)
 	defer engine.untrack(raw)
+	engine.trackControl(raw)
+	defer engine.untrackControl(raw)
 
 	guard := wire.NewConnectionGuard(raw, nil, wire.Options{
 		MaxWireVersion: wire.VersionV1,
@@ -489,10 +511,18 @@ func (engine *Engine) serveControlLoop(conn net.Conn, guard *wire.ConnectionGuar
 // failAbnormal 记录异常停止的首个错误并关闭 Done。
 //
 // 正常 Shutdown 路径不得调用：Shutdown 后 Err() 必须保持 nil。
+// 引擎已进入停止流程时调用为空操作——此时连接关闭引发的读错误是 Shutdown
+// 的预期结果，不属于异常终止。
 // 传入的错误不得包含 token、密码、Authorization 或正文原文。
 func (engine *Engine) failAbnormal(err error) {
-	engine.setFinalErr(err)
 	engine.mu.Lock()
+	if engine.stopping || engine.state == stateStopped {
+		engine.mu.Unlock()
+		return
+	}
+	if engine.finalErr == nil {
+		engine.finalErr = err
+	}
 	select {
 	case <-engine.done:
 	default:
