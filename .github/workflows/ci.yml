@@ -47,6 +47,23 @@ jobs:
       - run: task test:go
       - run: task build:go
 
+  fuzz:
+    name: wire 模糊测试 / Ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.x
+          cache-dependency-path: |
+            go.work.sum
+            apps/jrps/go.sum
+      - uses: arduino/setup-task@v3
+        with:
+          version: 3.52.0
+      - run: task workspace:sync
+      - run: task test:fuzz
+
   web-production:
     name: Web 与生产构建 / Ubuntu
     runs-on: ubuntu-latest

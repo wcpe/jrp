@@ -88,7 +88,7 @@ docs(architecture): 更新配置版本状态机
 - 修改功能代码前先运行相关测试，确认基线通过。
 - 新增或修改业务逻辑必须同步测试，覆盖正常、边界和关键错误路径。
 - 禁止注释、跳过或删除失败测试来获得绿色结果。
-- 当前稳态门禁为 Go 的 `gofmt`、`go vet`、依赖边界检查与模块测试，以及 Web 的 Prettier、ESLint、TypeScript 类型检查与 Vitest。
+- 当前稳态门禁为 Go 的 `gofmt`、`go vet`、依赖边界检查与模块测试，wire 层模糊测试（`task test:fuzz`），以及 Web 的 Prettier、ESLint、TypeScript 类型检查与 Vitest。
 - `golangci-lint`、`goimports`、`govulncheck`、`pnpm audit`、竞态检测和浏览器级测试属于后续增强，需单独批准、固定版本并接入同一 Task 入口后才能列为强制门禁。
 - Core 依赖门、wire/加密状态机、传输、工作连接、NAT、热更、SQLite revision/outbox、采集旁路、脱敏和 Windows 文件语义属于高风险门。
 

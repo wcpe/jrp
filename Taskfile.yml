@@ -88,6 +88,14 @@ tasks:
       - task: test:jrps
       - task: test:jrpc
 
+  test:fuzz:
+    desc: 运行 wire 层模糊测试（短时，用于 CI 回归）
+    dir: core
+    cmds:
+      - go test -run=^$ -fuzz=FuzzV1Frame -fuzztime=10s ./internal/wire/
+      - go test -run=^$ -fuzz=FuzzV2Frame -fuzztime=10s ./internal/wire/
+      - go test -run=^$ -fuzz=FuzzVersionDetection -fuzztime=10s ./internal/wire/
+
   test:web:
     desc: 运行 Web 测试
     cmds:
