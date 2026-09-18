@@ -35,3 +35,4 @@
 - FR-09 中请求元数据走有界批处理通道，采集关闭时不进入落库路径；通知采用事务 outbox，外部副作用只在事务提交后触发。
 - FR-09 中 token 只以摘要落库，读取视图与审计一律掩码。
 - OPERATIONS 补入 FR-09 已交付的 `--data-dir`、`--database` 引导参数与两侧数据库独立性约定。
+- 交付 FR-25 首个真实垂直切片：`core/server` 与 `core/client` 双侧 Engine 门面，TCP 传输 + wire v1 控制会话 + 一个 TCP 代理端到端闭环；生命周期为 New、Start、Shutdown、Done，Start 成功接管宿主资源、失败保留给宿主，Shutdown 后无残留监听器、连接或 goroutine。
