@@ -21,6 +21,13 @@ const forbiddenCoreDependencies = [
   ['apps module', /^github\.com\/wcpe\/jrp\/apps(?:\/|$)/u],
 ];
 
+// Core 只承载数据面能力：源码不得读取环境变量、文件或数据库（FR-32 §5 与 architecture-invariants §2）。
+const forbiddenCoreSourcePatterns = [
+  ['环境变量', /\bos\.(?:Getenv|LookupEnv|Environ)\b/u],
+  ['文件读取', /\bos\.(?:Open|OpenFile|ReadFile)\b/u],
+  ['数据库', /"database\/sql"/u],
+];
+
 function firstFieldLines(output) {
   return output
     .split(/\r?\n/u)
@@ -47,6 +54,32 @@ function packageDependencies(packageJson) {
   ];
 }
 
+function collectGoFiles(directory) {
+  const files = [];
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    const entryPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...collectGoFiles(entryPath));
+    } else if (entry.isFile() && entry.name.endsWith('.go')) {
+      files.push(entryPath);
+    }
+  }
+  return files;
+}
+
+// Core 源码（含测试）不得读取运行环境：构建器只接受宿主在代码中传入的值。
+function checkCoreSources(directory) {
+  for (const file of collectGoFiles(directory)) {
+    const relativePath = path.relative(root, file).split(path.sep).join('/');
+    const source = readFileSync(file, 'utf8');
+    for (const [label, pattern] of forbiddenCoreSourcePatterns) {
+      if (pattern.test(source)) {
+        violations.push(`Core 源码出现禁止的${label}调用：${relativePath}`);
+      }
+    }
+  }
+}
+
 try {
   const coreGoMod = readFileSync(path.join(coreDirectory, 'go.mod'), 'utf8');
   checkCoreEntries('go.mod', coreGoMod.split(/\s+/u).filter(Boolean));
@@ -62,6 +95,8 @@ try {
     env: standaloneEnvironment,
   });
   checkCoreEntries('包依赖图', firstFieldLines(corePackages));
+
+  checkCoreSources(coreDirectory);
 
   const jrpsPackages = captureCommand('go', ['list', '-deps', './...'], {
     cwd: path.join(root, 'apps/jrps'),
