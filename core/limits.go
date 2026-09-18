@@ -21,3 +21,29 @@ const DefaultHeartbeat = 30 * time.Second
 
 // DefaultTimeout 是超时为零值时采用的 Core 默认值。
 const DefaultTimeout = 10 * time.Second
+
+// DefaultDrainTimeout 是排水上限为零值时采用的 Core 默认值。
+//
+// 排水上限是 Shutdown 等待活动连接自然结束的最长时间；超过上限强制释放。
+const DefaultDrainTimeout = 10 * time.Second
+
+// DefaultWorkConnPoolSize 是工作连接池上限为零值时采用的 Core 默认值。
+//
+// 取值 1 表示每个代理同时只有一条工作连接在途：这是当前转发语义下的最小
+// 正确值，放大取值需要上层具备连接复用能力。
+const DefaultWorkConnPoolSize = 1
+
+// MaxWorkConnPoolSize 是单代理工作连接池上限的上界。
+//
+// 池容量直接决定每代理的在途连接与转发 goroutine 数量，必须由 Core 常量约束
+// 上界，避免宿主配置把单机资源打满。
+const MaxWorkConnPoolSize = 16
+
+// DefaultIdleWorkConnLimit 是待命工作连接空闲上限为零值时采用的 Core 默认值。
+const DefaultIdleWorkConnLimit = 2
+
+// MaxIdleWorkConnLimit 是单代理待命工作连接空闲上限的上界。
+//
+// 待命连接已建链但不承载数据，每条都占用两端的文件描述符与暂存内存，必须由
+// Core 常量约束上界。
+const MaxIdleWorkConnLimit = 16

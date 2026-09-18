@@ -18,7 +18,8 @@ func (config ClientConfig) Validate() error {
 	problems = append(problems, validateClientAuth(config)...)
 	problems = append(problems, validateClientProxies(config.proxies)...)
 	problems = append(problems, validateLimit("proxies", len(config.proxies), MaxProxyCount)...)
-	problems = append(problems, validateDurations(config.heartbeat, config.timeout)...)
+	problems = append(problems, validateDurations(config.heartbeat, config.timeout, config.drainTimeout)...)
+	problems = append(problems, validatePoolLimits(config.poolSize, config.idleLimit)...)
 	return collectProblems(problems)
 }
 
@@ -32,7 +33,8 @@ func (config ServerConfig) Validate() error {
 	problems = append(problems, validateLimit("credentials", len(config.credentials), MaxClientCredentialCount)...)
 	problems = append(problems, validateBindings(config.bindings, config.credentials)...)
 	problems = append(problems, validateLimit("bindings", len(config.bindings), MaxProxyCount)...)
-	problems = append(problems, validateDurations(config.heartbeat, config.timeout)...)
+	problems = append(problems, validateDurations(config.heartbeat, config.timeout, config.drainTimeout)...)
+	problems = append(problems, validateServerIdleLimit(config.idleLimit)...)
 	return collectProblems(problems)
 }
 
@@ -184,6 +186,28 @@ func validateListenAddress(field string, address netip.AddrPort) []*ConfigError 
 	return validatePort(field, int(address.Port()))
 }
 
+// validatePoolLimits 校验客户端侧的工作连接池上限与待命空闲上限。
+func validatePoolLimits(poolSize, idleLimit int) []*ConfigError {
+	problems := validateBound("workConnPoolSize", poolSize, MaxWorkConnPoolSize)
+	return append(problems, validateBound("idleWorkConnLimit", idleLimit, MaxIdleWorkConnLimit)...)
+}
+
+// validateServerIdleLimit 校验服务端侧的待命工作连接空闲上限。
+func validateServerIdleLimit(idleLimit int) []*ConfigError {
+	return validateBound("idleWorkConnLimit", idleLimit, MaxIdleWorkConnLimit)
+}
+
+// validateBound 校验取值落在 1 到 limit 的闭区间内。
+//
+// 零值已在构建时被默认常量取代，因此这里的下界是 1：负值或零值都视为越界。
+func validateBound(field string, value, limit int) []*ConfigError {
+	if value >= 1 && value <= limit {
+		return nil
+	}
+	return []*ConfigError{newConfigError(CodeLimitExceeded, field,
+		"取值必须在 1 到 "+strconv.Itoa(limit)+" 之间")}
+}
+
 // validateEnum 校验取值是否在已交付的常量集合内，并给出受支持取值列表。
 func validateEnum[T ~string](field string, value T, supported []T) []*ConfigError {
 	for _, candidate := range supported {
@@ -213,10 +237,11 @@ func validateLimit(field string, count, limit int) []*ConfigError {
 		"条目数超出上限 "+strconv.Itoa(limit))}
 }
 
-// validateDurations 校验心跳间隔与超时。
-func validateDurations(heartbeat, timeout time.Duration) []*ConfigError {
+// validateDurations 校验心跳间隔、超时与排水上限。
+func validateDurations(heartbeat, timeout, drainTimeout time.Duration) []*ConfigError {
 	problems := validateDuration("heartbeat", heartbeat)
-	return append(problems, validateDuration("timeout", timeout)...)
+	problems = append(problems, validateDuration("timeout", timeout)...)
+	return append(problems, validateDuration("drainTimeout", drainTimeout)...)
 }
 
 // validateDuration 校验时间参数非负；零值在构建时已被默认常量取代。

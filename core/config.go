@@ -71,13 +71,16 @@ func (binding TCPProxyBinding) Type() ProxyType {
 //
 // 构建后没有 setter；读取集合返回深复制的新切片。零值不是合法配置，Validate 会返回错误。
 type ClientConfig struct {
-	clientID    string
-	endpoint    ServerEndpoint
-	auth        TokenAuth
-	proxies     []TCPProxy
-	heartbeat   time.Duration
-	timeout     time.Duration
-	hasEndpoint bool
+	clientID     string
+	endpoint     ServerEndpoint
+	auth         TokenAuth
+	proxies      []TCPProxy
+	heartbeat    time.Duration
+	timeout      time.Duration
+	drainTimeout time.Duration
+	hasEndpoint  bool
+	poolSize     int
+	idleLimit    int
 }
 
 // ClientOption 是客户端配置的选项函数；选项只做赋值，不做校验。
@@ -87,13 +90,15 @@ type ClientOption func(*clientDraft)
 //
 // 构建后没有 setter；读取集合返回深复制的新切片。零值不是合法配置，Validate 会返回错误。
 type ServerConfig struct {
-	listen      BindEndpoint
-	wire        WireVersion
-	credentials []ClientCredential
-	bindings    []TCPProxyBinding
-	heartbeat   time.Duration
-	timeout     time.Duration
-	hasListen   bool
+	listen       BindEndpoint
+	wire         WireVersion
+	credentials  []ClientCredential
+	bindings     []TCPProxyBinding
+	heartbeat    time.Duration
+	timeout      time.Duration
+	drainTimeout time.Duration
+	hasListen    bool
+	idleLimit    int
 }
 
 // ServerOption 是服务端配置的选项函数；选项只做赋值，不做校验。
@@ -129,6 +134,21 @@ func (config ClientConfig) Timeout() time.Duration {
 	return config.timeout
 }
 
+// DrainTimeout 返回排水上限：Shutdown 等待活动连接自然结束的最长时间。
+func (config ClientConfig) DrainTimeout() time.Duration {
+	return config.drainTimeout
+}
+
+// WorkConnPoolSize 返回单代理工作连接池上限，零值输入已由默认常量取代。
+func (config ClientConfig) WorkConnPoolSize() int {
+	return config.poolSize
+}
+
+// IdleWorkConnLimit 返回单代理待命工作连接的空闲上限，零值输入已由默认常量取代。
+func (config ClientConfig) IdleWorkConnLimit() int {
+	return config.idleLimit
+}
+
 // Listen 返回监听端点副本。
 func (config ServerConfig) Listen() BindEndpoint {
 	return config.listen
@@ -157,6 +177,16 @@ func (config ServerConfig) Heartbeat() time.Duration {
 // Timeout 返回连接超时，零值输入已由默认常量取代。
 func (config ServerConfig) Timeout() time.Duration {
 	return config.timeout
+}
+
+// DrainTimeout 返回排水上限：Shutdown 等待活动连接自然结束的最长时间。
+func (config ServerConfig) DrainTimeout() time.Duration {
+	return config.drainTimeout
+}
+
+// IdleWorkConnLimit 返回单代理待命工作连接的空闲上限，零值输入已由默认常量取代。
+func (config ServerConfig) IdleWorkConnLimit() int {
+	return config.idleLimit
 }
 
 // WithClientID 设置客户端标识。
@@ -207,6 +237,27 @@ func WithTimeout(timeout time.Duration) ClientOption {
 	}
 }
 
+// WithClientDrainTimeout 设置客户端排水上限；零值表示使用 DefaultDrainTimeout。
+func WithClientDrainTimeout(timeout time.Duration) ClientOption {
+	return func(draft *clientDraft) {
+		draft.drainTimeout = timeout
+	}
+}
+
+// WithWorkConnPoolSize 设置单代理工作连接池上限；零值表示使用 DefaultWorkConnPoolSize。
+func WithWorkConnPoolSize(size int) ClientOption {
+	return func(draft *clientDraft) {
+		draft.poolSize = size
+	}
+}
+
+// WithIdleWorkConnLimit 设置单代理待命工作连接的空闲上限；零值表示使用 DefaultIdleWorkConnLimit。
+func WithIdleWorkConnLimit(limit int) ClientOption {
+	return func(draft *clientDraft) {
+		draft.idleLimit = limit
+	}
+}
+
 // WithServerHeartbeat 设置服务端心跳间隔；零值表示使用 DefaultHeartbeat。
 //
 // 与客户端的 WithHeartbeat 同名会冲突，因此服务端侧带 Server 前缀。
@@ -220,6 +271,21 @@ func WithServerHeartbeat(interval time.Duration) ServerOption {
 func WithServerTimeout(timeout time.Duration) ServerOption {
 	return func(draft *serverDraft) {
 		draft.timeout = timeout
+	}
+}
+
+// WithServerDrainTimeout 设置服务端排水上限；零值表示使用 DefaultDrainTimeout。
+func WithServerDrainTimeout(timeout time.Duration) ServerOption {
+	return func(draft *serverDraft) {
+		draft.drainTimeout = timeout
+	}
+}
+
+// WithServerIdleWorkConnLimit 设置服务端单代理待命工作连接的空闲上限；
+// 零值表示使用 DefaultIdleWorkConnLimit。
+func WithServerIdleWorkConnLimit(limit int) ServerOption {
+	return func(draft *serverDraft) {
+		draft.idleLimit = limit
 	}
 }
 
@@ -264,40 +330,58 @@ func WithTCPProxyBindings(bindings []TCPProxyBinding) ServerOption {
 
 // clientDraft 是客户端配置的构建中间态，仅在构建函数内存在。
 type clientDraft struct {
-	clientID    string
-	endpoint    ServerEndpoint
-	auth        TokenAuth
-	proxies     []TCPProxy
-	heartbeat   time.Duration
-	timeout     time.Duration
-	hasEndpoint bool
+	clientID     string
+	endpoint     ServerEndpoint
+	auth         TokenAuth
+	proxies      []TCPProxy
+	heartbeat    time.Duration
+	timeout      time.Duration
+	drainTimeout time.Duration
+	hasEndpoint  bool
+	poolSize     int
+	idleLimit    int
 }
 
 // serverDraft 是服务端配置的构建中间态，仅在构建函数内存在。
 type serverDraft struct {
-	listen      BindEndpoint
-	wire        WireVersion
-	credentials []ClientCredential
-	bindings    []TCPProxyBinding
-	heartbeat   time.Duration
-	timeout     time.Duration
-	hasListen   bool
+	listen       BindEndpoint
+	wire         WireVersion
+	credentials  []ClientCredential
+	bindings     []TCPProxyBinding
+	heartbeat    time.Duration
+	timeout      time.Duration
+	drainTimeout time.Duration
+	hasListen    bool
+	idleLimit    int
 }
 
 // withDefaults 把零值心跳与超时替换为默认常量。
 func (draft *clientDraft) withDefaults() {
 	draft.heartbeat = defaultDuration(draft.heartbeat, DefaultHeartbeat)
 	draft.timeout = defaultDuration(draft.timeout, DefaultTimeout)
+	draft.drainTimeout = defaultDuration(draft.drainTimeout, DefaultDrainTimeout)
+	draft.poolSize = defaultValue(draft.poolSize, DefaultWorkConnPoolSize)
+	draft.idleLimit = defaultValue(draft.idleLimit, DefaultIdleWorkConnLimit)
 }
 
 // withDefaults 把零值心跳与超时替换为默认常量。
 func (draft *serverDraft) withDefaults() {
 	draft.heartbeat = defaultDuration(draft.heartbeat, DefaultHeartbeat)
 	draft.timeout = defaultDuration(draft.timeout, DefaultTimeout)
+	draft.drainTimeout = defaultDuration(draft.drainTimeout, DefaultDrainTimeout)
+	draft.idleLimit = defaultValue(draft.idleLimit, DefaultIdleWorkConnLimit)
 }
 
 // defaultDuration 在取值为零时返回回退值；负值保持原样交由校验报错。
 func defaultDuration(value, fallback time.Duration) time.Duration {
+	if value == 0 {
+		return fallback
+	}
+	return value
+}
+
+// defaultValue 在取值为零时返回回退值；负值保持原样交由校验报错。
+func defaultValue(value, fallback int) int {
 	if value == 0 {
 		return fallback
 	}

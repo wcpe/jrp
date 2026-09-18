@@ -13,13 +13,16 @@ func NewClientConfig(options ...ClientOption) (ClientConfig, error) {
 	draft.withDefaults()
 
 	config := ClientConfig{
-		clientID:    draft.clientID,
-		endpoint:    draft.endpoint,
-		auth:        draft.auth,
-		proxies:     copySlice(draft.proxies),
-		heartbeat:   draft.heartbeat,
-		timeout:     draft.timeout,
-		hasEndpoint: draft.hasEndpoint,
+		clientID:     draft.clientID,
+		endpoint:     draft.endpoint,
+		auth:         draft.auth,
+		proxies:      copySlice(draft.proxies),
+		heartbeat:    draft.heartbeat,
+		timeout:      draft.timeout,
+		drainTimeout: draft.drainTimeout,
+		hasEndpoint:  draft.hasEndpoint,
+		poolSize:     draft.poolSize,
+		idleLimit:    draft.idleLimit,
 	}
 	if err := config.Validate(); err != nil {
 		return ClientConfig{}, err
@@ -40,13 +43,15 @@ func NewServerConfig(options ...ServerOption) (ServerConfig, error) {
 	draft.withDefaults()
 
 	config := ServerConfig{
-		listen:      draft.listen,
-		wire:        draft.wire,
-		credentials: copySlice(draft.credentials),
-		bindings:    copySlice(draft.bindings),
-		heartbeat:   draft.heartbeat,
-		timeout:     draft.timeout,
-		hasListen:   draft.hasListen,
+		listen:       draft.listen,
+		wire:         draft.wire,
+		credentials:  copySlice(draft.credentials),
+		bindings:     copySlice(draft.bindings),
+		heartbeat:    draft.heartbeat,
+		timeout:      draft.timeout,
+		drainTimeout: draft.drainTimeout,
+		hasListen:    draft.hasListen,
+		idleLimit:    draft.idleLimit,
 	}
 	if err := config.Validate(); err != nil {
 		return ServerConfig{}, err

@@ -8,10 +8,12 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
 	"time"
 
 	"github.com/wcpe/jrp/core"
+	"github.com/wcpe/jrp/core/internal/transport"
 	"github.com/wcpe/jrp/core/internal/wire"
 )
 
@@ -24,17 +26,16 @@ var ErrNotStarted = errors.New("服务端引擎尚未启动")
 // ErrStopped 表示 Engine 已停止，不允许重启。
 var ErrStopped = errors.New("服务端引擎已停止，不允许重启")
 
-// 排水上限：Shutdown 等待活动连接结束的最长时间。
-const drainTimeout = 10 * time.Second
-
 // Engine 是 Core 暴露给宿主的服务端运行门面。
 //
 // 生命周期为 New → Start → Shutdown → Done。构造函数只做纯内存装配；Start 接管
 // 宿主注入的监听器；Shutdown 释放全部资源。同一进程可并行运行多个 Engine。
 type Engine struct {
-	config   core.ServerConfig
-	logger   *slog.Logger
-	listener net.Listener
+	config       core.ServerConfig
+	logger       *slog.Logger
+	dialer       transport.Dialer
+	drainTimeout time.Duration
+	listener     *transport.Listener
 
 	mu           sync.Mutex
 	state        engineState
@@ -43,9 +44,9 @@ type Engine struct {
 	finalErr     error
 	stopOnce     sync.Once
 	wg           sync.WaitGroup
-	conns        map[net.Conn]struct{}
-	controlConns map[net.Conn]struct{}
-	guestLns     map[string]net.Listener
+	conns        map[*transport.Conn]struct{}
+	controlConns map[*transport.Conn]struct{}
+	guestLns     map[string]*transport.Listener
 	guestAddr    map[string]net.Addr
 	workConns    *workBroker
 	clients      map[string]*clientSession
@@ -56,7 +57,7 @@ type Engine struct {
 // clientSession 是已登录客户端的会话状态：控制连接与待命工作连接配对。
 type clientSession struct {
 	clientID string
-	control  net.Conn
+	control  *transport.Conn
 }
 
 // engineState 是 Engine 的内部状态，切换只在持锁下进行。
@@ -75,7 +76,7 @@ type Option func(*Engine)
 // WithListener 注入宿主管理的监听器。
 func WithListener(listener net.Listener) Option {
 	return func(engine *Engine) {
-		engine.listener = listener
+		engine.listener = transport.TakeOverListener(listener)
 	}
 }
 
@@ -91,13 +92,15 @@ func New(config core.ServerConfig, options ...Option) *Engine {
 	engine := &Engine{
 		config:       config,
 		done:         make(chan struct{}),
-		conns:        make(map[net.Conn]struct{}),
-		controlConns: make(map[net.Conn]struct{}),
-		guestLns:     make(map[string]net.Listener),
+		conns:        make(map[*transport.Conn]struct{}),
+		controlConns: make(map[*transport.Conn]struct{}),
+		guestLns:     make(map[string]*transport.Listener),
 		guestAddr:    make(map[string]net.Addr),
-		workConns:    newWorkBroker(),
+		workConns:    newWorkBroker(config.IdleWorkConnLimit()),
 		clients:      make(map[string]*clientSession),
 		heartbeat:    config.Heartbeat(),
+		dialer:       transport.Dialer{Timeout: config.Timeout()},
+		drainTimeout: config.DrainTimeout(),
 	}
 	for _, option := range options {
 		option(engine)
@@ -118,12 +121,12 @@ func (engine *Engine) Start(ctx context.Context) error {
 		engine.releaseStartSlot()
 		return fmt.Errorf("服务端引擎缺少宿主注入的监听器：%w", ErrNotStarted)
 	}
-	if !listenerUsable(listener) {
+	if !listenerUsable(listener.Listener()) {
 		engine.releaseStartSlot()
 		return fmt.Errorf("宿主注入的监听器已关闭或不可用：%w", ErrNotStarted)
 	}
 
-	guests, addresses, err := openGuestListeners(engine.config.Bindings())
+	guests, addresses, err := engine.openGuestListeners()
 	if err != nil {
 		engine.releaseStartSlot()
 		return fmt.Errorf("打开访客监听器失败：%w", err)
@@ -144,8 +147,8 @@ func (engine *Engine) Start(ctx context.Context) error {
 // claimStartSlot 校验配置并原子认领启动位。
 //
 // 认领即把状态置为 starting，后续失败由调用方回滚到 idle。重复启动返回哨兵
-// 错误而不触碰任何资源。返回宿主注入的监听器。
-func (engine *Engine) claimStartSlot() (net.Listener, error) {
+// 错误而不触碰任何资源。返回宿主注入的监听器句柄。
+func (engine *Engine) claimStartSlot() (*transport.Listener, error) {
 	if err := engine.config.Validate(); err != nil {
 		return nil, err
 	}
@@ -172,7 +175,7 @@ func (engine *Engine) releaseStartSlot() {
 
 // commitRunning 把认领成功的启动位推进到 running。
 func (engine *Engine) commitRunning(
-	guests map[string]net.Listener,
+	guests map[string]*transport.Listener,
 	addresses map[string]net.Addr,
 ) {
 	engine.mu.Lock()
@@ -184,20 +187,43 @@ func (engine *Engine) commitRunning(
 
 // openGuestListeners 为每个代理绑定打开访客监听器。
 //
-// 任一失败时关闭已打开的监听器并返回错误，不遗留半启动状态。
-func openGuestListeners(bindings []core.TCPProxyBinding) (map[string]net.Listener, map[string]net.Addr, error) {
-	guests := make(map[string]net.Listener, len(bindings))
+// 监听地址来自代理绑定的 RemotePort 与 Engine 自身的监听端点族：Review 端口是
+// 配置的一部分，不得在代码里写死回环地址。
+// 任一失败时释放已打开的监听器并返回错误，不遗留半启动状态。
+func (engine *Engine) openGuestListeners() (map[string]*transport.Listener, map[string]net.Addr, error) {
+	bindings := engine.config.Bindings()
+	guests := make(map[string]*transport.Listener, len(bindings))
 	addresses := make(map[string]net.Addr, len(bindings))
 	for _, binding := range bindings {
-		guestListener, err := net.Listen("tcp", guestListenAddr(binding.RemotePort))
+		guestListener, err := engine.listenGuest(binding.RemotePort)
 		if err != nil {
-			closeGuests(guests)
+			releaseGuestListeners(guests)
 			return nil, nil, err
 		}
 		guests[binding.Name] = guestListener
 		addresses[binding.Name] = guestListener.Addr()
 	}
 	return guests, addresses, nil
+}
+
+// listenGuest 按监听端点的地址族打开一个访客监听器。
+func (engine *Engine) listenGuest(port int) (*transport.Listener, error) {
+	host := engine.config.Listen().Address.Addr()
+	if !host.IsValid() {
+		host = netip.IPv4Unspecified()
+	}
+	listener, err := net.Listen("tcp", netip.AddrPortFrom(host, uint16(port)).String())
+	if err != nil {
+		return nil, err
+	}
+	return transport.TakeOverListener(listener), nil
+}
+
+// releaseGuestListeners 释放一批已创建的访客监听器。
+func releaseGuestListeners(guests map[string]*transport.Listener) {
+	for _, listener := range guests {
+		_ = listener.Release()
+	}
 }
 
 // Shutdown 幂等关闭：先停止接收新连接，再按排水上限等待活动连接自然结束，
@@ -222,12 +248,12 @@ func (engine *Engine) stopListenersLocked() {
 	engine.mu.Lock()
 	engine.stopping = true
 	if engine.listener != nil {
-		_ = engine.listener.Close()
+		_ = engine.listener.Release()
 	}
 	for _, guestListener := range engine.guestLns {
-		_ = guestListener.Close()
+		_ = guestListener.Release()
 	}
-	controls := make([]net.Conn, 0, len(engine.controlConns))
+	controls := make([]*transport.Conn, 0, len(engine.controlConns))
 	for conn := range engine.controlConns {
 		controls = append(controls, conn)
 	}
@@ -252,7 +278,7 @@ func (engine *Engine) waitDrained(ctx context.Context) error {
 		engine.wg.Wait()
 	}()
 
-	deadline := drainTimeout
+	deadline := engine.drainTimeout
 	if ctxDeadline, ok := ctx.Deadline(); ok {
 		if remaining := time.Until(ctxDeadline); remaining < deadline {
 			deadline = remaining
@@ -352,29 +378,8 @@ func listenerUsable(listener net.Listener) bool {
 	return true
 }
 
-// guestListenAddr 把访客端口拼成回环监听地址。
-func guestListenAddr(port int) string {
-	address := "127.0.0.1:"
-	number := port
-	if number <= 0 {
-		return address + "0"
-	}
-	digits := []byte{}
-	for value := number; value > 0; value /= 10 {
-		digits = append([]byte{byte('0' + value%10)}, digits...)
-	}
-	return address + string(digits)
-}
-
-// closeGuests 关闭一批已创建的访客监听器。
-func closeGuests(guests map[string]net.Listener) {
-	for _, listener := range guests {
-		_ = listener.Close()
-	}
-}
-
 // track 登记一条活动连接。
-func (engine *Engine) track(conn net.Conn) {
+func (engine *Engine) track(conn *transport.Conn) {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	engine.conns[conn] = struct{}{}
@@ -383,21 +388,21 @@ func (engine *Engine) track(conn net.Conn) {
 // trackControl 登记一条控制连接，供 Shutdown 立即释放。
 //
 // 控制连接不承载用户数据，排水时可直接关闭；数据桥接另有 conns 管理。
-func (engine *Engine) trackControl(conn net.Conn) {
+func (engine *Engine) trackControl(conn *transport.Conn) {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	engine.controlConns[conn] = struct{}{}
 }
 
 // untrackControl 移除一条控制连接。
-func (engine *Engine) untrackControl(conn net.Conn) {
+func (engine *Engine) untrackControl(conn *transport.Conn) {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	delete(engine.controlConns, conn)
 }
 
 // untrack 移除一条活动连接。
-func (engine *Engine) untrack(conn net.Conn) {
+func (engine *Engine) untrack(conn *transport.Conn) {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	delete(engine.conns, conn)
@@ -406,7 +411,7 @@ func (engine *Engine) untrack(conn net.Conn) {
 // closeConns 强制关闭全部活动连接。
 func (engine *Engine) closeConns() {
 	engine.mu.Lock()
-	conns := make([]net.Conn, 0, len(engine.conns))
+	conns := make([]*transport.Conn, 0, len(engine.conns))
 	for conn := range engine.conns {
 		conns = append(conns, conn)
 	}
@@ -417,16 +422,40 @@ func (engine *Engine) closeConns() {
 }
 
 // serveControl 接受控制连接并逐条处理登录与心跳。
-func (engine *Engine) serveControl(listener net.Listener) {
+//
+// Accept 错误按传输层分类处理：临时错误退避后继续，致命错误停止循环并上报，
+// 绝不静默退出（规格 §3.6）。
+func (engine *Engine) serveControl(listener *transport.Listener) {
 	defer engine.wg.Done()
 	for {
-		conn, err := listener.Accept()
+		conn, action, err := listener.Accept(transport.PurposeControl)
 		if err != nil {
-			return
+			if action == transport.AcceptFatal {
+				engine.reportAcceptFatal(listener, err)
+				return
+			}
+			// 临时错误：退避后继续，避免把 Accept 循环变成忙循环。
+			time.Sleep(transport.AcceptBackoff(action))
+			continue
 		}
 		engine.wg.Add(1)
 		go engine.handleControl(conn)
 	}
+}
+
+// reportAcceptFatal 上报致命的 Accept 错误：停止监听后记录为异常终止。
+//
+// 引擎已进入停止流程时为空操作：Shutdown 关闭监听器引发的 Accept 错误是预期
+// 结果，不属于异常终止。
+func (engine *Engine) reportAcceptFatal(listener *transport.Listener, err error) {
+	engine.mu.Lock()
+	stopping := engine.stopping || engine.state == stateStopped
+	engine.mu.Unlock()
+	if stopping {
+		return
+	}
+	engine.log().Error("监听循环因致命错误停止", "listener", listener.Addr().String(), "error", err)
+	engine.failAbnormal(fmt.Errorf("监听 %s 的 Accept 失败：%w", listener.Addr().String(), err))
 }
 
 // handleControl 处理一条控制连接：版本判定 → 登录 → 心跳/工作连接服务。
@@ -434,7 +463,7 @@ func (engine *Engine) serveControl(listener net.Listener) {
 // 控制连接只承载登录与心跳；工作连接是独立的 TCP 连接，由客户端主动拨号到
 // 同一监听器建立。两类连接用首帧类型区分：登录帧走控制路径，工作声明帧走
 // 配对路径。
-func (engine *Engine) handleControl(raw net.Conn) {
+func (engine *Engine) handleControl(raw *transport.Conn) {
 	defer engine.wg.Done()
 	engine.track(raw)
 	defer engine.untrack(raw)
@@ -485,7 +514,7 @@ func (engine *Engine) handleControl(raw net.Conn) {
 //
 // 心跳中断或未知帧都视为异常终止：记录首个异常错误并关闭 Done，
 // 使宿主可通过 Err() 判定。正常 Shutdown 不经过本路径。
-func (engine *Engine) serveControlLoop(conn net.Conn, guard *wire.ConnectionGuard, clientID string) {
+func (engine *Engine) serveControlLoop(conn *transport.Conn, guard *wire.ConnectionGuard, clientID string) {
 	_ = clientID
 	for {
 		frame, err := guard.ReadFrame()
@@ -532,7 +561,7 @@ func (engine *Engine) failAbnormal(err error) {
 }
 
 // serveWorkDeclaration 处理一条工作连接的归属声明并与访客配对。
-func (engine *Engine) serveWorkDeclaration(raw net.Conn, payload []byte) {
+func (engine *Engine) serveWorkDeclaration(raw *transport.Conn, payload []byte) {
 	proxyName, err := parseWorkDeclaration(payload)
 	if err != nil {
 		_ = raw.Close()
@@ -570,7 +599,7 @@ type loginResponsePayload struct {
 }
 
 // handleLogin 校验客户端凭证并回复登录结果。
-func (engine *Engine) handleLogin(conn net.Conn, payload []byte) (string, error) {
+func (engine *Engine) handleLogin(conn *transport.Conn, payload []byte) (string, error) {
 	var request loginPayload
 	if err := json.Unmarshal(payload, &request); err != nil {
 		_ = engine.writeLoginResponse(conn, false, "登录载荷非法")
@@ -594,7 +623,7 @@ func (engine *Engine) handleLogin(conn net.Conn, payload []byte) (string, error)
 }
 
 // writeLoginResponse 写出登录响应帧。
-func (engine *Engine) writeLoginResponse(conn net.Conn, ok bool, message string) error {
+func (engine *Engine) writeLoginResponse(conn *transport.Conn, ok bool, message string) error {
 	response := loginResponsePayload{OK: ok, Error: message}
 	body, err := json.Marshal(response)
 	if err != nil {
@@ -609,7 +638,7 @@ func (engine *Engine) writeLoginResponse(conn net.Conn, ok bool, message string)
 }
 
 // replyPong 回复心跳。
-func (engine *Engine) replyPong(conn net.Conn) error {
+func (engine *Engine) replyPong(conn *transport.Conn) error {
 	body := []byte(`{}`)
 	encoded, err := wire.EncodeV1Frame(wire.Frame{Type: wire.MessageTypePong, Payload: body})
 	if err != nil {
@@ -620,12 +649,19 @@ func (engine *Engine) replyPong(conn net.Conn) error {
 }
 
 // serveGuest 接受指定代理的访客连接。
-func (engine *Engine) serveGuest(name string, listener net.Listener) {
+//
+// Accept 错误同样按临时/致命分类处理，致命错误停止监听并上报而不是静默退出。
+func (engine *Engine) serveGuest(name string, listener *transport.Listener) {
 	defer engine.wg.Done()
 	for {
-		conn, err := listener.Accept()
+		conn, action, err := listener.Accept(transport.PurposeWork, name)
 		if err != nil {
-			return
+			if action == transport.AcceptFatal {
+				engine.reportAcceptFatal(listener, err)
+				return
+			}
+			time.Sleep(transport.AcceptBackoff(action))
+			continue
 		}
 		engine.wg.Add(1)
 		go engine.handleGuest(name, conn)
@@ -633,7 +669,7 @@ func (engine *Engine) serveGuest(name string, listener net.Listener) {
 }
 
 // registerClient 登记已登录客户端的控制连接，供工作连接配对使用。
-func (engine *Engine) registerClient(clientID string, control net.Conn) {
+func (engine *Engine) registerClient(clientID string, control *transport.Conn) {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	engine.clients[clientID] = &clientSession{clientID: clientID, control: control}
@@ -654,7 +690,7 @@ func (engine *Engine) isStopped() bool {
 }
 
 // handleGuest 把访客连接交给配对中心：有待命工作连接立即桥接，否则暂存。
-func (engine *Engine) handleGuest(name string, guest net.Conn) {
+func (engine *Engine) handleGuest(name string, guest *transport.Conn) {
 	defer engine.wg.Done()
 	engine.track(guest)
 	// parkGuest 接管访客的所有权：配对成功后桥接负责关闭，未配对时暂存；

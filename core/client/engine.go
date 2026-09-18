@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/wcpe/jrp/core"
+	"github.com/wcpe/jrp/core/internal/transport"
 	"github.com/wcpe/jrp/core/internal/wire"
 )
 
@@ -24,8 +25,12 @@ var ErrNotStarted = errors.New("客户端引擎尚未启动")
 // ErrStopped 表示 Engine 已停止，不允许重启。
 var ErrStopped = errors.New("客户端引擎已停止，不允许重启")
 
-// 排水上限：Shutdown 等待活动连接结束的最长时间。
-const drainTimeout = 10 * time.Second
+const (
+	// retryBackoff 是工作连接建链失败后的退避时长。
+	retryBackoff = time.Second
+	// poolRetryBackoff 是工作连接池达到上限后的退避时长。
+	poolRetryBackoff = 100 * time.Millisecond
+)
 
 // Engine 是 Core 暴露给宿主的客户端运行门面。
 //
@@ -33,9 +38,11 @@ const drainTimeout = 10 * time.Second
 // 配置拨号并建立控制会话与本地目标监听；Shutdown 释放全部资源。
 // 同一进程可并行运行多个 Engine。
 type Engine struct {
-	config core.ClientConfig
-	logger *slog.Logger
-	dial   func(ctx context.Context, address string) (net.Conn, error)
+	config       core.ClientConfig
+	logger       *slog.Logger
+	dialer       transport.Dialer
+	drainTimeout time.Duration
+	pool         *transport.WorkConnPool
 
 	mu       sync.Mutex
 	state    engineState
@@ -43,9 +50,12 @@ type Engine struct {
 	finalErr error
 	stopOnce sync.Once
 	wg       sync.WaitGroup
-	conns    map[net.Conn]struct{}
+	conns    map[*transport.Conn]struct{}
 	targetLn map[string]net.Listener
 	stopCh   chan struct{}
+	stopCtx  context.Context
+	// cancelWork 取消转发上下文，在 Shutdown 时调用一次。
+	cancelWork context.CancelFunc
 }
 
 // engineState 是 Engine 的内部状态，切换只在持锁下进行。
@@ -61,13 +71,6 @@ const (
 // Option 是客户端 Engine 的装配选项，只做赋值不做校验。
 type Option func(*Engine)
 
-// WithDialer 注入宿主管理的拨号器；未注入时使用标准 TCP 拨号。
-func WithDialer(dial func(ctx context.Context, address string) (net.Conn, error)) Option {
-	return func(engine *Engine) {
-		engine.dial = dial
-	}
-}
-
 // WithLogger 注入宿主的日志器；未注入时丢弃日志。
 func WithLogger(logger *slog.Logger) Option {
 	return func(engine *Engine) {
@@ -78,12 +81,18 @@ func WithLogger(logger *slog.Logger) Option {
 // New 构造客户端 Engine，只做纯内存装配，不拨号、不启动 goroutine。
 func New(config core.ClientConfig, options ...Option) *Engine {
 	engine := &Engine{
-		config:   config,
-		done:     make(chan struct{}),
-		conns:    make(map[net.Conn]struct{}),
-		targetLn: make(map[string]net.Listener),
-		stopCh:   make(chan struct{}),
+		config:       config,
+		done:         make(chan struct{}),
+		conns:        make(map[*transport.Conn]struct{}),
+		targetLn:     make(map[string]net.Listener),
+		stopCh:       make(chan struct{}),
+		dialer:       transport.Dialer{Timeout: config.Timeout()},
+		drainTimeout: config.DrainTimeout(),
+		pool:         transport.NewWorkConnPool(config.WorkConnPoolSize()),
 	}
+	// 转发上下文：Engine 生命周期内唯一，随 Shutdown 取消，用于中断阻塞的转发。
+	// 每条工作连接各建一个会随连接轮换累积 goroutine，此处必须按 Engine 持有。
+	engine.stopCtx, engine.cancelWork = context.WithCancel(context.Background())
 	for _, option := range options {
 		option(engine)
 	}
@@ -95,56 +104,73 @@ func New(config core.ClientConfig, options ...Option) *Engine {
 // 只能成功一次；重复调用返回 ErrAlreadyStarted。失败时不遗留半启动的连接或
 // 监听器，宿主可修正后重试。
 func (engine *Engine) Start(ctx context.Context) error {
-	dial, endpoint, err := engine.claimStartSlot()
+	endpoint, err := engine.claimStartSlot()
 	if err != nil {
 		return err
 	}
 
-	conn, err := dial(ctx, endpoint.Address.String())
+	control, err := engine.dialControl(ctx, endpoint)
 	if err != nil {
 		engine.releaseStartSlot()
-		return fmt.Errorf("客户端拨号失败：%w", err)
+		return err
 	}
 
-	controlDone := make(chan struct{})
-	control := &controlSession{conn: conn, done: controlDone}
 	if err := loginControl(ctx, control, engine.config); err != nil {
-		_ = conn.Close()
+		_ = control.conn.Close()
 		engine.releaseStartSlot()
 		return err
 	}
 
 	engine.commitRunning()
 
-	engine.track(conn)
+	engine.track(control.conn)
 	engine.wg.Add(3)
 	go engine.serveControl(control)
 	go engine.heartbeatLoop(control)
-	go engine.maintainWorkConns(dial, endpoint)
+	go engine.maintainWorkConns(endpoint)
 	return nil
 }
 
-// claimStartSlot 校验配置并原子认领启动位，返回拨号器与服务端端点。
+// dialControl 按配置超时拨号控制连接。
+//
+// 超时来自配置快照：拨号必须带超时，禁止无超时拨号（规格 §3.4）。
+func (engine *Engine) dialControl(ctx context.Context, endpoint core.ServerEndpoint) (*controlSession, error) {
+	conn, err := engine.dial(ctx, endpoint.Address.String(), transport.PurposeControl)
+	if err != nil {
+		return nil, fmt.Errorf("客户端拨号失败：%w", err)
+	}
+	return &controlSession{conn: conn, done: make(chan struct{})}, nil
+}
+
+// dial 拨号一条带用途标记的工作连接。
+//
+// 超时来自配置快照，由传输层强制门禁：禁止无超时拨号（规格 §3.4）。
+func (engine *Engine) dial(
+	ctx context.Context,
+	address string,
+	purpose transport.Purpose,
+	proxy ...string,
+) (*transport.Conn, error) {
+	return engine.dialer.Dial(ctx, address, purpose, proxy...)
+}
+
+// claimStartSlot 校验配置并原子认领启动位，返回服务端端点。
 //
 // 认领即把状态置为 starting，后续失败由调用方回滚到 idle。
-func (engine *Engine) claimStartSlot() (func(ctx context.Context, address string) (net.Conn, error), core.ServerEndpoint, error) {
+func (engine *Engine) claimStartSlot() (core.ServerEndpoint, error) {
 	if err := engine.config.Validate(); err != nil {
-		return nil, core.ServerEndpoint{}, err
+		return core.ServerEndpoint{}, err
 	}
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	if engine.state != stateIdle {
 		if engine.state == stateStarting || engine.state == stateRunning {
-			return nil, core.ServerEndpoint{}, ErrAlreadyStarted
+			return core.ServerEndpoint{}, ErrAlreadyStarted
 		}
-		return nil, core.ServerEndpoint{}, ErrStopped
+		return core.ServerEndpoint{}, ErrStopped
 	}
 	engine.state = stateStarting
-	dial := engine.dial
-	if dial == nil {
-		dial = standardDial
-	}
-	return dial, engine.config.ServerEndpoint(), nil
+	return engine.config.ServerEndpoint(), nil
 }
 
 // releaseStartSlot 把认领失败的启动位回滚到 idle。
@@ -177,14 +203,16 @@ func (engine *Engine) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// markStopped 标记停止、清理异常记录并关闭本地监听器。
+// markStopped 标记停止、清理异常记录、取消转发上下文并关闭本地监听器。
 //
-// 不在此处关闭活动连接：它们交由 waitDrained 按排水上限等待。
+// 取消转发上下文会中断阻塞的双向转发：工作连接随 Engine 一起收尾，不留悬挂
+// goroutine。活动连接仍交由 waitDrained 按排水上限等待，不在此处强制关闭。
 func (engine *Engine) markStopped() {
 	engine.mu.Lock()
 	engine.state = stateStopped
 	engine.finalErr = nil
 	close(engine.stopCh)
+	engine.cancelWork()
 	for _, listener := range engine.targetLn {
 		_ = listener.Close()
 	}
@@ -203,7 +231,7 @@ func (engine *Engine) waitDrained(ctx context.Context) error {
 		engine.wg.Wait()
 	}()
 
-	deadline := drainTimeout
+	deadline := engine.drainTimeout
 	if ctxDeadline, ok := ctx.Deadline(); ok {
 		if remaining := time.Until(ctxDeadline); remaining < deadline {
 			deadline = remaining
@@ -225,10 +253,14 @@ func (engine *Engine) waitDrained(ctx context.Context) error {
 	return nil
 }
 
-// closeDone 在完全停止后关闭 Done 通道；重复调用安全。
+// closeDone 在完全停止后关闭 Done 通道并释放转发上下文；重复调用安全。
+//
+// 取消函数在此统一收口：未 Start 就 Shutdown 的路径也经过这里，因此不会
+// 残留未取消的 context（go vet 的 lostcancel 检查点）。
 func (engine *Engine) closeDone() {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
+	engine.cancelWork()
 	select {
 	case <-engine.done:
 	default:
@@ -264,14 +296,14 @@ func (engine *Engine) log() *slog.Logger {
 }
 
 // track 登记一条活动连接。
-func (engine *Engine) track(conn net.Conn) {
+func (engine *Engine) track(conn *transport.Conn) {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	engine.conns[conn] = struct{}{}
 }
 
 // untrack 移除一条活动连接。
-func (engine *Engine) untrack(conn net.Conn) {
+func (engine *Engine) untrack(conn *transport.Conn) {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	delete(engine.conns, conn)
@@ -280,7 +312,7 @@ func (engine *Engine) untrack(conn net.Conn) {
 // closeConns 强制关闭全部活动连接。
 func (engine *Engine) closeConns() {
 	engine.mu.Lock()
-	conns := make([]net.Conn, 0, len(engine.conns))
+	conns := make([]*transport.Conn, 0, len(engine.conns))
 	for conn := range engine.conns {
 		conns = append(conns, conn)
 	}
@@ -288,12 +320,6 @@ func (engine *Engine) closeConns() {
 	for _, conn := range conns {
 		_ = conn.Close()
 	}
-}
-
-// standardDial 是未注入拨号器时的默认 TCP 拨号。
-func standardDial(ctx context.Context, address string) (net.Conn, error) {
-	dialer := &net.Dialer{}
-	return dialer.DialContext(ctx, "tcp", address)
 }
 
 // clientLogin 是 wire v1 登录载荷的最小形态。
@@ -313,7 +339,7 @@ type loginResponse struct {
 // 控制连接的读写必须串行：心跳写入与响应读取不可并发，否则帧边界错乱。
 // 本结构用一把互斥锁串行全部控制帧写出，读循环独占读取。
 type controlSession struct {
-	conn net.Conn
+	conn *transport.Conn
 	done chan struct{}
 
 	mu sync.Mutex
@@ -450,32 +476,23 @@ func (engine *Engine) failAbnormal(err error) {
 	engine.mu.Unlock()
 }
 
-// maintainWorkConns 为每个代理维持一条待命工作连接。
+// maintainWorkConns 为每个代理维持待命工作连接。
 //
-// 待命连接数固定为每代理一条：服务端取走一条配对访客后，客户端检测到空缺
-// 再补充。停止时全部待命连接随 Engine 一起关闭。
-func (engine *Engine) maintainWorkConns(
-	dial func(ctx context.Context, address string) (net.Conn, error),
-	endpoint core.ServerEndpoint,
-) {
+// 每个代理独立循环：先占用池槽位（受池上限约束），再建链、声明归属并服务
+// 转发；连接结束后释放槽位并重建下一条。停止时全部待命连接随 Engine 一起关闭。
+func (engine *Engine) maintainWorkConns(endpoint core.ServerEndpoint) {
 	defer engine.wg.Done()
-	proxies := engine.config.Proxies()
-	for _, proxy := range proxies {
+	for _, proxy := range engine.config.Proxies() {
 		engine.wg.Add(1)
-		go engine.maintainOneProxy(dial, endpoint, proxy)
+		go engine.maintainOneProxy(endpoint, proxy)
 	}
 }
 
-// maintainOneProxy 为单个代理维持待命工作连接并在配对后服务转发。
+// maintainOneProxy 为单个代理维持一条待命工作连接并在配对后服务转发。
 //
-// 配对后的转发语义：工作连接的远端是服务端的桥接端，近端是本地目标。
-// 本函数在声明归属后进入转发循环，直到连接结束或引擎停止；结束后立即
-// 重建下一条待命连接，保证每个代理始终有一条待命工作连接可用。
-func (engine *Engine) maintainOneProxy(
-	dial func(ctx context.Context, address string) (net.Conn, error),
-	endpoint core.ServerEndpoint,
-	proxy core.TCPProxy,
-) {
+// 池槽位在整条工作连接的生命周期内持有：达到池上限时本循环退避后重试，
+// 绝不无限等待也不静默放弃（规格 §3.5）。
+func (engine *Engine) maintainOneProxy(endpoint core.ServerEndpoint, proxy core.TCPProxy) {
 	defer engine.wg.Done()
 	for {
 		select {
@@ -483,93 +500,57 @@ func (engine *Engine) maintainOneProxy(
 			return
 		default:
 		}
-		work, err := dial(context.Background(), endpoint.Address.String())
+		slot, err := engine.pool.Acquire(context.Background(), proxy.Name)
 		if err != nil {
+			// 池已满：退避后重试，避免忙循环。
 			select {
 			case <-engine.stopCh:
 				return
-			case <-time.After(time.Second):
+			case <-time.After(poolRetryBackoff):
 				continue
 			}
 		}
-		if err := declareWorkConn(work, proxy.Name); err != nil {
-			_ = work.Close()
-			continue
-		}
-		// 声明已发送：进入与本地目标的转发循环，直到工作连接结束。
-		// 服务端在配对成功后开始转发；配对前服务端暂存该连接，本端阻塞在
-		// 转发循环的首次读取上，不消耗资源。
-		engine.track(work)
-		serveWorkConn(work, proxy.LocalAddr.String(), engine.stopCh)
-		engine.untrack(work)
-		_ = work.Close()
+		engine.serveOneWorkConn(endpoint, proxy)
+		slot.Release()
 	}
+}
+
+// serveOneWorkConn 建链、声明归属并服务一条工作连接，直到连接结束。
+func (engine *Engine) serveOneWorkConn(endpoint core.ServerEndpoint, proxy core.TCPProxy) {
+	work, err := engine.dial(context.Background(), endpoint.Address.String(), transport.PurposeWork, proxy.Name)
+	if err != nil {
+		select {
+		case <-engine.stopCh:
+		case <-time.After(retryBackoff):
+		}
+		return
+	}
+	if err := declareWorkConn(work, proxy.Name); err != nil {
+		_ = work.Close()
+		return
+	}
+	// 声明已发送：服务端暂存该连接等待访客，本端拨号本地目标后进入双向转发。
+	engine.track(work)
+	engine.serveWorkConn(work, proxy.LocalAddr.String())
+	engine.untrack(work)
+	_ = work.Close()
 }
 
 // serveWorkConn 把一条已声明归属的工作连接桥接到本地目标。
 //
-// 转发是双向的：本地目标的回包原路返回工作连接。任一方向结束即关闭两端
-// 并返回，调用方负责重建下一条待命连接。
-func serveWorkConn(work net.Conn, target string, stopCh <-chan struct{}) {
-	targetConn, err := net.Dial("tcp", target)
+// 本地目标的拨号同样带配置超时，禁止无超时拨号。任一方向结束即关闭两端并
+// 返回，调用方负责释放池槽位并重建下一条待命连接。
+func (engine *Engine) serveWorkConn(work *transport.Conn, target string) {
+	targetConn, err := engine.dialer.Dial(context.Background(), target, transport.PurposeWork)
 	if err != nil {
 		return
 	}
-	defer targetConn.Close()
-
-	var done sync.WaitGroup
-	done.Add(2)
-	go func() {
-		defer done.Done()
-		_, _ = copyStream(targetConn, work)
-		if closer, ok := targetConn.(*net.TCPConn); ok {
-			_ = closer.CloseWrite()
-		}
-	}()
-	go func() {
-		defer done.Done()
-		_, _ = copyStream(work, targetConn)
-		if closer, ok := work.(*net.TCPConn); ok {
-			_ = closer.CloseWrite()
-		}
-	}()
-	finished := make(chan struct{})
-	go func() {
-		defer close(finished)
-		done.Wait()
-	}()
-	select {
-	case <-finished:
-	case <-stopCh:
-		_ = work.Close()
-		<-finished
-	}
-}
-
-// copyStream 在两个连接之间转发字节，返回转发字节数。
-func copyStream(dst, src net.Conn) (int64, error) {
-	buffer := make([]byte, 32*1024)
-	var total int64
-	for {
-		read, readErr := src.Read(buffer)
-		if read > 0 {
-			written, writeErr := dst.Write(buffer[:read])
-			total += int64(written)
-			if writeErr != nil {
-				return total, writeErr
-			}
-			if written != read {
-				return total, errors.New("转发写入不完整")
-			}
-		}
-		if readErr != nil {
-			return total, readErr
-		}
-	}
+	defer func() { _ = targetConn.Close() }()
+	transport.Bridge(engine.stopCtx, work, targetConn)
 }
 
 // declareWorkConn 在新建的工作连接首帧声明代理归属，供服务端配对访客。
-func declareWorkConn(work net.Conn, proxyName string) error {
+func declareWorkConn(work *transport.Conn, proxyName string) error {
 	body, err := json.Marshal(map[string]string{"run_id": proxyName, "proxy_name": proxyName})
 	if err != nil {
 		return err
