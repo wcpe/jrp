@@ -67,9 +67,14 @@ function collectGoFiles(directory) {
   return files;
 }
 
-// Core 源码（含测试）不得读取运行环境：构建器只接受宿主在代码中传入的值。
+// Core 生产源码不得读取运行环境：构建器只接受宿主在代码中传入的值。
+// 测试文件（_test.go）不在此约束内，因为测试读取自身 testdata 属正当行为，
+// 且测试不进入任何二进制产物。
 function checkCoreSources(directory) {
   for (const file of collectGoFiles(directory)) {
+    if (file.endsWith('_test.go')) {
+      continue;
+    }
     const relativePath = path.relative(root, file).split(path.sep).join('/');
     const source = readFileSync(file, 'utf8');
     for (const [label, pattern] of forbiddenCoreSourcePatterns) {

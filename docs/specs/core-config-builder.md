@@ -183,7 +183,7 @@ scfg, err := core.NewServerConfig(
 依赖与门禁：
 
 - Core 依赖图穷举不含 Gin、GORM、SQLite、Web、通知、`apps/*` 与 `github.com/fatedier/frp`。
-- Core 测试源码中不存在 `os.Getenv`、`os.Open`、`os.ReadFile` 或任何数据库驱动导入；该断言由依赖门脚本或 grep 门禁覆盖。
+- Core 生产源码中不存在 `os.Getenv`、`os.Open`、`os.ReadFile` 或任何数据库驱动导入；该断言由依赖门脚本扫描非 `_test.go` 的 Go 源码覆盖。测试文件不受此约束，因为测试读取自身 `testdata` 属正当行为且不进入二进制产物。
 - `task test:core` 与 `task lint:go` 在 Windows、Linux、macOS 均通过。
 
 ## 6. 风险与待定
