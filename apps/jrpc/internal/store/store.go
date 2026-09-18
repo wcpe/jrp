@@ -78,6 +78,10 @@ func Open(cfg Config) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := restrictDatabasePermissions(cfg.Path); err != nil {
+		_ = sqlDB.Close()
+		return nil, err
+	}
 	store := &Store{db: db, sqlDB: sqlDB, logger: logger, path: cfg.Path, role: RoleClient}
 
 	if err := store.loadSchemaVersion(); err != nil {
@@ -383,4 +387,18 @@ func translateSQLError(err error) error {
 	default:
 		return err
 	}
+}
+
+// restrictDatabasePermissions 把数据库文件与 WAL/SHM 的权限收紧到仅运行账户可读写。
+//
+// SQLite 驱动按进程 umask 创建文件（通常 0644），而库内可能含客户端身份材料，
+// 数据目录是信任边界：同机其他用户不得读取。Windows 上权限由 ACL 管理，
+// 本函数只在类 Unix 平台生效。
+func restrictDatabasePermissions(path string) error {
+	for _, target := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Chmod(target, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("收紧数据库文件权限失败：%w", err)
+		}
+	}
+	return nil
 }

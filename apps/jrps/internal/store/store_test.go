@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -200,5 +201,33 @@ func TestWriteFailureReturnsChineseError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "写入") {
 		t.Fatalf("写入失败错误信息应为中文：%v", err)
+	}
+}
+
+// TestOpenRestrictsDatabaseFilePermissions 断言数据库文件权限被收紧到仅运行账户可读写。
+//
+// SQLite 驱动按 umask 创建文件（通常 0644），而库内含明文 token 与配置：
+// 数据目录是信任边界，同机其他用户不得读取。Windows 上权限由 ACL 管理，
+// 本断言只在类 Unix 平台生效。
+func TestOpenRestrictsDatabaseFilePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 文件权限由 ACL 管理，不适用 POSIX 位")
+	}
+
+	path := filepath.Join(t.TempDir(), "jrps.db")
+	store := openServerStore(t, path)
+	defer store.Close()
+
+	for _, target := range []string{path, path + "-wal"} {
+		info, err := os.Stat(target)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			t.Fatalf("读取文件状态失败：%v", err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Fatalf("数据库文件权限过宽：%s 为 %o，期望 600", filepath.Base(target), perm)
+		}
 	}
 }
