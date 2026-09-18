@@ -1,0 +1,193 @@
+# 接口契约：JRP
+
+> 本文是 JRP 管理接口的目标契约真源。工程骨架当前端点与尚未交付的 P1 契约分开描述；存在文档不代表已经实现。
+
+## 1. 通用约定
+
+### 1.1 接口分区
+
+- `/healthz`、`/readyz`：工程骨架健康端点。
+- `/api/v1`：单管理员 REST 管理接口。
+- `/api/v1/events`：SSE 实时事件流。
+- `/agent/v1`：jrpc enrollment、配置获取和 WSS 管理通道。
+
+P1 不提供 `/node`、`/cluster`、节点注册、调度或分布式 RPC 端点，也不在请求/响应中预留节点字段。
+
+### 1.2 编码与时间
+
+- REST 使用 UTF-8 JSON；错误使用 `application/problem+json`。
+- 时间使用 RFC 3339 UTC 字符串。
+- ID 为服务端生成的不透明字符串，客户端不得解析结构。
+- 字节数使用整数，持续时间字段明确使用毫秒或秒后缀。
+
+### 1.3 管理认证与 CSRF
+
+- Web 登录成功后使用 `HttpOnly`、`Secure`、合理 `SameSite` 属性的 Cookie session。
+- 所有修改状态的管理请求必须验证 CSRF token；只读 GET 也不得产生副作用。
+- P1 只有一个管理员，不提供角色或租户字段。
+- 正文查看、导出和删除除会话/CSRF 外还必须写审计事件。
+
+### 1.4 jrpc 认证
+
+- enrollment 使用一次性或短期 enrollment 凭据换取客户端身份与独立 token。
+- 后续 HTTPS/WSS 请求使用该客户端 token，不使用管理员 Cookie。
+- token 只授权当前客户端的 desired state、回执和运行状态，不得访问其他客户端。
+
+### 1.5 分页、过滤与并发控制
+
+- 列表使用游标分页：`limit` 与 `cursor`；响应包含 `items` 和可选 `nextCursor`。
+- 默认 `limit=50`，最大值为 200；非法游标返回 400 问题详情。
+- 可变资源响应包含 `ETag`，修改请求使用 `If-Match` 或显式 `revision`。
+- revision 不匹配返回 409，客户端必须重新读取，不允许最后写入静默覆盖。
+
+### 1.6 幂等与事件
+
+- 创建 token、应用配置等可重试操作接受 `Idempotency-Key`，同一主体与键在有效期内返回同一结果。
+- SSE 事件包含 `id`、`type`、`occurredAt`、`data`，支持 `Last-Event-ID` 恢复。
+- SSE 仅提供观察能力，不承载配置命令。
+
+## 2. 错误约定
+
+错误媒体类型为 `application/problem+json`：
+
+```json
+{
+  "type": "https://jrp.invalid/problems/revision-conflict",
+  "title": "配置版本冲突",
+  "status": 409,
+  "detail": "请求基于的配置版本已过期",
+  "code": "revision_conflict",
+  "requestId": "不透明请求标识"
+}
+```
+
+字段约定：
+
+- `type`：稳定的问题类型标识，不携带秘密。
+- `title`：面向用户的中文摘要。
+- `status`：HTTP 状态码。
+- `detail`：可安全公开的中文说明，不包含堆栈、SQL、文件路径、内部地址或凭证。
+- `code`：稳定机器码。
+- `requestId`：用于关联脱敏日志。
+
+常见状态：400 输入非法、401 未认证、403 无权限或 CSRF 失败、404 不存在、409 revision 冲突、413 请求或正文超限、422 配置语义无效、429 速率受限、500 内部错误、503 尚未就绪。
+
+## 3. 当前工程骨架端点
+
+### 3.1 存活检查
+
+- **方法/路径**：`GET /healthz`
+- **认证**：无
+- **响应**：进程可处理请求时返回 200 和最小状态对象。
+- **语义**：只表示进程存活，不表示数据库、监听器或配置已就绪。
+
+### 3.2 就绪检查
+
+- **方法/路径**：`GET /readyz`
+- **认证**：无
+- **响应**：关键启动检查完成时返回 200；尚未就绪返回 503。
+- **语义**：工程骨架阶段只覆盖已接入的依赖，不虚构尚未实现的数据库或协议检查。
+
+除上述端点外，以下 §4 和 §5 均为 P1 目标契约，只有对应 FR 验收通过后才视为已交付。
+
+## 4. P1 管理 REST 契约
+
+### 4.1 首次初始化
+
+- **唯一入口**：`jrps init` 本地 CLI；P1 不提供远程 HTTP 初始化端点。
+- **启用条件**：只允许在目标 SQLite 尚无管理员记录时执行；成功后该初始化路径永久关闭。
+- **凭据输入**：默认通过交互式标准输入读取管理员密码，禁止把密码放入普通命令参数；自动化方式由对应功能规格定义受限标准输入或一次性环境变量。
+- **原子性**：数据库迁移、管理员创建与初始化完成标记必须在同一事务中提交；失败不得留下可登录的半初始化状态。
+- **重复执行**：已完成初始化时返回明确错误，不得重置管理员、覆盖密码或绕过现有会话安全策略。
+- **CSRF 边界**：初始化发生在本机 CLI，不建立浏览器会话，因此不适用 Web CSRF；首次成功登录后所有修改请求仍按 §1.3 执行。
+
+### 4.2 管理员会话
+
+- `POST /api/v1/session`：验证管理员凭据并建立 Cookie session。
+- `DELETE /api/v1/session`：注销当前会话。
+- `GET /api/v1/session`：返回当前会话的脱敏信息和 CSRF 协议所需状态。
+
+不得返回密码、密码派生材料、完整 Cookie 或服务端会话密钥。
+
+### 4.3 客户端
+
+- `GET /api/v1/clients`：分页查询客户端、连接状态和 revision 摘要。
+- `POST /api/v1/clients`：创建待 enrollment 客户端或发行 enrollment 凭据。
+- `GET /api/v1/clients/{clientId}`：读取单个客户端详情。
+- `PATCH /api/v1/clients/{clientId}`：修改允许的管理元数据。
+- `POST /api/v1/clients/{clientId}/tokens:rotate`：轮换独立 token。
+- `POST /api/v1/clients/{clientId}/tokens:revoke`：吊销 token 并使后续鉴权失败。
+
+所有 token 响应只允许在创建时返回一次完整值，后续只返回掩码和元数据。
+
+### 4.4 代理与配置 revision
+
+- `GET /api/v1/proxies`、`GET /api/v1/proxies/{proxyId}`：查询代理。
+- `POST /api/v1/proxies`：创建代理并生成新的 desired revision。
+- `PATCH /api/v1/proxies/{proxyId}`：修改代理并生成新的 desired revision。
+- `DELETE /api/v1/proxies/{proxyId}`：删除代理并生成新的 desired revision。
+- `GET /api/v1/config-revisions`：查询 desired、active、last-good 与应用结果。
+- `POST /api/v1/config-revisions/{revision}:apply`：触发 prepare、health-check、publish、drain。
+- `POST /api/v1/config-revisions/{revision}:restore`：以历史内容创建新的 desired revision，不直接修改历史版本。
+
+应用请求成功受理可返回 202，最终结果通过资源状态和 SSE 事件观察。冲突使用 409，语义无效使用 422。
+
+### 4.5 状态、日志与指标
+
+- `GET /api/v1/status`：服务、客户端、代理、连接与容量摘要。
+- `GET /api/v1/logs`：按时间、等级、组件和关联 ID 过滤脱敏日志。
+- `GET /api/v1/metrics`：供 Web 使用的结构化指标摘要；监控抓取格式另由实现 spec 明确。
+- `GET /api/v1/events`：SSE 实时事件。
+
+### 4.6 HTTP 采集
+
+- `GET /api/v1/captures`：分页查询请求元数据，不默认携带正文。
+- `GET /api/v1/captures/{captureId}`：查询单条元数据。
+- `GET /api/v1/captures/{captureId}/body`：流式读取正文并记录审计。
+- `DELETE /api/v1/captures/{captureId}`：删除索引与正文引用并记录审计。
+- `GET /api/v1/capture-policy`、`PUT /api/v1/capture-policy`：管理默认关闭、30 天和 5 GiB 策略。契约与策略值归属见 `docs/specs/audit-and-retention.md`；`PUT` 遵循 §1.5 的并发控制（ETag/If-Match），变更写入审计。
+
+未采集、已清理或不可见的正文返回 404/410 的稳定问题码；API 不应把压缩分段文件路径暴露给客户端。
+
+### 4.7 通知与审计
+
+- `GET/POST/PATCH/DELETE /api/v1/notification-targets`：管理 Webhook 与邮件目标。
+- `POST /api/v1/notification-targets/{targetId}:test`：发送显式测试通知，不伪造业务事件。
+- `GET /api/v1/audit-events`：分页查询审计事件。
+
+通知目标中的秘密只在创建/更新时接收，读取时必须掩码。
+
+## 5. P1 jrpc 管理契约
+
+### 5.1 Enrollment
+
+- **方法/路径**：`POST /agent/v1/enrollments`
+- **请求**：enrollment 凭据、客户端生成的身份材料、版本与平台摘要。
+- **响应**：客户端 ID、独立 token、管理 WSS 地址、服务端证书指纹信息和当前 desired revision 摘要。
+- **错误**：凭据无效/过期、客户端已绑定、版本不受支持、速率受限。
+
+### 5.2 Desired state
+
+- **方法/路径**：`GET /agent/v1/desired-state`
+- **认证**：客户端 token。
+- **条件请求**：支持 ETag/revision；无新版本可返回 304。
+- **响应**：只包含当前客户端的不可变 desired state 和 revision。
+
+### 5.3 应用回执
+
+- **方法/路径**：`POST /agent/v1/apply-results`
+- **请求**：revision、阶段、成功/失败、脱敏错误摘要、active/last-good revision。
+- **约束**：重复回执幂等；客户端不得回报其他客户端或未知 revision。
+
+### 5.4 管理长连接
+
+- **方法/路径**：`GET /agent/v1/connect`，升级为 WSS。
+- **用途**：服务端通知 desired revision 变化、token 状态与控制面心跳；客户端回报在线状态与应用进度。
+- **边界**：不承载代理数据，不复用或扩展官方 frpc 数据消息。
+
+## 6. 安全与审计要求
+
+- 所有正文读取、token 管理、配置变更和通知目标变更必须审计。
+- 管理接口不得返回完整秘密；问题详情不得泄露内部实现。
+- 输入必须限制集合大小、字符串长度、端口、域名、URL、帧和正文大小。
+- 破坏性接口必须具备明确对象、revision/ETag 和幂等边界。
