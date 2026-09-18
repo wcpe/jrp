@@ -86,6 +86,7 @@ tasks:
     cmds:
       - task: test:core
       - task: test:jrps
+      - task: test:jrps:webui
       - task: test:jrpc
 
   test:fuzz:

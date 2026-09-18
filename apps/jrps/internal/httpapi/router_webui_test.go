@@ -10,7 +10,9 @@ import (
 )
 
 func TestProductionSPAAssets(t *testing.T) {
-	router := NewRouter()
+	// 本用例只验证生产 SPA 资源，不涉及管理端点，因此传空选项：
+	// Store 为空时管理端点按未初始化处理，不影响静态资源断言。
+	router := NewRouter(RouterOptions{})
 	indexRecorder := httptest.NewRecorder()
 	indexRequest := httptest.NewRequest(http.MethodGet, "/", nil)
 	router.ServeHTTP(indexRecorder, indexRequest)
