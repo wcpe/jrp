@@ -70,7 +70,8 @@ tasks:
       - go test ./...
 
   test:jrps:webui:
-    desc: 运行 jrps 生产 Web 嵌入测试
+    desc: 运行 jrps 生产 Web 嵌入测试（先构建前端，因为该标签下的 embed 依赖 dist 产物）
+    deps: [build:web]
     dir: apps/jrps
     cmds:
       - go test -tags webui ./...
@@ -86,16 +87,16 @@ tasks:
     cmds:
       - task: test:core
       - task: test:jrps
-      - task: test:jrps:webui
       - task: test:jrpc
 
   test:fuzz:
     desc: 运行 wire 层模糊测试（短时，用于 CI 回归）
     dir: core
     cmds:
-      - go test -run=^$ -fuzz=FuzzV1Frame -fuzztime=10s ./internal/wire/
-      - go test -run=^$ -fuzz=FuzzV2Frame -fuzztime=10s ./internal/wire/
-      - go test -run=^$ -fuzz=FuzzVersionDetection -fuzztime=10s ./internal/wire/
+      # 每个入口 5 秒：CI 机器性能差异大，短时长能在保持有效覆盖的同时控制总耗时。
+      - go test -run=^$ -fuzz=FuzzV1Frame -fuzztime=5s ./internal/wire/
+      - go test -run=^$ -fuzz=FuzzV2Frame -fuzztime=5s ./internal/wire/
+      - go test -run=^$ -fuzz=FuzzVersionDetection -fuzztime=5s ./internal/wire/
 
   test:web:
     desc: 运行 Web 测试

@@ -118,7 +118,11 @@ func FuzzVersionDetection(f *testing.F) {
 					t.Fatalf("判定失败必须携带稳定类别：%v", err)
 				}
 			}
-		case <-time.After(5 * time.Second):
+		// 悬挂看门狗：判定必须给出确定答案而非永久等待（规格 §2「不得悬挂」）。
+		//
+		// 阈值留足余量：DetectVersion 对内存读取器是纯 CPU 操作，但 CI 机器性能
+		// 差异可达一个数量级，过紧会把它变成对吞吐的间接断言而误报。
+		case <-time.After(20 * time.Second):
 			t.Fatal("版本判定悬挂")
 		}
 	})
