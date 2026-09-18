@@ -58,3 +58,8 @@
 - CI 升级 action 版本至 Node 24 运行时：checkout v7、setup-go v7、setup-node v7、pnpm/action-setup v6，消除 Node.js 20 弃用警告。
 - CI 的文档路径忽略范围由 `.claude/rules/**` 扩至 `.claude/**`。
 - README 补入 CI、许可、Go 与 pnpm 徽章，登记 S1 已交付能力，并更新快速开始为当前可用命令。
+- 交付 FR-02 首次初始化与单管理员认证：`jrps init` 在本机一次性建立唯一管理员凭据，密码只经交互式标准输入或一次性环境变量读取，禁止命令参数形态；管理员记录与初始化标记在同一事务提交，重复执行返回中文错误且不覆盖密码。
+- FR-02 建立首个 `/api/v1` 路由面与中间件挂载点，并实现会话端点：`POST`/`GET`/`DELETE /api/v1/session` 分别建立、查询与注销会话；未初始化时 `/api` 前缀一律返回 503，`/healthz` 与 `/readyz` 保持可用。
+- FR-02 会话采用 `HttpOnly`、`Secure` 与 `SameSite=Strict` Cookie，服务端只保存会话令牌摘要；修改请求必须校验 CSRF token，缺失或错误返回 403 且不产生副作用。
+- FR-02 管理员密码使用标准库 PBKDF2-HMAC-SHA256 派生，盐与派生参数随记录保存；登录失败不区分用户不存在与密码错误，连续失败达到阈值后限流，登录、登出与失败尝试均写入审计事件且不含凭据材料。
+- FR-02 新增 `admin_initialized`、`admin_login`、`admin_logout`、`admin_login_failure` 四个审计动作常量，与既有审计常量块保持同一命名风格。

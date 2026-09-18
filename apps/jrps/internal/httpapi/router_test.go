@@ -9,7 +9,7 @@ import (
 )
 
 func TestHealthAndReadiness(t *testing.T) {
-	router := NewRouter()
+	router := NewRouter(RouterOptions{})
 
 	for _, path := range []string{"/healthz", "/readyz"} {
 		recorder := httptest.NewRecorder()
@@ -34,7 +34,7 @@ func TestHealthAndReadiness(t *testing.T) {
 }
 
 func TestSPAFallback(t *testing.T) {
-	router := NewRouter()
+	router := NewRouter(RouterOptions{})
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodGet, "/dashboard/proxies", nil)
 
@@ -51,16 +51,34 @@ func TestSPAFallback(t *testing.T) {
 	}
 }
 
+// SPA fallback 不得吞掉保留路径。
+//
+// 该测试使用未初始化的空存储：按 FR-02 规格 §2.1，/api 前缀此时返回 503 而非 404，
+// 因此 /api 与 /agent 分开断言；核心断言是"响应体不得是 SPA 的 HTML"。
 func TestSPAFallbackDoesNotHandleReservedPaths(t *testing.T) {
-	router := NewRouter()
+	router := NewRouter(RouterOptions{})
 
-	for _, path := range []string{"/api", "/api/proxies", "/agent", "/agent/v1/connect", "/healthz/missing", "/readyz/missing"} {
+	for _, path := range []string{"/agent", "/agent/v1/connect", "/healthz/missing", "/readyz/missing"} {
 		recorder := httptest.NewRecorder()
 		request := httptest.NewRequest(http.MethodGet, path, nil)
 		router.ServeHTTP(recorder, request)
 
 		if recorder.Code != http.StatusNotFound {
 			t.Fatalf("%s 应返回 404，实际为 %d", path, recorder.Code)
+		}
+		if strings.Contains(strings.ToLower(recorder.Body.String()), "<html") {
+			t.Fatalf("%s 被 SPA fallback 吞掉", path)
+		}
+	}
+
+	// 未初始化时 /api 前缀返回 503，且同样不得落入 SPA fallback。
+	for _, path := range []string{"/api", "/api/v1/session"} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		router.ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s 在未初始化时应返回 503，实际为 %d", path, recorder.Code)
 		}
 		if strings.Contains(strings.ToLower(recorder.Body.String()), "<html") {
 			t.Fatalf("%s 被 SPA fallback 吞掉", path)

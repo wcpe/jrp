@@ -30,6 +30,15 @@ const (
 	ActionClientCreate   = "client_create"
 )
 
+// 认证相关审计动作（FR-02）：登录、登出、登录失败与管理员初始化。
+// 该枚举后续由 FR-16 统一管理，此处只登记本次需要的取值。
+const (
+	ActionAdminInitialized  = "admin_initialized"
+	ActionAdminLogin        = "admin_login"
+	ActionAdminLogout       = "admin_logout"
+	ActionAdminLoginFailure = "admin_login_failure"
+)
+
 // ErrNoRevision 表示数据库尚无任何 desired 版本。
 var ErrNoRevision = errors.New("尚无配置版本")
 

@@ -25,6 +25,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if handled, code := handleImmediateCommand(args, stdout); handled {
 		return code
 	}
+	if len(args) > 0 && args[0] == "init" {
+		return runInitCommand(args[1:], stdout, stderr, os.Stdin)
+	}
 
 	flags := flag.NewFlagSet("jrps", flag.ContinueOnError)
 	flags.SetOutput(stderr)
@@ -96,7 +99,7 @@ func handleImmediateCommand(args []string, stdout io.Writer) (bool, int) {
 func serve(listen string, database *store.Store, logger *slog.Logger) int {
 	server := http.Server{
 		Addr:              listen,
-		Handler:           httpapi.NewRouter(),
+		Handler:           httpapi.NewRouter(httpapi.RouterOptions{Store: database, Logger: logger}),
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
