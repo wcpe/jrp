@@ -14,29 +14,11 @@ const (
 	ScopeServer = "server"
 )
 
-// 审计主体与动作枚举：P1 只有管理员与客户端两类主体，动作为封闭枚举。
+// 审计主体类别：P1 只有管理员与客户端两类主体。
+// 动作、对象类型与结果的封闭枚举由 audit.go 统一管理（FR-16 规格 §3.2）。
 const (
 	ActorTypeAdmin  = "admin"
 	ActorTypeClient = "client"
-
-	ActionProxyCreate    = "proxy_create"
-	ActionProxyUpdate    = "proxy_update"
-	ActionProxyDelete    = "proxy_delete"
-	ActionApplyPrepare   = "apply_prepare"
-	ActionApplyPublish   = "apply_publish"
-	ActionApplyFailure   = "apply_failure"
-	ActionRestoreApply   = "restore_apply"
-	ActionRevisionAppend = "revision_append"
-	ActionClientCreate   = "client_create"
-)
-
-// 认证相关审计动作（FR-02）：登录、登出、登录失败与管理员初始化。
-// 该枚举后续由 FR-16 统一管理，此处只登记本次需要的取值。
-const (
-	ActionAdminInitialized  = "admin_initialized"
-	ActionAdminLogin        = "admin_login"
-	ActionAdminLogout       = "admin_logout"
-	ActionAdminLoginFailure = "admin_login_failure"
 )
 
 // ErrNoRevision 表示数据库尚无任何 desired 版本。
@@ -399,9 +381,14 @@ func (tx *Tx) AuditEvents() ([]AuditEvent, error) {
 }
 
 // writeAudit 写入审计事件；审计与业务结果在同一事务内提交，不进入降级路径。
+//
+// 时间是服务端生成的事实而非调用方输入：无论调用方是否填了 OccurredAt，一律
+// 以当前 UTC 时间覆盖（FR-16 规格 §2.1）。校验失败与写入失败都返回错误，由
+// 上层事务整体回滚，不留下字段不合法或携带秘密的审计记录。
 func (tx *Tx) writeAudit(event AuditEvent) error {
-	if event.OccurredAt.IsZero() {
-		event.OccurredAt = time.Now().UTC()
+	event.OccurredAt = time.Now().UTC()
+	if err := validateAuditEvent(event); err != nil {
+		return err
 	}
 	if err := tx.db.Create(&event).Error; err != nil {
 		return fmt.Errorf("写入审计事件失败：%w", translateSQLError(err))

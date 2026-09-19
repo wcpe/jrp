@@ -266,3 +266,35 @@ type BodySegment struct {
 }
 
 func (BodySegment) TableName() string { return "body_segments" }
+
+// capturePolicyRowID 是策略单例行的固定主键：策略是受管理的对象而非流水记录，
+// 全库只允许存在一行，读取时按其定位，不引入版本表。
+const capturePolicyRowID = 1
+
+// CapturePolicy 是受管理的保留策略对象（FR-16 规格 §3.4）。
+//
+// 采集默认关闭；保留天数与正文总量上限两个限制独立计算，任一先到即触发清理。
+// 它是策略真源，不散落在采集代码里的常量（ADR-0004）。
+//
+// 审计保留天数与正文策略同表但相互独立（§3.7）：正文清理不牵连审计，
+// 审计清理只按时间维度、不按大小。同表存放是因为两者同属"保留策略对象"、
+// 由同一个端点读写，不是因为它们互相影响。
+type CapturePolicy struct {
+	ID uint64 `gorm:"primaryKey"`
+
+	// CaptureEnabled 是采集总开关，默认关闭：未显式开启前不产生任何请求记录。
+	CaptureEnabled bool `gorm:"not null;default:false"`
+
+	// RetentionDays 是正文保留天数，从记录产生时刻起算。
+	RetentionDays int `gorm:"not null"`
+
+	// MaxTotalBytes 是正文分段文件总量上限，单位字节。
+	MaxTotalBytes int64 `gorm:"not null"`
+
+	// AuditRetentionDays 是审计事件保留天数，独立于正文策略。
+	AuditRetentionDays int `gorm:"not null"`
+
+	UpdatedAt time.Time
+}
+
+func (CapturePolicy) TableName() string { return "capture_policy" }

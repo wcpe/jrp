@@ -145,7 +145,12 @@ P1 不提供 `/node`、`/cluster`、节点注册、调度或分布式 RPC 端点
 - `GET /api/v1/captures/{captureId}`：查询单条元数据。
 - `GET /api/v1/captures/{captureId}/body`：流式读取正文并记录审计。
 - `DELETE /api/v1/captures/{captureId}`：删除索引与正文引用并记录审计。
-- `GET /api/v1/capture-policy`、`PUT /api/v1/capture-policy`：管理默认关闭、30 天和 5 GiB 策略。契约与策略值归属见 `docs/specs/audit-and-retention.md`；`PUT` 遵循 §1.5 的并发控制（ETag/If-Match），变更写入审计。
+- `GET /api/v1/capture-policy`、`PUT /api/v1/capture-policy`：管理默认关闭、30 天和 5 GiB 策略。契约与策略值归属见 `docs/specs/audit-and-retention.md`。
+  - 读取需管理员会话；修改需会话与 CSRF（`X-CSRF-Token`），变更写入审计。
+  - 响应字段：`captureEnabled`（布尔）、`retentionDays`（整数）、`maxTotalBytes`（整数，字节）、`auditRetentionDays`（整数）、`updatedAt`（RFC 3339 UTC）。
+  - `PUT` 请求体必须提供全部四项策略值（不接受部分提交），越界或缺失返回 400 且不产生部分变更。
+  - 边界：正文保留天数 1–365，正文总量上限 1 MiB–1 TiB，审计保留天数 30–3650。
+  - 并发控制：策略是单行整体对象，`PUT` 用**最后写入生效**语义，暂不提供 `If-Match`/`ETag`。这与 §1.5 对可变资源的通用约定不同，是 P1 的已知简化：单管理员场景下并发覆盖的实际风险低，而变更审计完整记录前后值，事后可追溯。若引入多管理员或外部自动化写入，须补齐条件写入。
 
 未采集、已清理或不可见的正文返回 404/410 的稳定问题码；API 不应把压缩分段文件路径暴露给客户端。
 
@@ -153,7 +158,12 @@ P1 不提供 `/node`、`/cluster`、节点注册、调度或分布式 RPC 端点
 
 - `GET/POST/PATCH/DELETE /api/v1/notification-targets`：管理 Webhook 与邮件目标。
 - `POST /api/v1/notification-targets/{targetId}:test`：发送显式测试通知，不伪造业务事件。
-- `GET /api/v1/audit-events`：分页查询审计事件。
+- `GET /api/v1/audit-events`：分页查询审计事件，需管理员会话。
+  - 过滤参数：`from`/`to`（RFC 3339 时间范围，闭区间）、`action`（动作枚举）、`objectType`（对象类型枚举）、`result`（`success`/`failure`/`denied`）。
+  - 过滤值必须是封闭枚举内的取值；非法值返回 400，不静默忽略。
+  - 分页遵循 §1.5：`limit` 默认 50、最大 200；`cursor` 为不透明字符串，非法游标返回 400。
+  - 响应字段：`items` 数组（每项含 `id`、`occurredAt`、`actorType`、`actorId`、`action`、`objectType`、`objectId`、`result`、`context`、`requestId`）与可选 `nextCursor`。
+  - **负面契约**：P1 不提供审计导出接口，也不提供审计删除接口。审计事件不可被管理员经 API 抹除；写入后不可修改。
 
 通知目标中的秘密只在创建/更新时接收，读取时必须掩码。
 

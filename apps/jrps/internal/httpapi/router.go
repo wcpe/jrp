@@ -63,6 +63,8 @@ func NewRouter(options RouterOptions) *gin.Engine {
 // 只有在路由匹配时才执行，因此仅靠组中间件会让未初始化的未知端点绕过守卫返回 404。
 func registerAPI(router *gin.Engine, options RouterOptions) {
 	session := newSessionAPI(options)
+	audit := newAuditAPI(options)
+	policy := newPolicyAPI(options)
 	guard := requireInitialized(options.Store)
 	router.Use(func(context *gin.Context) {
 		if strings.HasPrefix(context.Request.URL.Path, "/api") {
@@ -76,6 +78,14 @@ func registerAPI(router *gin.Engine, options RouterOptions) {
 	api.POST("/session", session.login)
 	api.GET("/session", session.authenticate(false), session.query)
 	api.DELETE("/session", session.authenticate(true), session.logout)
+
+	// 审计查询是安全敏感读取：与日志查询同类，读取本身也须留痕（FR-16 §3.6）。
+	// P1 不提供审计导出与删除接口——审计不可被管理员经 API 抹除（§3.6）。
+	api.GET("/audit-events", session.authenticate(false), audit.list)
+
+	// 保留策略：读取需会话，修改额外要求 CSRF；变更写入审计（FR-16 §3.4）。
+	api.GET("/capture-policy", session.authenticate(false), policy.show)
+	api.PUT("/capture-policy", session.authenticate(true), policy.update)
 }
 
 func notImplementedHandler(context *gin.Context) {

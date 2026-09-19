@@ -67,6 +67,7 @@ func TestOpenOnEmptyDatabaseAppliesInitialMigration(t *testing.T) {
 		"store_meta", "admin_credentials", "sessions", "clients", "proxies",
 		"config_revisions", "revision_state", "apply_results", "audit_events",
 		"notification_targets", "notification_outbox", "request_records", "body_segments",
+		"capture_policy",
 	}
 	for _, table := range expected {
 		if !store.DB().Migrator().HasTable(table) {
