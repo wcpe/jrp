@@ -12,6 +12,6 @@
 | [static-analysis.md](static-analysis.md) | Go 与 Web 格式、静态分析和漏洞门禁 |
 | [comments.md](comments.md) | 注释和日志语言 |
 | [config-files.md](config-files.md) | 运行配置命名、注释与敏感项 |
-| [git-commit.md](git-commit.md) | 中文提交与文档入库边界 |
+| [git-commit.md](git-commit.md) | 中文提交、文档入库边界与禁止引用 commit hash |
 
 完整演进流程见 [`../../docs/CONTRIBUTING.md`](../../docs/CONTRIBUTING.md)。项目侧禁止创建 `.claude/skills/`。
