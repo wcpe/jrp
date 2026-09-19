@@ -5,6 +5,7 @@ tasks:
     desc: 安装工作区依赖并同步 Go 模块
     cmds:
       - task: workspace:sync
+      - task: tools:install
       - pnpm install --frozen-lockfile
 
   workspace:sync:
@@ -14,10 +15,89 @@ tasks:
     cmds:
       - go work sync
 
+  tools:install:
+    desc: 安装固定版本的 Go 静态检查工具
+    cmds:
+      # 版本必须固定：随 latest 漂移会让门禁结果依赖于安装时间，
+      # 且新版工具常要求更高的 Go 工具链（例如 x/vuln v1.8 需要 Go 1.26，
+      # 而 CI 使用 1.25.x），届时 CI 会被迫下载额外工具链。
+      # 升级工具版本时同步更新本处与 static-analysis.md 的版本记录。
+      - go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+      - go install golang.org/x/tools/cmd/goimports@v0.49.0
+      - go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+
+  lint:static:
+    desc: 运行 golangci-lint（按 .golangci.yml 的宽松规则集）
+    cmds:
+      # 根目录不是 Go module，逐个 module 运行：让每个 module 各自解析
+      # 自己的 go.mod，配置从仓库根统一读取。
+      - task: lint:static:core
+      - task: lint:static:jrps
+      - task: lint:static:jrpc
+
+  lint:static:core:
+    internal: true
+    dir: core
+    cmds:
+      - golangci-lint run ./...
+
+  lint:static:jrps:
+    internal: true
+    dir: apps/jrps
+    cmds:
+      - golangci-lint run ./...
+
+  lint:static:jrpc:
+    internal: true
+    dir: apps/jrpc
+    cmds:
+      - golangci-lint run ./...
+
+  lint:imports:
+    desc: 检查 Go 导入分组与增删（goimports，gofmt 不覆盖这部分）
+    cmds:
+      - node scripts/lint-imports.mjs --check
+
+  lint:enhanced:
+    desc: 运行增强静态门禁（goimports + golangci-lint + 漏洞扫描）
+    cmds:
+      # 与「既有稳态门禁」分开成独立任务：这三项依赖额外安装的工具，
+      # 而 lint:go 位于三平台矩阵与生产构建两个 job 内，
+      # 并入会让每个 job 都重复安装工具链。CI 由独立的 static-analysis job 执行本任务。
+      - task: lint:imports
+      - task: lint:static
+      - task: vuln:check
+
+  vuln:check:
+    desc: 扫描已知依赖漏洞（govulncheck，按可调用路径判定）
+    cmds:
+      - task: vuln:check:core
+      - task: vuln:check:jrps
+      - task: vuln:check:jrpc
+
+  vuln:check:core:
+    internal: true
+    dir: core
+    cmds:
+      - govulncheck ./...
+
+  vuln:check:jrps:
+    internal: true
+    dir: apps/jrps
+    cmds:
+      - govulncheck ./...
+
+  vuln:check:jrpc:
+    internal: true
+    dir: apps/jrpc
+    cmds:
+      - govulncheck ./...
+
   fmt:
     desc: 格式化 Go 与 Web 工程文件
     cmds:
       - node scripts/format-go.mjs --write
+      - node scripts/lint-imports.mjs --write
       - pnpm format
 
   fmt:check:
@@ -88,6 +168,15 @@ tasks:
       - task: test:core
       - task: test:jrps
       - task: test:jrpc
+
+  test:core:race:
+    desc: 以竞态检测运行 Core 测试（并发正确性门禁）
+    dir: core
+    cmds:
+      # 竞态检测是并发代码的唯一自动化防线：普通测试只能证明"这次没出错"，
+      # 而 -race 能发现未被复现的数据竞争。此前它只被临时手工执行，
+      # 多次审核都出现了"竞态已修复但无门禁守住"的情况。
+      - go test -race ./...
 
   test:fuzz:
     desc: 运行 wire 层模糊测试（短时，用于 CI 回归）

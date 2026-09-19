@@ -74,6 +74,10 @@ const (
 type Option func(*Engine)
 
 // WithLogger 注入宿主的日志器；未注入时丢弃日志。
+//
+// 待办：客户端侧目前尚未产生日志事件（服务端侧已有），注入的值只被保存而不被消费。
+// 规格 docs/specs/core-engine-facade.md 已约定该注入点，故保留公共面不变；
+// 待客户端诊断事件落地后接入，届时同步补规格与用例。
 func WithLogger(logger *slog.Logger) Option {
 	return func(engine *Engine) {
 		engine.logger = logger
@@ -288,6 +292,8 @@ func (engine *Engine) Err() error {
 }
 
 // log 返回可用的日志器；未注入时返回丢弃日志器。
+//
+// 待办：尚无调用方，保留以配合 WithLogger 的规格约定，接入时同时补用例。
 func (engine *Engine) log() *slog.Logger {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()

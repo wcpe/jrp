@@ -318,13 +318,6 @@ func (sender *classifyingSender) callCount() int {
 	return len(sender.calls)
 }
 
-// received 返回已投递记录的副本。
-func (sender *classifyingSender) received() []NotificationOutbox {
-	sender.mutex.Lock()
-	defer sender.mutex.Unlock()
-	return append([]NotificationOutbox(nil), sender.calls...)
-}
-
 // classifiedError 实现 RetryClassifier，供 store 层判定可重试性。
 type classifiedError struct {
 	retryable bool

@@ -864,13 +864,6 @@ func (engine *Engine) serveHTTPGuest(port int, listener *transport.Listener) {
 	}
 }
 
-// isStopped 返回引擎是否已进入停止状态。
-func (engine *Engine) isStopped() bool {
-	engine.mu.Lock()
-	defer engine.mu.Unlock()
-	return engine.state == stateStopped
-}
-
 // handleGuest 把访客连接交给配对中心：有待命工作连接立即桥接，否则暂存。
 func (engine *Engine) handleGuest(name string, guest *transport.Conn) {
 	defer engine.wg.Done()
@@ -1062,9 +1055,6 @@ func (engine *Engine) selectHTTPProxy(port int, host, path string) (string, bool
 	}
 	return router.Select(host, path)
 }
-
-// delimCRLF 是 HTTP 首部的行分隔符。
-const delimCRLF = '\n'
 
 // headerEndCRLF 与 headerEndLF 是首部块结束的两种形态。
 const (

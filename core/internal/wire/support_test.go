@@ -59,12 +59,6 @@ func (conn *recordingConn) wasClosed() bool {
 	return conn.closed
 }
 
-// pipeConn 是一对内存连接，用于观察拒绝路径的双向关闭。
-func pipeConn() (net.Conn, net.Conn) {
-	client, server := net.Pipe()
-	return client, server
-}
-
 // clientHelloWith 构造测试用客户端 hello：能力集合按线上嵌套结构分组。
 func clientHelloWith(codecs, cryptoAlgorithms, compressionAlgorithms []string, maxPayload int) ClientHello {
 	hello := ClientHello{

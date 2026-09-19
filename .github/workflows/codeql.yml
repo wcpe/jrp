@@ -1,0 +1,75 @@
+# CodeQL 代码扫描：只分析 Go。
+#
+# Go 不支持 build-mode: none，只能用 autobuild 或 manual。
+# 本仓库是 go.work 多模块工作区，而 CodeQL 对 Go workspace 的支持
+# 只在 extractor 源码中有体现，官方文档未给出保证；autobuild 在依赖解析
+# 失败时还会尝试改写 go.mod/go.sum。此处改用手写构建命令覆盖三个 module：
+# 仓库根不是 module，`go build ./...` 会直接失败，必须逐个 module 给出路径。
+#
+# 权限：advanced setup 必须声明 security-events: write 才能回传扫描结果。
+name: CodeQL
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - '.claude/**'
+      - 'LICENSE'
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - '.claude/**'
+      - 'LICENSE'
+  schedule:
+    # 每周一 03:17 UTC 定时扫描：安全公告在发布后仍会持续入库，
+    # 只靠 push 触发会漏掉依赖未变但新漏洞已披露的情况。
+    - cron: '17 3 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: CodeQL / Go
+    runs-on: ubuntu-latest
+    permissions:
+      # 回传扫描结果必需。
+      security-events: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.25.13
+          cache-dependency-path: |
+            go.work.sum
+            apps/jrps/go.sum
+            apps/jrpc/go.sum
+            core/go.sum
+      - uses: arduino/setup-task@v3
+        with:
+          version: 3.52.0
+      - run: task workspace:sync
+
+      - name: 初始化 CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: go
+          build-mode: manual
+          # 默认套件只覆盖高置信度安全问题；security-extended 补上覆盖面更广
+          # 与精度略低的查询。起步阶段先跑这一层，避免因告警过多而长期无人处理。
+          queries: security-extended
+
+      - name: 构建
+        run: go build ./core/... ./apps/jrps/... ./apps/jrpc/...
+
+      - name: 完成分析
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: '/language:go'

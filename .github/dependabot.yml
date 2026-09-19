@@ -1,0 +1,86 @@
+# Dependabot 配置：只做依赖更新提醒，不自动合并。
+#
+# 三个 Go module 分开配置：仓库根不是 module，而 gomod 生态需要指向含 go.mod 的目录。
+# 依赖版本的真源 pnpm-workspace.yaml 的 catalog 与根 package.json 都在仓库根，
+# 因此 npm 生态只配置根目录，apps/web 与 packages/* 经 catalog 引用，无需重复配置。
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /core
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      # 补丁与次版本合并为一组：这类更新数量多、风险低，逐个开 PR 会淹没评审。
+      # 主版本不分组，保持单独成 PR，便于人工识别破坏性变更。
+      go-minor-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: gomod
+    directory: /apps/jrps
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      go-minor-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: gomod
+    directory: /apps/jrpc
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      go-minor-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      npm-minor-patch:
+        patterns:
+          - '*'
+        update-types:
+          - minor
+          - patch
+
+  # 工作流与静态检查工具引用的 action 版本。
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      actions:
+        patterns:
+          - '*'

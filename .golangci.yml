@@ -1,0 +1,41 @@
+# golangci-lint 配置：宽松起步，逐步收紧。
+#
+# 起步阶段只启用高信号、低争议的检查，先让门禁全绿，再按实际需要一次启用一条规则，
+# 避免一次性引入大量既有告警导致门禁形同虚设。启用面收窄的同时，
+# 每条豁免都在此集中说明中文原因，不在代码里零散添加忽略指令。
+
+version: '2'
+
+linters:
+  default: none
+  enable:
+    - errcheck # 未处理的错误返回值
+    - govet # Go 官方检查集（printf、lostcancel、loopclosure 等）
+    - ineffassign # 无效赋值：赋了值但从未被使用
+    - staticcheck # 静态分析 SA 系列
+    - unused # 未被使用的标识符
+
+  exclusions:
+    rules:
+      # 测试代码用 defer 关闭连接是 Go 的惯用写法，该错误没有可断言之处；
+      # 生产代码不做此豁免，仍强制检查错误返回值。
+      - path: _test\.go
+        linters:
+          - errcheck
+
+      # unused 未识别泛型类型约束的方法满足关系：build.go 中三个 withCopiedTargets
+      # 由泛型函数 withCopiedTargets[T] 经约束调用，实际存在调用方。
+      # 已用行为用例验证别名防护生效（宿主切片改动不会影响已构建的配置值），
+      # 故按误报豁免，范围限定到该文件。
+      - path: (^|[/\\])build\.go$
+        linters:
+          - unused
+        text: withCopiedTargets is unused
+
+      # 客户端侧日志注入点已由规格 docs/specs/core-engine-facade.md 约定，
+      # 但日志事件尚未落地，属规格未落地而非可删代码：保留公共面，
+      # 并在代码内标注待办，待事件落地后一并移除豁免。
+      - path: (^|[/\\])client[/\\]engine\.go$
+        linters:
+          - unused
+        text: (log|logger) is unused

@@ -39,9 +39,6 @@ const (
 	ProxyTypeHTTPS ProxyType = "https"
 )
 
-// supportedProxyTypes 列出当前已交付的代理类型取值。
-var supportedProxyTypes = []ProxyType{ProxyTypeTCP, ProxyTypeUDP, ProxyTypeHTTP, ProxyTypeHTTPS}
-
 // String 返回代理类型取值，满足 Stringer。
 func (proxyType ProxyType) String() string {
 	return string(proxyType)

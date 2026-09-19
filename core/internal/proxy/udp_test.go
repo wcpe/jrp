@@ -302,9 +302,9 @@ func TestDeliverCopiesDatagramBuffer(t *testing.T) {
 		t.Fatal("第二个数据报应被接受")
 	}
 
-	// 模拟入口循环复用同一缓冲：就地覆写，这不应影响已入队的内容。
-	first = append(first[:0], []byte("CCCCCCCCCCCCCCCC")...)
-	second = append(second[:0], []byte("DDDDDDDDDDDDDDDD")...)
+	// 模拟入口循环复用同一缓冲：就地把同一块内存改成新内容，这不应影响已入队的内容。
+	copy(first, []byte("CCCCCCCCCCCCCCCC"))
+	copy(second, []byte("DDDDDDDDDDDDDDDD"))
 
 	// 逐个读出：内容必须是最初投递的 A 与 B，而不是覆写后的 C 与 D。
 	// 工作连接上走的是线协议帧，用 readDatagram 解出载荷。

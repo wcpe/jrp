@@ -45,7 +45,55 @@ jobs:
       - run: task workspace:sync
       - run: task lint:go
       - run: task test:go
+      # 外部消费验证此前不在 CI 网内：它最能发现"Core 公共 API 变更后
+      # 外部宿主还能否编译并跑通"这类破坏性改动，而这类问题只能靠人工想起来跑。
+      - run: task test:core:external
       - run: task build:go
+
+  race:
+    name: Core 竞态检测 / Ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.25.x
+          cache-dependency-path: |
+            go.work.sum
+            apps/jrps/go.sum
+      - uses: arduino/setup-task@v3
+        with:
+          version: 3.52.0
+      - run: task workspace:sync
+      # 竞态检测是并发代码的唯一自动化防线，此前只在本地临时执行过。
+      # 单独成 job 而非并入 go 矩阵：-race 使测试耗时翻倍以上，
+      # 而竞态是代码性质而非平台性质，跑一个平台即可覆盖。
+      - run: task test:core:race
+
+  static-analysis:
+    name: Go 静态分析与漏洞扫描 / Ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          # 显式写到补丁版：govulncheck 按当前工具链判定标准库漏洞，
+          # 补丁版本落后会让门禁报出与代码无关的告警。
+          go-version: 1.25.13
+          cache-dependency-path: |
+            go.work.sum
+            apps/jrps/go.sum
+            apps/jrpc/go.sum
+            core/go.sum
+      - uses: arduino/setup-task@v3
+        with:
+          version: 3.52.0
+      - run: task workspace:sync
+      # 工具的二进制装到 $(go env GOPATH)/bin，该目录在 runner 的默认 PATH 内。
+      - run: task tools:install
+      # goimports、golangci-lint 与 govulncheck 此前只在本机手工跑过。
+      # 单独成 job：这三项都要先安装工具，并入三平台矩阵会让每个平台重复安装。
+      - run: task lint:enhanced
 
   fuzz:
     name: wire 模糊测试 / Ubuntu

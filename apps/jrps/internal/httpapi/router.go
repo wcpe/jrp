@@ -102,10 +102,6 @@ func registerAPI(router *gin.Engine, options RouterOptions) {
 	api.POST("/notification-targets/*action", session.authenticate(true), notification.test)
 }
 
-func notImplementedHandler(context *gin.Context) {
-	writeProblem(context, http.StatusNotFound, codeNotFound, "资源不存在", "请求的管理端点不存在")
-}
-
 func statusHandler(context *gin.Context) {
 	info := buildinfo.Current()
 	context.JSON(http.StatusOK, statusResponse{
