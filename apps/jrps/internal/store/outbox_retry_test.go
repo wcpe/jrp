@@ -333,3 +333,110 @@ type classifiedError struct {
 func (err classifiedError) Error() string { return "模拟投递失败" }
 
 func (err classifiedError) Retryable() bool { return err.retryable }
+
+// 已转入 discarded 的记录不得被发送结果覆盖。
+//
+// 回归用例：`recordOutcome` 的 UPDATE 只带 `id`，于是投递期间被丢弃的记录会在
+// 投递结束后被改写成 sent 或 retrying——已明确不再投递的通知会被重新发出，且
+// 留下 retrying 与 stopped_at 并存的自相矛盾记录。
+func TestOutboxDiscardedStateSurvivesDeliveryOutcome(t *testing.T) {
+	database := openQueryStore(t)
+	sender := &classifyingSender{}
+	stopped := time.Now().UTC()
+
+	var entryID uint64
+	if err := database.Transaction(context.Background(), func(tx *Tx) error {
+		var err error
+		entryID, err = tx.OutboxEnqueue(NotificationOutbox{
+			EventID: "evt-1", TargetID: "target-1", EventType: "x", Payload: "{}",
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("写入 outbox 失败：%v", err)
+	}
+
+	// 模拟投递进行中：先抢占（置为 sending），再把记录转入 discarded。
+	dispatcher := mustDispatcher(t, database, sender)
+	claimed, err := dispatcher.claim(context.Background(), entryID)
+	if err != nil || !claimed {
+		t.Fatalf("抢占应成功：claimed=%v err=%v", claimed, err)
+	}
+	if err := database.Transaction(context.Background(), func(tx *Tx) error {
+		return tx.db.Model(&NotificationOutbox{}).Where("id = ?", entryID).
+			Updates(map[string]any{
+				"status":     OutboxStatusDiscarded,
+				"stopped_at": stopped,
+			}).Error
+	}); err != nil {
+		t.Fatalf("转入 discarded 失败：%v", err)
+	}
+
+	// 投递返回成功：结果不得覆盖已确定的终态。
+	if err := database.Transaction(context.Background(), func(tx *Tx) error {
+		return tx.updateOutboxOutcome(entryID, 1, 5, func(int) time.Duration { return 0 }, nil)
+	}); err != nil {
+		t.Fatalf("写入投递结果失败：%v", err)
+	}
+
+	entries := mustOutboxEntries(t, database)
+	if entries[0].Status != OutboxStatusDiscarded {
+		t.Fatalf("已丢弃的终态被投递结果覆盖为 %s", entries[0].Status)
+	}
+}
+
+// 目标查询失败不得被当作"目标不存在"。
+//
+// 回归用例：`NotificationTargetByID` 把任何数据库错误都包装成"目标不存在"，
+// 调用方据此把查询失败与真正缺失混为一谈——生产路径下会把完好目标的在途通知
+// 全部转入 discarded 并写一条内容错误的审计。
+func TestTargetLookupFailureIsNotMissing(t *testing.T) {
+	database := openQueryStore(t)
+
+	// 先建一个目标，确认正常查询不报缺失。
+	var targetID string
+	if err := database.Transaction(context.Background(), func(tx *Tx) error {
+		id, err := NewNotificationTargetID()
+		if err != nil {
+			return err
+		}
+		targetID = id
+		view, err := tx.CreateNotificationTarget(ActorAdmin("admin"), NotificationTargetInput{
+			Name: "目标", Type: NotificationTypeWebhook, Enabled: true,
+			WebhookURL: "https://hooks.example.com/hook",
+		})
+		if err != nil {
+			return err
+		}
+		targetID = view.ID
+		return nil
+	}); err != nil {
+		t.Fatalf("创建目标失败：%v", err)
+	}
+
+	// 用已取消的上下文查询：这是"查询失败"而非"目标不存在"。
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	var lookupErr error
+	_ = database.View(cancelled, func(tx *Tx) error {
+		_, lookupErr = tx.NotificationTargetByID(targetID)
+		return nil
+	})
+	if lookupErr == nil {
+		// 前提不成立就明确失败，而不是跳过：静默跳过会让该分支在别的环境下
+		// 悄悄失去覆盖，而它保护的是一条会把完好目标的在途通知误丢弃的路径。
+		t.Fatal("已取消的上下文未使查询失败，用例前提不成立")
+	}
+	if errors.Is(lookupErr, ErrNotificationTargetMissing) {
+		t.Fatalf("查询失败被误判为目标不存在：%v", lookupErr)
+	}
+
+	// 真正的缺失仍应返回该哨兵，否则调用方的 404 分支会失效。
+	var missingErr error
+	_ = database.View(context.Background(), func(tx *Tx) error {
+		_, missingErr = tx.NotificationTargetByID("不存在的目标标识")
+		return nil
+	})
+	if !errors.Is(missingErr, ErrNotificationTargetMissing) {
+		t.Fatalf("真正缺失的目标应返回哨兵错误：%v", missingErr)
+	}
+}

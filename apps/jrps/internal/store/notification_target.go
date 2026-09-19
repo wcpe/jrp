@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 // 通知目标标识的随机字节数；与客户端 token 同为不可猜测的不透明标识。
@@ -36,16 +38,24 @@ var ErrNotificationTargetMissing = errors.New("通知目标不存在")
 // 秘密只在此处接收，读取一律掩码（FR-15 §3.5）。更新时秘密为空表示
 // 保留原有秘密，避免管理员为了改个名字而重新输入密码。
 type NotificationTargetInput struct {
-	Name         string
-	Type         string
-	Enabled      bool
-	Secret       string
-	WebhookURL   string
-	SMTPHost     string
-	SMTPPort     int
-	SMTPFrom     string
-	SMTPTo       []string
+	Name       string
+	Type       string
+	Enabled    bool
+	Secret     string
+	WebhookURL string
+	SMTPHost   string
+	SMTPPort   int
+	SMTPFrom   string
+	SMTPTo     []string
+	// SMTPSecurity 为空时由写入侧取 starttls。
 	SMTPSecurity string
+
+	// EnabledProvided 表示调用方是否显式给出了启用状态。
+	//
+	// 更新时未提供应沿用原值：`Enabled` 的假零值无法区分"显式停用"与"没提这一项"，
+	// 而按默认值处理会在 PATCH 只改名字时把已停用的目标静默重新启用——那与
+	// "停用即不接收通知"的语义直接冲突。创建路径不需要该字段（未提供即启用）。
+	EnabledProvided bool
 }
 
 // NotificationTargetInputViolation 描述一处目标校验失败。
@@ -287,6 +297,10 @@ func (tx *Tx) UpdateNotificationTarget(actor Actor, id string, input Notificatio
 		if input.Secret == "" {
 			replacement.Secret = existing.Secret
 		}
+		// 未显式给出启用状态时沿用原值：按默认值处理会把已停用的目标静默重新启用。
+		if !input.EnabledProvided {
+			replacement.Enabled = existing.Enabled
+		}
 		replacement.CreatedAt = existing.CreatedAt
 		replacement.UpdatedAt = time.Now().UTC()
 		values := notificationTargetValues(replacement)
@@ -445,7 +459,13 @@ func (tx *Tx) NotificationTargets() ([]NotificationTargetView, error) {
 func (tx *Tx) NotificationTargetByID(id string) (NotificationTargetView, error) {
 	var record NotificationTarget
 	if err := tx.db.Where("id = ?", id).First(&record).Error; err != nil {
-		return NotificationTargetView{}, fmt.Errorf("%w：%s", ErrNotificationTargetMissing, id)
+		// 只有"查不到记录"才是目标不存在。此前把任何数据库错误都包装成该哨兵，
+		// 调用方据此无法区分"目标确实没了"与"查询本身失败"——后者会让调用方
+		// 把完好的目标的在途通知误判为应丢弃。
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return NotificationTargetView{}, fmt.Errorf("%w：%s", ErrNotificationTargetMissing, id)
+		}
+		return NotificationTargetView{}, fmt.Errorf("读取通知目标失败：%w", translateSQLError(err))
 	}
 	return viewFromNotificationTarget(record), nil
 }
@@ -459,7 +479,7 @@ func viewFromNotificationTarget(record NotificationTarget) NotificationTargetVie
 		Enabled:      record.Enabled,
 		MaskedSecret: MaskSecret(record.Secret),
 		Summary:      record.TargetSummary,
-		WebhookURL:   record.WebhookURL,
+		WebhookURL:   maskWebhookURL(record.WebhookURL),
 		SMTPHost:     record.SMTPHost,
 		SMTPPort:     record.SMTPPort,
 		SMTPFrom:     record.SMTPFrom,
@@ -468,6 +488,24 @@ func viewFromNotificationTarget(record NotificationTarget) NotificationTargetVie
 		CreatedAt:    record.CreatedAt,
 		UpdatedAt:    record.UpdatedAt,
 	}
+}
+
+// maskWebhookURL 掩去目标地址中的查询串与片段。
+//
+// 规格 §3.5 要求读取时隐藏地址的凭据部分，而查询串正是凭据的常见载体
+// （`?token=...`、`?key=...`）——它与 secret 字段一样只在写入时接收，
+// 读取一律不完整回显。路径予以保留：管理员需要靠它区分同一主机上的多个目标。
+func maskWebhookURL(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		// 解析失败时不回显原文：它可能正是导致解析失败的异常内容。
+		return "（地址不可解析）"
+	}
+	if parsed.RawQuery != "" {
+		parsed.RawQuery = "已隐藏"
+	}
+	parsed.Fragment = ""
+	return parsed.String()
 }
 
 // MaskSecret 返回秘密的掩码：只保留末四位供运维识别。

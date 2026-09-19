@@ -225,15 +225,31 @@ func (loop *OutboxLoop) targetMissing(ctx context.Context, targetID string) bool
 	if targetID == "" || loop.onTargetMissing == nil {
 		return false
 	}
-	var missing bool
-	viewErr := loop.dispatcher.store.View(ctx, func(tx *Tx) error {
-		_, err := tx.NotificationTargetByID(targetID)
-		if err != nil {
-			missing = true
+	// 只把"目标确实不存在"当作缺失。
+	//
+	// 此前把查询返回的任何错误都判为缺失，于是数据库瞬时故障或上下文取消都会
+	// 触发回调——生产路径下会把该目标的全部在途通知转入 discarded 并写一条内容
+	// 错误的审计（"目标已不存在"），而目标其实完好。查询失败应当让本轮跳过该
+	// 记录、留待下次重试，而不是据错误的存在推断目标的状态。
+	missing := false
+	queryErr := loop.dispatcher.store.View(ctx, func(tx *Tx) error {
+		if _, err := tx.NotificationTargetByID(targetID); err != nil {
+			// 只有哨兵错误表示目标不存在；其余错误向上抛出，由调用方按查询
+			// 失败处理，不进入缺失分支。
+			if errors.Is(err, ErrNotificationTargetMissing) {
+				missing = true
+				return nil
+			}
+			return err
 		}
 		return nil
 	})
-	if viewErr != nil || !missing {
+	if queryErr != nil {
+		loop.failed.Add(1)
+		loop.logger.Error("读取通知目标失败，本轮跳过", "目标标识", targetID, "错误", queryErr)
+		return false
+	}
+	if !missing {
 		return false
 	}
 	if err := loop.onTargetMissing(ctx, targetID); err != nil {

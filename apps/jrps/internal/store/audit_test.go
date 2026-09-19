@@ -309,3 +309,127 @@ func TestAuditActionEnumerationCoversSpec(t *testing.T) {
 		}
 	}
 }
+
+// 合法的运维上下文必须能写入审计。
+//
+// 回归用例：禁止标记表此前收录了通用路径前缀（/etc/、/home/、盘符等）与英文
+// 冒号，于是"读取 /etc/nginx/nginx.conf 失败"这类正当的排障描述被拒绝——审计
+// 写入与业务同事务，一次误拒会让整个业务操作回滚。规格禁止的是**分段文件**路径
+// 与凭据值，不是任意路径与任意冒号。
+func TestAuditAcceptsLegitimateOperationalContext(t *testing.T) {
+	database := openInitializedServerStore(t)
+	cases := []struct {
+		name    string
+		context string
+	}{
+		{"记录配置文件路径", "读取 /etc/nginx/nginx.conf 失败"},
+		{"记录 Windows 配置路径", `打开 C:\jrp\config\app.conf 失败`},
+		{"英文冒号描述", "已更新代理 secret: 分组"},
+		{"中文冒号描述", "密钥轮换：已完成"},
+		{"含 token 字样的合规描述", "客户端 edge-1 的 token 摘要前缀 a1b2c3d4 已记录"},
+		{"中文业务摘要", "配置应用失败：准备阶段校验未通过，共三处问题，含端口冲突与域名重复"},
+	}
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			event := baseAuditEvent()
+			event.Context = item.context
+			if err := writeAuditInTransaction(t, database, event); err != nil {
+				t.Fatalf("合法运维上下文被拒绝：%v", err)
+			}
+		})
+	}
+}
+
+// 真正的凭据泄漏仍必须被拦。
+//
+// 与上一条对照：放宽误拒不能把防护一并放开。等号赋值、凭据字段名、协议头整行、
+// 私钥块与分段文件路径都是"一旦出现即泄漏"的形态，必须继续拒绝。
+func TestAuditStillRejectsCredentialLeaks(t *testing.T) {
+	database := openInitializedServerStore(t)
+	cases := []struct {
+		name    string
+		context string
+	}{
+		{"等号赋值 token", "token=abcdef0123456789"},
+		{"等号赋值 secret", "secret=s3cr3t-value"},
+		{"凭据字段名", "password_digest=deadbeef"},
+		{"密码盐字段", "password_salt=cafe1234"},
+		{"授权头整行", "Authorization: Bearer abcdef"},
+		{"Cookie 整行", "Cookie: jrp_session=abcdef"},
+		{"私钥块", "-----BEGIN PRIVATE KEY-----"},
+		{"分段文件路径扩展名", "分段文件 /var/lib/jrp/segments/0001.seg 已回收"},
+		{"UNIX 分段目录", "segments/0002.seg 缺失"},
+	}
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			event := baseAuditEvent()
+			event.Context = item.context
+			if err := writeAuditInTransaction(t, database, event); err == nil {
+				t.Fatalf("凭据泄漏形态必须被拒绝：%s", item.context)
+			}
+		})
+	}
+}
+
+// 标识长度必须在写入前被限制。
+//
+// 回归用例：标识字段此前只校验非空、不校验长度，而模型列宽是 128 字节。未认证
+// 请求提交的超长用户名会一路走到审计写入，落库时被截断或失败——查询响应还会把
+// 它原样带出（实测 2MB 用户名可让审计响应膨胀到 4.2MB）。
+func TestAuditRejectsOverlongIdentifiers(t *testing.T) {
+	database := openInitializedServerStore(t)
+
+	overlong := strings.Repeat("超", maxAuditIdentifierRunes+1)
+
+	t.Run("超长主体标识", func(t *testing.T) {
+		event := baseAuditEvent()
+		event.ActorID = overlong
+		if err := writeAuditInTransaction(t, database, event); err == nil {
+			t.Fatal("超长主体标识必须被拒绝")
+		}
+	})
+	t.Run("超长对象标识", func(t *testing.T) {
+		event := baseAuditEvent()
+		event.ObjectID = overlong
+		if err := writeAuditInTransaction(t, database, event); err == nil {
+			t.Fatal("超长对象标识必须被拒绝")
+		}
+	})
+	t.Run("边界值放行", func(t *testing.T) {
+		event := baseAuditEvent()
+		event.ActorID = strings.Repeat("超", maxAuditIdentifierRunes)
+		event.ObjectID = strings.Repeat("超", maxAuditIdentifierRunes)
+		if err := writeAuditInTransaction(t, database, event); err != nil {
+			t.Fatalf("边界值应被接受：%v", err)
+		}
+	})
+}
+
+// 认证入口必须在源头拒绝超长输入。
+//
+// 与上一条互补：审计层的校验是防御性的，而认证层是这类输入的入口。缺少入口
+// 限制时，未认证请求可以用超大载荷推高处理开销与后续响应体积。
+func TestAuthenticateAdminRejectsOverlongInput(t *testing.T) {
+	database := openInitializedServerStore(t)
+
+	cases := []struct {
+		name     string
+		username string
+		password string
+	}{
+		{"超长用户名", strings.Repeat("u", maxAuditIdentifierRunes+1), "correct-horse-battery"},
+		{"超长密码", "admin", strings.Repeat("p", passwordMaxLength+1)},
+	}
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			var authErr error
+			_ = database.View(context.Background(), func(tx *Tx) error {
+				_, authErr = tx.AuthenticateAdmin(item.username, item.password)
+				return nil
+			})
+			if !errors.Is(authErr, ErrInvalidCredentials) {
+				t.Fatalf("超长输入应按凭据错误拒绝：%v", authErr)
+			}
+		})
+	}
+}

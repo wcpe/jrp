@@ -85,6 +85,61 @@ func TestValidateWebhookURLRejectsMappedIPv4(t *testing.T) {
 	}
 }
 
+// 带 zone 的 IPv6 地址必须被拒绝。
+//
+// 回归用例：`netip.Addr.Unmap()` 不剥离 zone，而 `netip.Prefix.Contains` 对带
+// zone 的地址一律返回 false。此前只做 Unmap 就比对前缀，导致 `[::1%25lo]` 这类
+// 地址绕过全部禁止段——实测确认回环、链路本地与唯一本地地址在带 zone 形态下
+// 全部放行，进而可访问内网服务。zone 只是本机接口限定符，剥离它不影响归属判定。
+func TestValidateWebhookURLRejectsZonedIPv6(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+	}{
+		{"回环带 zone", "https://[::1%25lo]/hook"},
+		{"链路本地带 zone", "https://[fe80::1%25eth0]/hook"},
+		{"唯一本地带 zone", "https://[fd00::1%25eth0]/hook"},
+	}
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			_, err := ValidateWebhookURL(item.url)
+			if err == nil {
+				t.Fatalf("带 zone 的内部地址必须被拒绝：%s", item.url)
+			}
+			if !errors.Is(err, ErrTargetBlocked) {
+				t.Fatalf("应返回目标被拒错误：%v", err)
+			}
+		})
+	}
+}
+
+// 拨号前的地址校验同样要拦住带 zone 的内部地址。
+//
+// 这一层是防 DNS 重绑定的关键：内核实际连接的地址就是没有 zone 形态的裸地址，
+// 但校验函数若按带 zone 形态判定就会放行。
+func TestOutboundControlBlocksZonedAddress(t *testing.T) {
+	cases := []struct {
+		name    string
+		address string
+		blocked bool
+	}{
+		{"回环带 zone", "[::1%25lo]:443", true},
+		{"链路本地带 zone", "[fe80::1%25eth0]:443", true},
+		{"公网 v6", "[2001:db8::1]:443", false},
+	}
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			err := outboundControl("tcp", item.address, nil)
+			if item.blocked && err == nil {
+				t.Fatalf("拨号到 %s 必须被阻止", item.address)
+			}
+			if !item.blocked && err != nil {
+				t.Fatalf("拨号到 %s 应被放行：%v", item.address, err)
+			}
+		})
+	}
+}
+
 // 非白名单端口一律拒绝：白名单让规则可穷举，不依赖"记得排除哪些端口"。
 func TestValidateWebhookURLRejectsUnlistedPorts(t *testing.T) {
 	cases := []string{

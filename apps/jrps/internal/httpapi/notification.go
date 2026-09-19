@@ -290,22 +290,28 @@ func bindNotificationTargetRequest(c *gin.Context) (notificationTargetRequest, b
 //
 // Enabled 用指针区分"未提供"与"显式关闭"：省略时按启用处理，
 // 因为创建目标后期望它立刻生效是更常见的意图。
+// notificationInputFromRequest 把请求体转为 store 输入。
+//
+// Enabled 用指针区分"未提供"与"显式关闭"：省略时创建按启用处理（创建目标后
+// 期望它立刻生效是更常见的意图），而更新沿用原值——按默认值处理会把已停用的
+// 目标静默重新启用。EnabledProvided 把这一区分传给 store 层。
 func notificationInputFromRequest(request notificationTargetRequest) store.NotificationTargetInput {
 	enabled := true
 	if request.Enabled != nil {
 		enabled = *request.Enabled
 	}
 	return store.NotificationTargetInput{
-		Name:         request.Name,
-		Type:         request.Type,
-		Enabled:      enabled,
-		Secret:       request.Secret,
-		WebhookURL:   request.WebhookURL,
-		SMTPHost:     request.SMTPHost,
-		SMTPPort:     request.SMTPPort,
-		SMTPFrom:     request.SMTPFrom,
-		SMTPTo:       request.SMTPTo,
-		SMTPSecurity: request.SMTPSecurity,
+		Name:            request.Name,
+		Type:            request.Type,
+		Enabled:         enabled,
+		EnabledProvided: request.Enabled != nil,
+		Secret:          request.Secret,
+		WebhookURL:      request.WebhookURL,
+		SMTPHost:        request.SMTPHost,
+		SMTPPort:        request.SMTPPort,
+		SMTPFrom:        request.SMTPFrom,
+		SMTPTo:          request.SMTPTo,
+		SMTPSecurity:    request.SMTPSecurity,
 	}
 }
 

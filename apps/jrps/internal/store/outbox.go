@@ -276,8 +276,20 @@ func (tx *Tx) updateOutboxOutcome(
 			updates["next_attempt_at"] = now.Add(backoff(nextAttempt))
 		}
 	}
-	if err := tx.db.Model(&NotificationOutbox{}).Where("id = ?", id).Updates(updates).Error; err != nil {
-		return fmt.Errorf("更新通知发送结果失败：%w", translateSQLError(err))
+	// 只在记录仍处于发送中时写入结果。
+	//
+	// 投递期间记录可能被其他路径改变状态：目标被删除或停用时 DiscardOutboxForTarget
+	// 会把它转入 discarded，此时写入发送结果会把终态覆盖掉——已丢弃的记录变成
+	// sent 或 retrying，后者还会让它重新进入投递队列，造成已明确不再投递的通知被
+	// 重复发出，并留下 retrying 与 stopped_at 同时存在的自相矛盾记录。
+	//
+	// 条件更新使这种竞态自然收敛：记录已不是 sending 说明本次投递的结果不再有意义，
+	// 静默跳过即可（不报错——这是并发下的正常情况，不是故障）。
+	statement := tx.db.Model(&NotificationOutbox{}).
+		Where("id = ? AND status = ?", id, OutboxStatusSending).
+		Updates(updates)
+	if statement.Error != nil {
+		return fmt.Errorf("更新通知发送结果失败：%w", translateSQLError(statement.Error))
 	}
 	return nil
 }

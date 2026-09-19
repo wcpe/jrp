@@ -105,9 +105,30 @@ func (sender *emailSender) validate(target Target) error {
 	case SMTPSecurityNone:
 		// 明文 SMTP 会把通知内容暴露在链路上。允许它是为了兼容不支持
 		// STARTTLS 的内网中继，但这是显式的取舍而非默认值。
+		//
+		// 明文传输下配置了密码的组合一律拒绝：Go 标准库的 PlainAuth 只在 TLS
+		// 或 localhost 上发送凭据（见 net/smtp 的说明），因此这类组合在运行期
+		// 必然失败，而失败原因会被归为"认证失败"——那会把排查方向引向凭据本身，
+		// 而真实原因是传输方式不允许发送凭据。
+		if target.Secret != "" && !isLocalSMTPHost(target.SMTPHost) {
+			return permanentError("明文 SMTP 不允许发送凭据：请改用 starttls，或把主机配置为回环地址")
+		}
 		return nil
 	default:
 		return permanentError("安全传输选项不合法，只能是 starttls 或 none")
+	}
+}
+
+// isLocalSMTPHost 判断 SMTP 主机是否为回环地址。
+//
+// 与 net/smtp 判定"允许在明文连接上发送凭据"的范围保持一致（localhost、
+// 127.0.0.1、::1）：口径不同会让校验放行一个运行期必然失败的目标。
+func isLocalSMTPHost(host string) bool {
+	switch strings.TrimSpace(strings.ToLower(host)) {
+	case "localhost", "127.0.0.1", "::1":
+		return true
+	default:
+		return false
 	}
 }
 

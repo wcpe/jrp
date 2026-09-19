@@ -90,6 +90,13 @@ var auditResults = map[string]struct{}{
 // 中文按 UTF-8 最大 3 字节计，85 字中文落在 255 字节内。
 const maxAuditContextRunes = 85
 
+// maxAuditIdentifierRunes 是主体标识与对象标识的最大字符数。
+//
+// 模型列宽为 128 字节；中文按 3 字节计，取 42 字以保证任何字符集下都不超列宽。
+// 没有这道校验时，未认证请求提交的超长用户名会一路走到审计写入，落库时被截断
+// 或失败——而查询响应会把它原样带出（实测 2MB 用户名可让审计响应膨胀到 4.2MB）。
+const maxAuditIdentifierRunes = 42
+
 // ErrAuditInvalid 表示审计事件未通过字段校验。
 //
 // 校验失败必须让业务事务整体回滚：宁可操作失败，也不能留下字段不合法或
@@ -131,12 +138,16 @@ var forbiddenAssignmentNames = []string{
 	"cookie", "credential", "api_key", "apikey", "access_key",
 }
 
-// forbiddenPathMarkers 覆盖规格禁止出现的分段文件路径。
+// forbiddenPathMarkers 覆盖规格禁止出现的**分段文件**路径特征。
 //
-// 路径按形状识别：盘符前缀、UNC 前缀与常见 Unix 根目录前缀。中文上下文里正常
-// 不含这些片段，命中即判为泄漏。
+// 规格禁止的是正文分段文件的路径（FR-13 的产物），不是任意文件路径：审计里记录
+// "读取 /etc/nginx/nginx.conf 失败" 是正当的运维上下文，把通用路径前缀列为禁词
+// 会拒绝这类合法写入，反而迫使写入方把上下文写成含糊措辞、削弱审计价值。
+//
+// 因此按分段文件的命名形态识别：分段文件由 FR-13 生成，扩展名为 .seg 或
+// segments 目录下的编号文件。FR-13 落地后若命名规则变化，此处需要同步。
 var forbiddenPathMarkers = []string{
-	`:\`, `\\`, "/home/", "/users/", "/var/", "/tmp/", "/etc/",
+	".seg", "segments/", `segments\`,
 }
 
 // validateAuditEvent 校验审计事件的字段合法性。
@@ -162,6 +173,14 @@ func validateAuditEvent(event AuditEvent) error {
 	}
 	if strings.TrimSpace(event.ObjectID) == "" {
 		return invalidAudit("对象标识不能为空")
+	}
+	// 标识长度受列宽约束：超长输入会被数据库截断或直接写入失败，两者都不可接受。
+	// 在写入前明确拒绝，避免把"标识被悄悄截断"变成难以追查的审计缺陷。
+	if utf8.RuneCountInString(event.ActorID) > maxAuditIdentifierRunes {
+		return invalidAudit("主体标识超出长度上限")
+	}
+	if utf8.RuneCountInString(event.ObjectID) > maxAuditIdentifierRunes {
+		return invalidAudit("对象标识超出长度上限")
 	}
 	if utf8.RuneCountInString(event.Context) > maxAuditContextRunes {
 		return invalidAudit("脱敏上下文超出长度上限")
@@ -199,14 +218,17 @@ func findForbiddenMarker(context string) (string, bool) {
 
 // findCredentialAssignment 检查上下文中是否存在"凭据字段 = 值"的赋值形态。
 //
-// 判定规则可解释：字段名后跟等号或冒号，且二者之间无其他内容。这样
-// 「token 摘要前缀 a1b2c3d4」放行，而「token=abc123」被拦。
+// 只认等号赋值：`token=abc123`、`secret=s3cr3t` 这类形态是凭据被写出来的典型
+// 标志，而冒号在中文运维摘要里太常见（"已更新代理 secret: 分组"、"密钥轮换：
+// 失败"），把它一并当赋值会拒绝大量合法上下文，迫使写入方把审计写成含糊措辞。
+//
+// 这确实放过了 `secret: abc123` 这种以冒号赋值的写法。取舍依据是两侧代价不对称：
+// 漏判的是一条本该被拦的记录，而误判会让正当的审计写入整体失败并回滚业务事务。
+// 弥补方式是写入侧只传白名单字段（见 validateAuditEvent 的说明）。
 func findCredentialAssignment(loweredContext string) (string, bool) {
 	for _, name := range forbiddenAssignmentNames {
-		for _, separator := range []string{"=", ":", "："} {
-			if strings.Contains(loweredContext, name+separator) {
-				return name, true
-			}
+		if strings.Contains(loweredContext, name+"=") {
+			return name, true
 		}
 	}
 	return "", false

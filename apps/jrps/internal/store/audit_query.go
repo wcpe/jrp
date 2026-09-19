@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -172,6 +173,10 @@ func encodeAuditCursor(id uint64) string {
 }
 
 // decodeAuditCursor 解析游标；空游标表示从头开始。
+//
+// 上界取 int64 的最大值而不是 uint64 的：SQLite 的 INTEGER 是有符号 64 位，
+// 超出该范围的游标会让驱动在查询时报错，最终以 500 返回——而它的性质是
+// "非法输入"，契约要求的是 400。在解析阶段就以同一口径拒绝。
 func decodeAuditCursor(cursor string) (uint64, error) {
 	if cursor == "" {
 		return 0, nil
@@ -185,6 +190,9 @@ func decodeAuditCursor(cursor string) (uint64, error) {
 	}
 	id, err := strconv.ParseUint(string(decoded), 10, 64)
 	if err != nil {
+		return 0, auditQueryError("游标不合法")
+	}
+	if id > math.MaxInt64 {
 		return 0, auditQueryError("游标不合法")
 	}
 	return id, nil

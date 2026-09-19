@@ -82,7 +82,8 @@ func registerAPI(router *gin.Engine, options RouterOptions) {
 	api.GET("/session", session.authenticate(false), session.query)
 	api.DELETE("/session", session.authenticate(true), session.logout)
 
-	// 审计查询是安全敏感读取：与日志查询同类，读取本身也须留痕（FR-16 §3.6）。
+	// 审计查询是安全敏感读取。规格 §3.6 要求它与日志查询同类地留痕，而
+	// 日志查询本身属 FR-12（未交付）；留痕随之落地，此处先提供查询能力。
 	// P1 不提供审计导出与删除接口——审计不可被管理员经 API 抹除（§3.6）。
 	api.GET("/audit-events", session.authenticate(false), audit.list)
 

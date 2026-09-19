@@ -152,10 +152,21 @@ func validatePort(parsed *url.URL) error {
 }
 
 // checkAddressAllowed 判定单个地址是否落在禁止范围内。
+//
+// 比对前必须剥离 zone：`Unmap()` 只处理 IPv4 映射，**不剥离 zone**，而
+// `netip.Prefix.Contains` 对带 zone 的地址一律返回 false。若直接用
+// `Unmap()` 的结果比对，`[::1%25lo]` 这类地址会绕过全部禁止段——实测确认
+// `[::1%25lo]`、`[fe80::1%25eth0]`、`[fd00::1%25eth0]` 在只做 Unmap 时全部放行。
+// zone 只是本机接口限定符，剥掉它不影响地址本身的归属判定。
 func checkAddressAllowed(address netip.Addr) error {
-	candidate := address.Unmap()
+	candidate := address.WithZone("").Unmap()
 	if !candidate.IsValid() {
 		return fmt.Errorf("%w：地址无效", ErrTargetMalformed)
+	}
+	// 剥离 zone 后重新确认：带 zone 的地址在剥离前 IsValid 为真，但若剥离过程
+	// 出现异常形态，这里必须明确拒绝而不是按"未知"放行。
+	if candidate.Zone() != "" {
+		return fmt.Errorf("%w：地址形态不合法", ErrTargetMalformed)
 	}
 	for _, prefix := range blockedPrefixes {
 		if prefix.Contains(candidate) {

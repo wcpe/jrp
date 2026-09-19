@@ -71,7 +71,8 @@ func TestUpdateNotificationTargetDisablesAndDiscards(t *testing.T) {
 
 	if err := database.Transaction(context.Background(), func(tx *Tx) error {
 		_, err := tx.UpdateNotificationTarget(ActorAdmin("admin"), target.ID, NotificationTargetInput{
-			Name: "目标", Type: NotificationTypeWebhook, Enabled: false,
+			Name: "目标", Type: NotificationTypeWebhook,
+			Enabled: false, EnabledProvided: true,
 			WebhookURL: "https://hooks.example.com/hook",
 		})
 		return err
@@ -92,7 +93,8 @@ func TestUpdateNotificationTargetKeepsSecretWhenOmitted(t *testing.T) {
 
 	if err := database.Transaction(context.Background(), func(tx *Tx) error {
 		_, err := tx.UpdateNotificationTarget(ActorAdmin("admin"), target.ID, NotificationTargetInput{
-			Name: "改名", Type: NotificationTypeWebhook, Enabled: true,
+			Name: "改名", Type: NotificationTypeWebhook,
+			Enabled: true, EnabledProvided: true,
 			WebhookURL: "https://hooks.example.com/hook", // 未提供 Secret
 		})
 		return err
@@ -121,7 +123,8 @@ func TestUpdateNotificationTargetKeepsIdentityAndCreationTime(t *testing.T) {
 
 	if err := database.Transaction(context.Background(), func(tx *Tx) error {
 		_, err := tx.UpdateNotificationTarget(ActorAdmin("admin"), target.ID, NotificationTargetInput{
-			Name: "改名", Type: NotificationTypeWebhook, Enabled: true,
+			Name: "改名", Type: NotificationTypeWebhook,
+			Enabled: true, EnabledProvided: true,
 			WebhookURL: "https://hooks.example.com/hook",
 		})
 		return err
@@ -255,5 +258,123 @@ func TestCreateNotificationTargetEnforcesLimit(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "上限") {
 		t.Fatalf("错误信息应说明上限：%v", err)
+	}
+}
+
+// 读取目标时不得回显地址中的查询串。
+//
+// 回归用例：查询串是凭据的常见载体（`?token=...`），而规格要求读取时隐藏地址的
+// 凭据部分。此前直接返回完整 URL，列表与详情响应都会把它带出去。
+func TestNotificationTargetViewMasksWebhookQuery(t *testing.T) {
+	database := openQueryStore(t)
+	const secretQuery = "token=super-secret-value"
+
+	var view NotificationTargetView
+	if err := database.Transaction(context.Background(), func(tx *Tx) error {
+		var err error
+		view, err = tx.CreateNotificationTarget(ActorAdmin("admin"), NotificationTargetInput{
+			Name: "目标", Type: NotificationTypeWebhook, Enabled: true,
+			WebhookURL: "https://hooks.example.com/services/abc?" + secretQuery,
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("创建目标失败：%v", err)
+	}
+
+	if strings.Contains(view.WebhookURL, "super-secret-value") {
+		t.Fatalf("读取视图泄露了查询串凭据：%s", view.WebhookURL)
+	}
+	// 主机与路径保留：管理员需要靠它们区分目标。
+	if !strings.Contains(view.WebhookURL, "hooks.example.com") {
+		t.Fatalf("视图应保留主机便于识别：%s", view.WebhookURL)
+	}
+	if !strings.Contains(view.WebhookURL, "/services/abc") {
+		t.Fatalf("视图应保留路径便于识别：%s", view.WebhookURL)
+	}
+
+	// 列表视图同样不得泄露。
+	var views []NotificationTargetView
+	if err := database.View(context.Background(), func(tx *Tx) error {
+		var err error
+		views, err = tx.NotificationTargets()
+		return err
+	}); err != nil {
+		t.Fatalf("读取目标列表失败：%v", err)
+	}
+	for _, item := range views {
+		if strings.Contains(item.WebhookURL, "super-secret-value") {
+			t.Fatalf("列表视图泄露了查询串凭据：%s", item.WebhookURL)
+		}
+	}
+
+	// 库内仍保存完整地址：投递必须使用原始 URL。
+	var stored NotificationTarget
+	if err := database.View(context.Background(), func(tx *Tx) error {
+		return tx.db.Where("id = ?", view.ID).First(&stored).Error
+	}); err != nil {
+		t.Fatalf("读取目标失败：%v", err)
+	}
+	if !strings.Contains(stored.WebhookURL, "super-secret-value") {
+		t.Fatal("库内应保留完整地址，掩码只作用于读取视图")
+	}
+}
+
+// 更新时省略启用状态必须沿用原值。
+//
+// 回归用例：`Enabled` 的假零值无法区分"显式停用"与"没提这一项"，按默认值处理
+// 会让 PATCH 只改名字的操作把已停用的目标静默重新启用——与"停用即不接收通知"
+// 的语义直接冲突，且管理员不会收到任何提示。
+func TestUpdateNotificationTargetKeepsEnabledWhenOmitted(t *testing.T) {
+	database := openQueryStore(t)
+
+	// 建一个启用的目标，再显式停用。
+	target := createWebhookTarget(t, database, "目标", true)
+	if err := database.Transaction(context.Background(), func(tx *Tx) error {
+		_, err := tx.UpdateNotificationTarget(ActorAdmin("admin"), target.ID, NotificationTargetInput{
+			Name: "目标", Type: NotificationTypeWebhook,
+			Enabled: false, EnabledProvided: true,
+			WebhookURL: "https://hooks.example.com/hook",
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("停用目标失败：%v", err)
+	}
+
+	// 只改名字，不提交 enabled。
+	var updated NotificationTargetView
+	if err := database.Transaction(context.Background(), func(tx *Tx) error {
+		var err error
+		updated, err = tx.UpdateNotificationTarget(ActorAdmin("admin"), target.ID, NotificationTargetInput{
+			Name: "改名后", Type: NotificationTypeWebhook,
+			WebhookURL: "https://hooks.example.com/hook",
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("更新目标失败：%v", err)
+	}
+	if updated.Enabled {
+		t.Fatal("省略启用状态时不得把已停用的目标重新启用")
+	}
+	if updated.Name != "改名后" {
+		t.Fatalf("名称应已更新：%s", updated.Name)
+	}
+
+	// 反向场景：已启用的目标在省略 enabled 时必须保持启用。
+	// 单靠"停用目标保持停用"无法区分"沿用了原值"与"被设成了零值 false"——
+	// 两种实现都会让停用目标保持停用。
+	enabled := createWebhookTarget(t, database, "另一个目标", true)
+	var kept NotificationTargetView
+	if err := database.Transaction(context.Background(), func(tx *Tx) error {
+		var err error
+		kept, err = tx.UpdateNotificationTarget(ActorAdmin("admin"), enabled.ID, NotificationTargetInput{
+			Name: "另一个目标改名", Type: NotificationTypeWebhook,
+			WebhookURL: "https://hooks.example.com/hook",
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("更新目标失败：%v", err)
+	}
+	if !kept.Enabled {
+		t.Fatal("省略启用状态时不得把已启用的目标停用")
 	}
 }

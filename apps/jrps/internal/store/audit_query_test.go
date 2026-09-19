@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"path/filepath"
 	"strconv"
@@ -392,5 +393,36 @@ func TestAuditQueryReadsConcurrentWrites(t *testing.T) {
 		if page.Items[index].ID < page.Items[index-1].ID {
 			t.Fatal("查询结果必须按主键升序")
 		}
+	}
+}
+
+// 超出 SQLite 整数范围的游标必须按非法输入拒绝。
+//
+// 回归用例：游标解码用 ParseUint 的 64 位上限，而 SQLite 的 INTEGER 是有符号
+// 64 位——超出 2^63-1 的值能通过解析，却让驱动在查询时报错，最终以 500 返回。
+// 契约要求非法游标返回 400，两者对不上会把"用户输入错误"呈现成"服务端故障"。
+func TestAuditQueryRejectsCursorBeyondSQLiteRange(t *testing.T) {
+	database := openQueryStore(t)
+	seedAuditEvents(t, database, 2)
+
+	// 构造一个超过 int64 上限的游标：2^63。
+	tooLarge := base64.RawURLEncoding.EncodeToString([]byte("9223372036854775808"))
+	var err error
+	_ = database.View(context.Background(), func(tx *Tx) error {
+		_, err = tx.QueryAuditEvents(AuditQuery{Cursor: tooLarge})
+		return nil
+	})
+	if !errors.Is(err, ErrAuditQueryInvalid) {
+		t.Fatalf("超出范围的游标应按非法输入拒绝：%v", err)
+	}
+
+	// int64 上限本身仍应可用：它是合法边界。
+	atLimit := base64.RawURLEncoding.EncodeToString([]byte("9223372036854775807"))
+	_ = database.View(context.Background(), func(tx *Tx) error {
+		_, err = tx.QueryAuditEvents(AuditQuery{Cursor: atLimit})
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("int64 上限游标应被接受：%v", err)
 	}
 }

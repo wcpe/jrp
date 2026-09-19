@@ -413,3 +413,46 @@ func TestEmailRejectsOverlongContent(t *testing.T) {
 		t.Fatalf("内容超限应为确定性失败：%v", err)
 	}
 }
+
+// 明文 SMTP 加密码的组合必须被明确拒绝。
+//
+// 回归用例：Go 标准库的 PlainAuth 只在 TLS 或 localhost 上发送凭据，因此
+// `none` + 非回环主机 + 密码的配置在运行期必然失败，而失败原因会被归为
+// "认证失败"——那会把排查方向引向凭据本身，而真实原因是传输方式不允许发送凭据。
+func TestEmailRejectsPlainTextWithCredentials(t *testing.T) {
+	sender := newUnsafeEmailSenderForTest()
+
+	t.Run("非回环主机被拒绝", func(t *testing.T) {
+		target := Target{
+			ID: "mail-1", Type: "email",
+			SMTPHost: "smtp.example.com", SMTPPort: 25,
+			SMTPFrom: "jrp@example.invalid", SMTPTo: []string{"ops@example.invalid"},
+			SMTPSecurity: SMTPSecurityNone, Secret: "password-value",
+		}
+		err := sender.validate(target)
+		if err == nil {
+			t.Fatal("明文 SMTP 加密码的组合必须被拒绝")
+		}
+		if Retryable(err) {
+			t.Fatalf("该组合是配置问题，应为确定性失败：%v", err)
+		}
+		// 错误应指明真实原因，而不是笼统的"认证失败"。
+		if !strings.Contains(err.Error(), "starttls") {
+			t.Fatalf("错误应给出可执行的修正方向：%v", err)
+		}
+	})
+
+	t.Run("回环主机放行", func(t *testing.T) {
+		target := Target{
+			ID: "mail-1", Type: "email",
+			SMTPHost: "127.0.0.1", SMTPPort: 25,
+			SMTPFrom: "jrp@example.invalid", SMTPTo: []string{"ops@example.invalid"},
+			SMTPSecurity: SMTPSecurityNone, Secret: "password-value",
+		}
+		// 回环是标准库允许明文发凭据的范围，配置校验应放行；
+		// 投递本身会因无监听而失败，那属于运行期问题。
+		if err := sender.validate(target); err != nil {
+			t.Fatalf("回环主机加明文应通过配置校验：%v", err)
+		}
+	})
+}

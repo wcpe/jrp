@@ -176,6 +176,13 @@ func (tx *Tx) AuthenticateAdmin(username, password string) (AdminCredential, err
 	if username == "" || password == "" {
 		return AdminCredential{}, ErrInvalidCredentials
 	}
+	// 长度上限在查询之前判定：超长输入不可能命中任何真实凭据，却会一路走到
+	// 派生与审计写入，让未认证请求用超大载荷推高响应体积与库内记录。
+	// 上限取审计标识的同一口径，保证合法用户名在任何路径上都不会被截断。
+	if utf8.RuneCountInString(username) > maxAuditIdentifierRunes ||
+		len(password) > passwordMaxLength {
+		return AdminCredential{}, ErrInvalidCredentials
+	}
 	var credential AdminCredential
 	err := tx.db.First(&credential, "username = ?", username).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
