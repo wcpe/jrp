@@ -91,7 +91,10 @@ func main() {
 		core.WithListen(core.BindEndpoint{Address: control, Transport: core.TransportTCP}),
 		core.WithWire(core.WireV1),
 		core.WithClientCredential(core.ClientCredential{ClientID: "ext-client", Token: "ext-token"}),
-		core.WithTCPProxyBinding(core.TCPProxyBinding{Name: "ext-ssh", ClientID: "ext-client", RemotePort: guestPort}),
+		core.WithTCPProxyBinding(core.TCPProxyBinding{
+			Name: "ext-ssh", ClientID: "ext-client", RemotePort: guestPort,
+			AllowedTargets: []netip.AddrPort{target},
+		}),
 	)
 	if err != nil {
 		fmt.Println("服务端配置失败：", err)

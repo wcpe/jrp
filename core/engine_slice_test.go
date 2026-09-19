@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -231,15 +232,47 @@ func TestVerticalSliceEndToEnd(t *testing.T) {
 	}
 }
 
-// freePort 申请一个空闲端口后立即释放，调用方随后绑定。
+// nextFreePort 返回动态端口范围之外的一个可用端口。
+// 游标只增不减：同一端口在被探测释放后不会立刻又被下一个用例选中，
+// 避免撞上尚未散尽的 TIME_WAIT 残留；越界后回绕继续找。
+func nextFreePort() int {
+	portMutex.Lock()
+	defer portMutex.Unlock()
+	for {
+		candidate := portCursor
+		portCursor++
+		if portCursor > portRangeEnd {
+			portCursor = portRangeStart
+		}
+		probe, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(candidate)))
+		if err != nil {
+			continue
+		}
+		_ = probe.Close()
+		return candidate
+	}
+}
+
+// 端口区间取在动态端口范围（1024–15000）之上，且避开常见服务端口。
+const (
+	portRangeStart = 20000
+	portRangeEnd   = 45000
+)
+
+var (
+	portCursor = portRangeStart
+	portMutex  sync.Mutex
+)
+
+// freePort 申请一个空闲端口，调用方随后绑定。
+//
+// 端口取自动态端口范围之外：Windows 默认把 1024–15000 留给出站连接的临时
+// 本地端口，本包内客户端引擎拨号、各处 net.Listen(":0") 都从该区间取号。
+// 若入口端口同样落在区间内，"先释放、后绑定"的空窗就会被这些同进程临时端口
+// 抢走，报 Only one usage of each socket address 而随机失败。
 func freePort(t *testing.T) int {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("申请空闲端口失败：%v", err)
-	}
-	defer listener.Close()
-	return listener.Addr().(*net.TCPAddr).Port
+	return nextFreePort()
 }
 
 // TestStartFailureKeepsListener 验证 Start 失败时宿主注入的 listener 仍归宿主。

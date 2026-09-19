@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +23,20 @@ const (
 	fr06aClientID    = "proxy-client"
 	fr06aClientToken = "proxy-token"
 )
+
+// controlAndFourPorts 一次性申请控制监听器与四个入口端口，全部取自
+// nextFreePort 的同一区间：控制监听器保持打开供服务端复用，四个入口端口
+// 释放后交给服务端绑定。同源分配保证五者互不相同。
+func controlAndFourPorts(t *testing.T) (net.Listener, [4]int) {
+	t.Helper()
+	controlPort := nextFreePort()
+	control, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(controlPort)))
+	if err != nil {
+		t.Fatalf("监听控制端口失败：%v", err)
+	}
+	ports := [4]int{nextFreePort(), nextFreePort(), nextFreePort(), nextFreePort()}
+	return control, ports
+}
 
 // startLocalUDPEcho 启动一个本地 UDP 回显服务，返回其地址与关闭函数。
 func startLocalUDPEcho(t *testing.T) (netip.AddrPort, func()) {
@@ -111,12 +126,9 @@ func fr06aClientConfig(t *testing.T, control netip.AddrPort, tcpTarget, udpTarge
 }
 
 // startFourProxyPair 启动带四种代理的一对 Engine。
-func startFourProxyPair(t *testing.T, ctx context.Context, tcpTarget, udpTarget netip.AddrPort, ports [4]int) *server.Engine {
+// controlListener 由调用方在同批端口中申请，避免与入口端口重复。
+func startFourProxyPair(t *testing.T, ctx context.Context, tcpTarget, udpTarget netip.AddrPort, ports [4]int, controlListener net.Listener) *server.Engine {
 	t.Helper()
-	controlListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("监听控制端口失败：%v", err)
-	}
 	control, err := netip.ParseAddrPort(controlListener.Addr().String())
 	if err != nil {
 		t.Fatalf("解析控制地址失败：%v", err)
@@ -146,10 +158,10 @@ func TestFR06aTCPProxyRoundTrip(t *testing.T) {
 	udpTarget, stopUDP := startLocalUDPEcho(t)
 	defer stopUDP()
 
-	ports := [4]int{freePort(t), freePort(t), freePort(t), freePort(t)}
+	controlListener, ports := controlAndFourPorts(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	serverEngine := startFourProxyPair(t, ctx, tcpTarget, udpTarget, ports)
+	serverEngine := startFourProxyPair(t, ctx, tcpTarget, udpTarget, ports, controlListener)
 
 	guest, err := net.Dial("tcp", serverEngine.GuestAddr("tcp-echo").String())
 	if err != nil {
@@ -169,10 +181,10 @@ func TestFR06aUDPProxyRoundTrip(t *testing.T) {
 	udpTarget, stopUDP := startLocalUDPEcho(t)
 	defer stopUDP()
 
-	ports := [4]int{freePort(t), freePort(t), freePort(t), freePort(t)}
+	controlListener, ports := controlAndFourPorts(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	serverEngine := startFourProxyPair(t, ctx, tcpTarget, udpTarget, ports)
+	serverEngine := startFourProxyPair(t, ctx, tcpTarget, udpTarget, ports, controlListener)
 
 	clientSocket, err := net.Dial("udp", serverEngine.GuestAddr("udp-echo").String())
 	if err != nil {
@@ -210,10 +222,10 @@ func TestFR06aHTTPSProxyPassthrough(t *testing.T) {
 	udpTarget, stopUDP := startLocalUDPEcho(t)
 	defer stopUDP()
 
-	ports := [4]int{freePort(t), freePort(t), freePort(t), freePort(t)}
+	controlListener, ports := controlAndFourPorts(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	serverEngine := startFourProxyPair(t, ctx, tcpTarget, udpTarget, ports)
+	serverEngine := startFourProxyPair(t, ctx, tcpTarget, udpTarget, ports, controlListener)
 
 	guest, err := net.Dial("tcp", serverEngine.GuestAddr("https-echo").String())
 	if err != nil {
@@ -276,10 +288,10 @@ func TestFR06aHTTPProxyRoutesByHostAndPath(t *testing.T) {
 	udpTarget, stopUDP := startLocalUDPEcho(t)
 	defer stopUDP()
 
-	ports := [4]int{freePort(t), freePort(t), freePort(t), freePort(t)}
+	controlListener, ports := controlAndFourPorts(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	serverEngine := startFourProxyPair(t, ctx, tcpTarget, udpTarget, ports)
+	serverEngine := startFourProxyPair(t, ctx, tcpTarget, udpTarget, ports, controlListener)
 
 	// 命中 app.example.com + /api 的路由：目标服务是回显服务，
 	// 因此写出的请求行会被原样返回，可据此确认请求抵达了目标。
@@ -307,10 +319,10 @@ func TestFR06aHTTPUnmatchedRouteReturnsPlainResponse(t *testing.T) {
 	udpTarget, stopUDP := startLocalUDPEcho(t)
 	defer stopUDP()
 
-	ports := [4]int{freePort(t), freePort(t), freePort(t), freePort(t)}
+	controlListener, ports := controlAndFourPorts(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	serverEngine := startFourProxyPair(t, ctx, tcpTarget, udpTarget, ports)
+	serverEngine := startFourProxyPair(t, ctx, tcpTarget, udpTarget, ports, controlListener)
 
 	guest, err := net.Dial("tcp", serverEngine.GuestAddr("http-echo").String())
 	if err != nil {
@@ -344,15 +356,13 @@ func TestFR06aTargetOutsideAllowedSetIsRejected(t *testing.T) {
 	tcpTarget, stopEcho := startLocalEcho(t)
 	defer stopEcho()
 
-	controlListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("监听控制端口失败：%v", err)
-	}
+	// 控制端口与入口端口同批申请：分两次申请的端口可能相同，拨号会撞在一起。
+	controlListener, entryPorts := controlAndFourPorts(t)
+	guestPort := entryPorts[0]
 	control, err := netip.ParseAddrPort(controlListener.Addr().String())
 	if err != nil {
 		t.Fatalf("解析控制地址失败：%v", err)
 	}
-	guestPort := freePort(t)
 
 	// 服务端只允许一个与客户端实际目标不同的地址：客户端声明必然越权。
 	serverConfig, err := core.NewServerConfig(
@@ -427,17 +437,13 @@ func TestFR06aShutdownLeavesNoResidue(t *testing.T) {
 	udpTarget, stopUDP := startLocalUDPEcho(t)
 	defer stopUDP()
 
-	ports := [4]int{freePort(t), freePort(t), freePort(t), freePort(t)}
+	controlListener, ports := controlAndFourPorts(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	// 基线取启动前：关闭后必须回到同一水平（规格 §5：goroutine、监听器与连接计数归零）。
 	baseline := runtime.NumGoroutine()
 
-	controlListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("监听控制端口失败：%v", err)
-	}
 	control, err := netip.ParseAddrPort(controlListener.Addr().String())
 	if err != nil {
 		t.Fatalf("解析控制地址失败：%v", err)
