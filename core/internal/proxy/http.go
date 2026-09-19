@@ -74,10 +74,15 @@ func normalizeRoute(route HTTPRoute) (HTTPRoute, error) {
 }
 
 // detectRouteConflict 检测主机名与路径前缀的重复组合。
+//
+// 键用 NUL 分隔而非直接拼接：主机名与路径都允许含 `/`，直接相加会让不同的组合
+// 产生同一个键——例如 `a/b.example.com` + `/c` 与 `a` + `/b.example.com/c`。
+// 这类误判会让构造路由表失败，而该端口的全部请求随之一律 404（静默失去路由）。
+// NUL 不可能出现在主机名或路径中，因此它不参与组合歧义。
 func detectRouteConflict(routes []HTTPRoute) error {
 	seen := make(map[string]bool, len(routes))
 	for _, route := range routes {
-		key := route.Host + route.Path
+		key := route.Host + "\x00" + route.Path
 		if seen[key] {
 			return fmt.Errorf("主机 %s 路径 %s 的%w", route.Host, route.Path, errRouteConflict)
 		}

@@ -1,7 +1,11 @@
 package core_test
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
+	"io"
 	"net"
 	"net/netip"
 	"runtime"
@@ -12,6 +16,7 @@ import (
 
 	"github.com/wcpe/jrp/core"
 	"github.com/wcpe/jrp/core/client"
+	"github.com/wcpe/jrp/core/internal/wire"
 	"github.com/wcpe/jrp/core/server"
 )
 
@@ -77,6 +82,19 @@ func startLocalUDPEcho(t *testing.T) (netip.AddrPort, func()) {
 // fr06aServerConfig 构造带四种代理绑定的服务端配置。
 func fr06aServerConfig(t *testing.T, control netip.AddrPort, tcpTarget, udpTarget netip.AddrPort, ports [4]int) core.ServerConfig {
 	t.Helper()
+	return fr06aServerConfigWithHTTPTarget(t, control, tcpTarget, udpTarget, ports, tcpTarget)
+}
+
+// fr06aServerConfigWithHTTPTarget 构造带四种代理绑定的服务端配置，并允许
+// HTTP 绑定指向独立的目标服务。
+//
+// HTTP 用例需要一个能区分"请求抵达目标"与"服务端把请求回吐给访客"的目标：
+// 纯回显服务两者产出的字节相同，无法证明请求真的走到了目标。
+func fr06aServerConfigWithHTTPTarget(
+	t *testing.T, control netip.AddrPort, tcpTarget, udpTarget netip.AddrPort, ports [4]int,
+	httpTarget netip.AddrPort,
+) core.ServerConfig {
+	t.Helper()
 	config, err := core.NewServerConfig(
 		core.WithListen(core.BindEndpoint{Address: control, Transport: core.TransportTCP}),
 		core.WithWire(core.WireV1),
@@ -93,7 +111,7 @@ func fr06aServerConfig(t *testing.T, control netip.AddrPort, tcpTarget, udpTarge
 			Name: "http-echo", ClientID: fr06aClientID, RemotePort: ports[2],
 			Hosts:          []string{fr06aHTTPHost},
 			Path:           fr06aHTTPPath,
-			AllowedTargets: []netip.AddrPort{tcpTarget},
+			AllowedTargets: []netip.AddrPort{httpTarget},
 		}),
 		core.WithHTTPSProxyBinding(core.HTTPSProxyBinding{
 			Name: "https-echo", ClientID: fr06aClientID, RemotePort: ports[3],
@@ -111,6 +129,18 @@ func fr06aServerConfig(t *testing.T, control netip.AddrPort, tcpTarget, udpTarge
 // fr06aClientConfig 构造与上述服务端匹配的客户端配置。
 func fr06aClientConfig(t *testing.T, control netip.AddrPort, tcpTarget, udpTarget netip.AddrPort, ports [4]int) core.ClientConfig {
 	t.Helper()
+	return fr06aClientConfigWithHTTPTarget(t, control, tcpTarget, udpTarget, ports, tcpTarget)
+}
+
+// fr06aClientConfigWithHTTPTarget 构造客户端配置，并允许 HTTP 代理指向独立目标。
+//
+// HTTP 代理声明的本地目标必须与服务端该绑定的 AllowedTargets 一致：两者不一致
+// 时服务端会按越权拒绝该工作连接，表现为该代理永远没有待命连接、访客只能暂存。
+func fr06aClientConfigWithHTTPTarget(
+	t *testing.T, control netip.AddrPort, tcpTarget, udpTarget netip.AddrPort, ports [4]int,
+	httpTarget netip.AddrPort,
+) core.ClientConfig {
+	t.Helper()
 	config, err := core.NewClientConfig(
 		core.WithClientID(fr06aClientID),
 		core.WithServerEndpoint(core.ServerEndpoint{
@@ -119,7 +149,7 @@ func fr06aClientConfig(t *testing.T, control netip.AddrPort, tcpTarget, udpTarge
 		core.WithClientAuth(core.TokenAuth{Token: fr06aClientToken}),
 		core.WithTCPProxy(core.TCPProxy{Name: "tcp-echo", LocalAddr: tcpTarget, RemotePort: ports[0]}),
 		core.WithUDPProxy(core.UDPProxy{Name: "udp-echo", LocalAddr: udpTarget, RemotePort: ports[1]}),
-		core.WithHTTPProxy(core.HTTPProxy{Name: "http-echo", LocalAddr: tcpTarget, RemotePort: ports[2]}),
+		core.WithHTTPProxy(core.HTTPProxy{Name: "http-echo", LocalAddr: httpTarget, RemotePort: ports[2]}),
 		core.WithHTTPSProxy(core.HTTPSProxy{Name: "https-echo", LocalAddr: tcpTarget, RemotePort: ports[3]}),
 		core.WithHeartbeat(200*time.Millisecond),
 		core.WithTimeout(2*time.Second),
@@ -132,15 +162,26 @@ func fr06aClientConfig(t *testing.T, control netip.AddrPort, tcpTarget, udpTarge
 
 // startFourProxyPair 启动带四种代理的一对 Engine。
 // controlListener 由调用方在同批端口中申请，避免与入口端口重复。
-func startFourProxyPair(t *testing.T, ctx context.Context, tcpTarget, udpTarget netip.AddrPort, ports [4]int, controlListener net.Listener) *server.Engine {
+//
+// httpTarget 可省略；给出时服务端 HTTP 绑定与客户端 HTTP 代理都改用它，两侧必须
+// 同时改：只改一侧会让客户端声明的目标落在服务端允许集合之外，工作连接被按越权
+// 拒绝，表现为该代理永远没有待命连接。
+func startFourProxyPair(
+	t *testing.T, ctx context.Context, tcpTarget, udpTarget netip.AddrPort,
+	ports [4]int, controlListener net.Listener, httpTarget ...netip.AddrPort,
+) *server.Engine {
 	t.Helper()
 	control, err := netip.ParseAddrPort(controlListener.Addr().String())
 	if err != nil {
 		t.Fatalf("解析控制地址失败：%v", err)
 	}
 
+	httpSide := tcpTarget
+	if len(httpTarget) > 0 {
+		httpSide = httpTarget[0]
+	}
 	serverEngine := server.New(
-		fr06aServerConfig(t, control, tcpTarget, udpTarget, ports),
+		fr06aServerConfigWithHTTPTarget(t, control, tcpTarget, udpTarget, ports, httpSide),
 		server.WithListener(controlListener),
 	)
 	if err := serverEngine.Start(ctx); err != nil {
@@ -148,12 +189,91 @@ func startFourProxyPair(t *testing.T, ctx context.Context, tcpTarget, udpTarget 
 	}
 	t.Cleanup(func() { _ = serverEngine.Shutdown(context.Background()) })
 
-	clientEngine := client.New(fr06aClientConfig(t, control, tcpTarget, udpTarget, ports))
+	clientEngine := client.New(fr06aClientConfigWithHTTPTarget(t, control, tcpTarget, udpTarget, ports, httpSide))
 	if err := clientEngine.Start(ctx); err != nil {
 		t.Fatalf("客户端启动失败：%v", err)
 	}
 	t.Cleanup(func() { _ = clientEngine.Shutdown(context.Background()) })
 	return serverEngine
+}
+
+// httpProbeMarker 是 HTTP 探针服务在回显请求后追加的标记。
+//
+// 它由目标侧产生，代理无从伪造：只有真正抵达目标并读到其响应的请求才会带回它。
+// 纯回显服务无法区分"请求抵达了目标"与"服务端把请求回吐给访客"——两者字节相同。
+const httpProbeMarker = "\n-- target-marker --\n"
+
+// startHTTPProbe 启动一个 HTTP 探针服务。
+//
+// 行为：读请求首部（直到空行），再按 Content-Length 读出正文，把首部与正文
+// 一并回显，最后追加目标侧标记。按声明长度读正文是刻意的：若上游把正文丢了，
+// 这里会一直等不到那部分字节，用例即以超时暴露问题。
+func startHTTPProbe(t *testing.T) (netip.AddrPort, func()) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("启动 HTTP 探针服务失败：%v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				reader := bufio.NewReader(c)
+				var head bytes.Buffer
+				contentLength := 0
+				for {
+					line, readErr := reader.ReadString('\n')
+					head.WriteString(line)
+					if name, value, ok := splitProbeHeader(line); ok &&
+						strings.EqualFold(name, "Content-Length") {
+						if parsed, convErr := strconv.Atoi(value); convErr == nil {
+							contentLength = parsed
+						}
+					}
+					if readErr != nil || line == "\r\n" || line == "\n" {
+						break
+					}
+				}
+				if _, err := c.Write(head.Bytes()); err != nil {
+					return
+				}
+				if contentLength > 0 {
+					body := make([]byte, contentLength)
+					if _, err := io.ReadFull(reader, body); err != nil {
+						return
+					}
+					if _, err := c.Write(body); err != nil {
+						return
+					}
+				}
+				_, _ = c.Write([]byte(httpProbeMarker))
+			}(conn)
+		}
+	}()
+	address := listener.Addr().(*net.TCPAddr)
+	return mustAddrPort(t, "127.0.0.1:"+itoa(address.Port)), func() {
+		_ = listener.Close()
+		<-done
+	}
+}
+
+// splitProbeHeader 拆分探针读到的首部行；空行与非法行返回假。
+func splitProbeHeader(line string) (name, value string, ok bool) {
+	trimmed := strings.TrimRight(line, "\r\n")
+	if trimmed == "" {
+		return "", "", false
+	}
+	separator := strings.Index(trimmed, ":")
+	if separator < 0 {
+		return "", "", false
+	}
+	return strings.TrimSpace(trimmed[:separator]), strings.TrimSpace(trimmed[separator+1:]), true
 }
 
 // TestFR06aTCPProxyRoundTrip 覆盖 TCP 代理：用户连接服务端端口后数据双向可达。
@@ -292,14 +412,16 @@ func TestFR06aHTTPProxyRoutesByHostAndPath(t *testing.T) {
 	defer stopEcho()
 	udpTarget, stopUDP := startLocalUDPEcho(t)
 	defer stopUDP()
+	// HTTP 绑定指向带标记的探针服务：回显服务与"把请求写回访客"产出的字节
+	// 相同，无法证明请求真的抵达了目标。
+	httpTarget, stopProbe := startHTTPProbe(t)
+	defer stopProbe()
 
 	controlListener, ports := controlAndFourPorts(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	serverEngine := startFourProxyPair(t, ctx, tcpTarget, udpTarget, ports, controlListener)
+	serverEngine := startFourProxyPair(t, ctx, tcpTarget, udpTarget, ports, controlListener, httpTarget)
 
-	// 命中 app.example.com + /api 的路由：目标服务是回显服务，
-	// 因此写出的请求行会被原样返回，可据此确认请求抵达了目标。
 	guest, err := net.Dial("tcp", serverEngine.GuestAddr("http-echo").String())
 	if err != nil {
 		t.Fatalf("访客连接 HTTP 入口失败：%v", err)
@@ -310,9 +432,23 @@ func TestFR06aHTTPProxyRoutesByHostAndPath(t *testing.T) {
 	if _, err := guest.Write([]byte(request)); err != nil {
 		t.Fatalf("写入 HTTP 请求失败：%v", err)
 	}
-	_, err = readFullWithTimeout(guest, make([]byte, len(request)))
-	if err != nil {
+	// 断言必须能区分"请求抵达了目标"与"服务端把请求原样回吐给访客"：
+	// 两者读到的字节完全相同，因此仅比对请求原文不足以证明前者。
+	// 改用目标侧写入的标记作为证据——只有真正抵达目标的请求才会带回它。
+	echoed := make([]byte, len(request))
+	if _, err := readFullWithTimeout(guest, echoed); err != nil {
 		t.Fatalf("HTTP 请求未抵达目标服务（路由未命中）：%v", err)
+	}
+	if string(echoed) != request {
+		t.Fatalf("目标回显内容与请求不一致：%q", string(echoed))
+	}
+	// 目标服务在回显后追加的标记：它由目标侧产生，服务端无从伪造。
+	marker := make([]byte, len(httpProbeMarker))
+	if _, err := readFullWithTimeout(guest, marker); err != nil {
+		t.Fatalf("未收到目标服务追加的标记，请求可能未真正抵达目标：%v", err)
+	}
+	if string(marker) != httpProbeMarker {
+		t.Fatalf("目标标记不匹配：%q", string(marker))
 	}
 }
 
@@ -543,4 +679,335 @@ func TestFR06aShutdownLeavesNoResidue(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("关闭后 goroutine 未回到基线：基线 %d，当前 %d", baseline, runtime.NumGoroutine())
+}
+
+// 未携带有效凭据的工作连接声明必须被拒绝，且不得影响该代理的暂存访客。
+//
+// 回归用例：工作连接是与控制连接平行的独立连接，服务端此前不做任何归属校验，
+// 于是任何能连上控制端口的对端都能声明任意代理名。除了能与真实访客配对（读取其
+// 数据），它还能借"越权目标"这一分支触发配对中心的副作用——释放该代理的全部
+// 暂存访客，形成无需认证的拒绝服务。
+//
+// 本用例验证：伪造声明被拒绝、真实访客不受影响、合法客户端仍能正常配对。
+func TestFR06aWorkConnRequiresCredentials(t *testing.T) {
+	tcpTarget, stopEcho := startLocalEcho(t)
+	defer stopEcho()
+	udpTarget, stopUDP := startLocalUDPEcho(t)
+	defer stopUDP()
+
+	controlListener, ports := controlAndFourPorts(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	control, err := netip.ParseAddrPort(controlListener.Addr().String())
+	if err != nil {
+		t.Fatalf("解析控制地址失败：%v", err)
+	}
+
+	// 只启动服务端：客户端稍后手动启动，以便在两者之间插入伪造声明。
+	serverEngine := server.New(
+		fr06aServerConfig(t, control, tcpTarget, udpTarget, ports),
+		server.WithListener(controlListener),
+	)
+	if err := serverEngine.Start(ctx); err != nil {
+		t.Fatalf("服务端启动失败：%v", err)
+	}
+	t.Cleanup(func() { _ = serverEngine.Shutdown(context.Background()) })
+
+	// 先建立一条真实访客并让它暂存（此时还没有工作连接）。
+	// 此刻不写入数据：暂存期间写入的字节会在配对后先于后续数据被转发回来，
+	// 让"哪一段回显对应哪次写入"变得难以分辨。本用例只需访客连接存在。
+	guest, err := net.Dial("tcp", serverEngine.GuestAddr("tcp-echo").String())
+	if err != nil {
+		t.Fatalf("访客连接失败：%v", err)
+	}
+	defer guest.Close()
+
+	// 伪造一条工作连接声明：代理名正确，但没有凭据。
+	forged, err := net.Dial("tcp", control.String())
+	if err != nil {
+		t.Fatalf("伪造对端连接失败：%v", err)
+	}
+	payload, err := json.Marshal(map[string]string{
+		"proxy_name":  "tcp-echo",
+		"target_addr": tcpTarget.String(),
+	})
+	if err != nil {
+		t.Fatalf("序列化伪造声明失败：%v", err)
+	}
+	frame, err := wire.EncodeV1Frame(wire.Frame{Type: wire.MessageTypeNewWorkConn, Payload: payload})
+	if err != nil {
+		t.Fatalf("编码伪造帧失败：%v", err)
+	}
+	if _, err := forged.Write(frame); err != nil {
+		t.Fatalf("发送伪造声明失败：%v", err)
+	}
+	// 服务端应关闭该连接。
+	_ = forged.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := forged.Read(make([]byte, 1)); err == nil {
+		t.Fatal("缺少凭据的工作连接声明应被拒绝并关闭")
+	}
+	_ = forged.Close()
+
+	// 再伪造一条带**错误凭据**的声明：这一条专门验证凭据校验本身。
+	// 若只测"无凭据"，代理归属校验会先拦住它，凭据校验被整体移除也测不出来。
+	wrongCred, err := net.Dial("tcp", control.String())
+	if err != nil {
+		t.Fatalf("错误凭据对端连接失败：%v", err)
+	}
+	wrongPayload, err := json.Marshal(map[string]string{
+		"client_id":   fr06aClientID,
+		"token":       "伪造的令牌",
+		"proxy_name":  "tcp-echo",
+		"target_addr": tcpTarget.String(),
+	})
+	if err != nil {
+		t.Fatalf("序列化错误凭据声明失败：%v", err)
+	}
+	wrongFrame, err := wire.EncodeV1Frame(wire.Frame{Type: wire.MessageTypeNewWorkConn, Payload: wrongPayload})
+	if err != nil {
+		t.Fatalf("编码错误凭据帧失败：%v", err)
+	}
+	if _, err := wrongCred.Write(wrongFrame); err != nil {
+		t.Fatalf("发送错误凭据声明失败：%v", err)
+	}
+	_ = wrongCred.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := wrongCred.Read(make([]byte, 1)); err == nil {
+		t.Fatal("令牌不匹配的工作连接声明应被拒绝并关闭")
+	}
+	_ = wrongCred.Close()
+
+	// 第三条：凭据合法但代理名不属于该客户端（此处用未注册的代理名）。
+	// 它验证归属校验，且同样不得触碰配对中心。
+	wrongProxy, err := net.Dial("tcp", control.String())
+	if err != nil {
+		t.Fatalf("越权代理对端连接失败：%v", err)
+	}
+	wrongProxyPayload, err := json.Marshal(map[string]string{
+		"client_id":   fr06aClientID,
+		"token":       fr06aClientToken,
+		"proxy_name":  "不属于该客户端的代理",
+		"target_addr": tcpTarget.String(),
+	})
+	if err != nil {
+		t.Fatalf("序列化越权代理声明失败：%v", err)
+	}
+	wrongProxyFrame, err := wire.EncodeV1Frame(wire.Frame{Type: wire.MessageTypeNewWorkConn, Payload: wrongProxyPayload})
+	if err != nil {
+		t.Fatalf("编码越权代理帧失败：%v", err)
+	}
+	if _, err := wrongProxy.Write(wrongProxyFrame); err != nil {
+		t.Fatalf("发送越权代理声明失败：%v", err)
+	}
+	_ = wrongProxy.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := wrongProxy.Read(make([]byte, 1)); err == nil {
+		t.Fatal("代理归属不匹配的工作连接声明应被拒绝并关闭")
+	}
+	_ = wrongProxy.Close()
+
+	// 暂存访客不得被伪造声明影响：它的连接仍应是打开的。
+	_ = guest.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if _, err := guest.Read(make([]byte, 1)); err == nil {
+		t.Fatal("暂存访客不应收到数据")
+	} else if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+		t.Fatalf("暂存访客被伪造声明影响（连接被关闭）：%v", err)
+	}
+
+	// 合法客户端仍应正常配对：访客写入的数据最终抵达回显目标并原路返回。
+	clientEngine := client.New(fr06aClientConfig(t, control, tcpTarget, udpTarget, ports))
+	if err := clientEngine.Start(ctx); err != nil {
+		t.Fatalf("客户端启动失败：%v", err)
+	}
+	t.Cleanup(func() { _ = clientEngine.Shutdown(context.Background()) })
+
+	payload2 := []byte("合法配对验证")
+	if _, err := guest.Write(payload2); err != nil {
+		t.Fatalf("访客二次写入失败：%v", err)
+	}
+	echoed := make([]byte, len(payload2))
+	if _, err := readFullWithTimeout(guest, echoed); err != nil {
+		t.Fatalf("合法客户端接入后访客数据未往返：%v", err)
+	}
+	if string(echoed) != string(payload2) {
+		t.Fatalf("往返内容不一致：%q", string(echoed))
+	}
+}
+
+// 打开入口失败时必须释放已成功打开的入口，不留半注册监听器。
+//
+// 回归用例：失败分支写的是 `return nil, nil, nil, err`，把命名返回值置空，
+// 于是 defer 里的释放函数拿到空 map，已打开的监听器不释放。反复 Start 失败
+// 会持续累积监听器，其间这些端口不可被其他进程使用，且释放时机取决于 GC。
+//
+// 判定方式：让第二个入口端口被外部占用以触发失败，随后验证第一个入口端口
+// 已可重新绑定——能绑上即说明它被真正释放。
+func TestFR06aStartFailureReleasesOpenedEntries(t *testing.T) {
+	tcpTarget, stopEcho := startLocalEcho(t)
+	defer stopEcho()
+	udpTarget, stopUDP := startLocalUDPEcho(t)
+	defer stopUDP()
+
+	controlListener, ports := controlAndFourPorts(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	control, err := netip.ParseAddrPort(controlListener.Addr().String())
+	if err != nil {
+		t.Fatalf("解析控制地址失败：%v", err)
+	}
+
+	// 外部占住第三个入口端口（HTTP 入口，TCP 监听），使服务端打开它时失败。
+	// 刻意不占第二个（UDP）：UDP 入口用 UDP 绑定，占用 TCP 端口不会让它失败。
+	blocker, err := net.Listen("tcp", netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(ports[2])).String())
+	if err != nil {
+		t.Fatalf("占用第三个入口端口失败：%v", err)
+	}
+	defer blocker.Close()
+
+	serverEngine := server.New(
+		fr06aServerConfig(t, control, tcpTarget, udpTarget, ports),
+		server.WithListener(controlListener),
+	)
+	if startErr := serverEngine.Start(ctx); startErr == nil {
+		_ = serverEngine.Shutdown(context.Background())
+		t.Fatal("入口端口被占用时 Start 应失败")
+	}
+
+	// 第一个入口端口在失败前已成功打开，失败后必须已被释放。
+	firstAddr := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(ports[0])).String()
+	reclaim, err := net.Listen("tcp", firstAddr)
+	if err != nil {
+		t.Fatalf("已打开的入口未在失败路径释放，端口 %s 仍被占用：%v", firstAddr, err)
+	}
+	_ = reclaim.Close()
+}
+
+// Host 首部携带端口时路由仍必须命中。
+//
+// 回归用例：HTTP/1.1 客户端在非默认端口上会把 Host 写成 `host:port`（标准行为），
+// 而路由表里配置的是裸主机名。此前直接取 Host 原值做等值比较，于是入口端口不是
+// 80 时**几乎所有真实客户端都被判为未匹配**，HTTP 代理在真实场景下不可用。
+func TestFR06aHTTPRoutesWithPortInHostHeader(t *testing.T) {
+	tcpTarget, stopEcho := startLocalEcho(t)
+	defer stopEcho()
+	udpTarget, stopUDP := startLocalUDPEcho(t)
+	defer stopUDP()
+	httpTarget, stopProbe := startHTTPProbe(t)
+	defer stopProbe()
+
+	controlListener, ports := controlAndFourPorts(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	serverEngine := startFourProxyPair(t, ctx, tcpTarget, udpTarget, ports, controlListener, httpTarget)
+
+	guest, err := net.Dial("tcp", serverEngine.GuestAddr("http-echo").String())
+	if err != nil {
+		t.Fatalf("访客连接 HTTP 入口失败：%v", err)
+	}
+	defer guest.Close()
+
+	// Host 带端口：这是真实客户端在非 80 端口上的标准写法。
+	entryAddr := mustAddrPort(t, serverEngine.GuestAddr("http-echo").String())
+	request := "GET /api/v1/users HTTP/1.1\r\nHost: " + fr06aHTTPHost +
+		":" + itoa(int(entryAddr.Port())) + "\r\n\r\n"
+	if _, err := guest.Write([]byte(request)); err != nil {
+		t.Fatalf("写入 HTTP 请求失败：%v", err)
+	}
+	echoed := make([]byte, len(request))
+	if _, err := readFullWithTimeout(guest, echoed); err != nil {
+		t.Fatalf("Host 带端口时路由未命中：%v", err)
+	}
+	marker := make([]byte, len(httpProbeMarker))
+	if _, err := readFullWithTimeout(guest, marker); err != nil {
+		t.Fatalf("未收到目标标记，请求未抵达目标：%v", err)
+	}
+	if string(marker) != httpProbeMarker {
+		t.Fatalf("目标标记不匹配：%q", string(marker))
+	}
+}
+
+// 带正文的请求必须完整送达目标，正文不得被丢弃。
+//
+// 回归用例：首部解析用 bufio 预读，被预读进缓冲的正文既不在回放字节里、也无法
+// 再被后续读取，于是目标收到 Content-Length 却拿不到数据（挂起或 400）。
+func TestFR06aHTTPPreservesRequestBody(t *testing.T) {
+	tcpTarget, stopEcho := startLocalEcho(t)
+	defer stopEcho()
+	udpTarget, stopUDP := startLocalUDPEcho(t)
+	defer stopUDP()
+	httpTarget, stopProbe := startHTTPProbe(t)
+	defer stopProbe()
+
+	controlListener, ports := controlAndFourPorts(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	serverEngine := startFourProxyPair(t, ctx, tcpTarget, udpTarget, ports, controlListener, httpTarget)
+
+	guest, err := net.Dial("tcp", serverEngine.GuestAddr("http-echo").String())
+	if err != nil {
+		t.Fatalf("访客连接 HTTP 入口失败：%v", err)
+	}
+	defer guest.Close()
+
+	body := "HELLO-BODY-PAYLOAD"
+	request := "POST /api HTTP/1.1\r\nHost: " + fr06aHTTPHost +
+		"\r\nContent-Length: " + itoa(len(body)) + "\r\n\r\n" + body
+	if _, err := guest.Write([]byte(request)); err != nil {
+		t.Fatalf("写入 HTTP 请求失败：%v", err)
+	}
+	// 探针按 Content-Length 读回正文并与首部一起回显，因此读满整个请求长度
+	// 即证明正文完整抵达了目标；若正文被丢弃，探针会一直等不到那部分字节。
+	echoed := make([]byte, len(request))
+	if _, err := readFullWithTimeout(guest, echoed); err != nil {
+		t.Fatalf("带正文的请求未完整抵达目标：%v", err)
+	}
+	if string(echoed) != request {
+		t.Fatalf("目标回显与请求不一致：%q", string(echoed))
+	}
+}
+
+// 默认配置下同一 UDP 代理必须能服务多个对端。
+//
+// 回归用例：UDP 按对端地址会话化，每条会话独占一条工作连接并在整个会话生命周期
+// 内持有。工作连接池的默认上限此前是 1，而 UDP 会话上限是 8——于是第 2 个对端起
+// 永远取不到工作连接，表现为"多用户共享一个 UDP 代理时随机只有一个可用"，
+// 与规格 §3.4 的多对端识别能力直接冲突。
+func TestFR06aUDPProxyServesMultiplePeersByDefault(t *testing.T) {
+	tcpTarget, stopEcho := startLocalEcho(t)
+	defer stopEcho()
+	udpTarget, stopUDP := startLocalUDPEcho(t)
+	defer stopUDP()
+
+	controlListener, ports := controlAndFourPorts(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	serverEngine := startFourProxyPair(t, ctx, tcpTarget, udpTarget, ports, controlListener)
+	guestAddr := serverEngine.GuestAddr("udp-echo").String()
+
+	// 三个不同的源端口 = 三个不同对端，各自应能建立会话并完成往返。
+	for index := 0; index < 3; index += 1 {
+		socket, err := net.Dial("udp", guestAddr)
+		if err != nil {
+			t.Fatalf("第 %d 个对端拨号失败：%v", index+1, err)
+		}
+		defer socket.Close()
+
+		payload := []byte("对端 " + itoa(index+1) + " 的数据报")
+		// 首个数据报用于建立会话并等待工作连接就绪，因此允许有限次重发：
+		// 重发是 UDP 的正常语义，重试次数有界，不是等待无限期。
+		// 用既有辅助而非手写读写：它只对读设截止时间，不会把写也置于超时之下。
+		var echoed []byte
+		var lastErr error
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			echoed, lastErr = roundTripUDP(socket, payload, 2*time.Second)
+			if lastErr == nil {
+				break
+			}
+		}
+		if lastErr != nil {
+			t.Fatalf("第 %d 个对端往返失败（默认配置应支持多对端）：%v", index+1, lastErr)
+		}
+		if string(echoed) != string(payload) {
+			t.Fatalf("第 %d 个对端往返内容不一致：%q", index+1, string(echoed))
+		}
+	}
 }

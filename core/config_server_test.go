@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -516,5 +517,58 @@ func TestServerConfigBindingNameBoundary(t *testing.T) {
 				t.Fatalf("期望命中 CodeLimitExceeded 且字段指向绑定名：%v", err)
 			}
 		})
+	}
+}
+
+// 代理名不得包含冒号。
+//
+// 回归用例：运行期用冒号派生共享 HTTP 入口的登记名（形如 `http:<端口>`），
+// 而入口表与代理表共用同一命名空间。允许冒号时名为 `http:<端口>` 的 TCP 代理
+// 会与对应 HTTP 入口撞名——该代理被误判为 HTTP 入口而静默失效，且被覆盖的那个
+// 监听器不再被释放（监听器泄漏，Shutdown 后端口仍可连接）。
+func TestServerConfigBindingNameRejectsColon(t *testing.T) {
+	_, err := core.NewServerConfig(
+		core.WithListen(validListenEndpoint()),
+		core.WithWire(core.WireV1),
+		core.WithClientCredential(validCredential(testCredentialName)),
+		core.WithTCPProxyBinding(validBinding("http:20001", testCredentialName, 6000)),
+	)
+	if err == nil {
+		t.Fatal("含冒号的绑定名必须被拒绝：它会与 HTTP 入口登记名撞名")
+	}
+	assertSingleErrorCode(t, err, core.CodeInvalidName, "bindings[0].name")
+}
+
+// HTTP 路由条数必须按入口端口累计。
+//
+// 回归用例：上限只按单条绑定的主机名个数校验，同端口的多个绑定各自合规却让
+// 实际参与线性匹配的路由数达到限额的若干倍——上限语义与文档口径对不上。
+func TestServerConfigHTTPRouteCountCountsPerPort(t *testing.T) {
+	hosts := make([]string, core.MaxHTTPRouteCount)
+	for index := range hosts {
+		hosts[index] = "host" + strconv.Itoa(index) + ".example.com"
+	}
+
+	// 两条绑定共用同一端口，各占满单绑定上限：端口级总数翻倍，应被拒绝。
+	_, err := core.NewServerConfig(
+		core.WithListen(validListenEndpoint()),
+		core.WithWire(core.WireV1),
+		core.WithClientCredential(validCredential(testCredentialName)),
+		core.WithHTTPProxyBinding(core.HTTPProxyBinding{
+			Name: "first", ClientID: testCredentialName, RemotePort: 7001,
+			Hosts: hosts, Path: "/a",
+			AllowedTargets: []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:22")},
+		}),
+		core.WithHTTPProxyBinding(core.HTTPProxyBinding{
+			Name: "second", ClientID: testCredentialName, RemotePort: 7001,
+			Hosts: hosts, Path: "/b",
+			AllowedTargets: []netip.AddrPort{netip.MustParseAddrPort("127.0.0.1:22")},
+		}),
+	)
+	if err == nil {
+		t.Fatal("同端口的路由总数超限时必须被拒绝")
+	}
+	if !strings.Contains(err.Error(), "路由条数") {
+		t.Fatalf("错误应指明路由条数超限：%v", err)
 	}
 }

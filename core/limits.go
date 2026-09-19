@@ -29,9 +29,17 @@ const DefaultDrainTimeout = 10 * time.Second
 
 // DefaultWorkConnPoolSize 是工作连接池上限为零值时采用的 Core 默认值。
 //
-// 取值 1 表示每个代理同时只有一条工作连接在途：这是当前转发语义下的最小
-// 正确值，放大取值需要上层具备连接复用能力。
-const DefaultWorkConnPoolSize = 1
+// 取值与 UDP 会话上限（DefaultUDPSessionLimit，8）对齐：UDP 代理按对端地址
+// 会话化，每条会话独占一条工作连接并在整个会话生命周期内持有，因此池上限小于
+// 会话上限时，第 2 个对端起就取不到工作连接——表现为"多用户共享一个 UDP 代理
+// 时随机只有一个可用"。取 1（原先的取值）正是这种情形。
+//
+// 对 TCP 与 HTTP 代理，放大该值不改变单访客的连接行为，只允许更多访客同时
+// 建立桥接：客户端按代理名循环补充待命连接，每条连接用一次即释放槽位。
+//
+// 池只记账容量、不预分配连接，因此放大取值不增加空闲资源占用。
+// 上界仍由 MaxWorkConnPoolSize 约束。
+const DefaultWorkConnPoolSize = 8
 
 // MaxWorkConnPoolSize 是单代理工作连接池上限的上界。
 //

@@ -543,7 +543,8 @@ func (engine *Engine) serveOneWorkConn(endpoint core.ServerEndpoint, proxy core.
 		}
 		return
 	}
-	if err := declareWorkConn(work, proxy.ProxyName(), proxy.ProxyLocalAddr()); err != nil {
+	auth := engine.config.Auth()
+	if err := declareWorkConn(work, engine.config.ClientID(), auth.Token, proxy.ProxyName(), proxy.ProxyLocalAddr()); err != nil {
 		_ = work.Close()
 		return
 	}
@@ -600,11 +601,15 @@ func (engine *Engine) serveUDPWorkConn(work *transport.Conn, target netip.AddrPo
 
 // declareWorkConn 在新建的工作连接首帧声明代理归属与本地目标地址，
 // 供服务端配对访客并校验目标地址是否在允许集合内（FR-06a §3.3）。
-func declareWorkConn(work *transport.Conn, proxyName string, target netip.AddrPort) error {
+func declareWorkConn(
+	work *transport.Conn, clientID, token, proxyName string, target netip.AddrPort,
+) error {
 	body, err := json.Marshal(workConnRequest{
-		RunID:  proxyName,
-		Proxy:  proxyName,
-		Target: target.String(),
+		ClientID: clientID,
+		Token:    token,
+		RunID:    proxyName,
+		Proxy:    proxyName,
+		Target:   target.String(),
 	})
 	if err != nil {
 		return err
@@ -622,7 +627,9 @@ func declareWorkConn(work *transport.Conn, proxyName string, target netip.AddrPo
 // target 承载本条工作连接最终转发到的本地目标地址，服务端据此判定目标是否在
 // 该客户端被允许的地址集合内（FR-06a §3.3）。
 type workConnRequest struct {
-	RunID  string `json:"run_id"`
-	Proxy  string `json:"proxy_name"`
-	Target string `json:"target_addr"`
+	ClientID string `json:"client_id"`
+	Token    string `json:"token"`
+	RunID    string `json:"run_id"`
+	Proxy    string `json:"proxy_name"`
+	Target   string `json:"target_addr"`
 }

@@ -110,3 +110,18 @@ func TestHTTPRouterSamePathDifferentHosts(t *testing.T) {
 		t.Fatalf("同路径不同主机应当各自命中：命中 %s 成功 %v", matched, ok)
 	}
 }
+
+// 键拼接不得让不同的主机名与路径组合被判为冲突。
+//
+// 回归用例：冲突检测的键是 `主机名 + 路径` 直接相加，而两者都允许含 `/`，
+// 于是 `a/b.example.com` + `/c` 与 `a` + `/b.example.com/c` 产生同一个键。
+// 这类误判会让路由表构造失败，而该端口的全部请求随之一律 404——配置校验
+// 判定合法、运行期却静默失去路由。
+func TestHTTPRouterAcceptsAmbiguousLookingCombinations(t *testing.T) {
+	if _, err := proxy.NewHTTPRouter([]proxy.HTTPRoute{
+		{Proxy: "first", Host: "a/b.example.com", Path: "/c"},
+		{Proxy: "second", Host: "a", Path: "/b.example.com/c"},
+	}); err != nil {
+		t.Fatalf("这两条路由的主机与路径组合不同，不应被判为冲突：%v", err)
+	}
+}

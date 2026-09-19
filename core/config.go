@@ -174,6 +174,9 @@ func (binding TCPProxyBinding) Type() ProxyType {
 // ProxyName 返回代理名。
 func (binding TCPProxyBinding) ProxyName() string { return binding.Name }
 
+// OwnerClientID 返回该绑定允许接入的客户端标识。
+func (binding TCPProxyBinding) OwnerClientID() string { return binding.ClientID }
+
 // ProxyRemotePort 返回服务端入口端口。
 func (binding TCPProxyBinding) ProxyRemotePort() int { return binding.RemotePort }
 
@@ -201,6 +204,9 @@ func (binding UDPProxyBinding) Type() ProxyType {
 
 // ProxyName 返回代理名。
 func (binding UDPProxyBinding) ProxyName() string { return binding.Name }
+
+// OwnerClientID 返回该绑定允许接入的客户端标识。
+func (binding UDPProxyBinding) OwnerClientID() string { return binding.ClientID }
 
 // ProxyRemotePort 返回服务端入口端口。
 func (binding UDPProxyBinding) ProxyRemotePort() int { return binding.RemotePort }
@@ -239,6 +245,9 @@ func (binding HTTPProxyBinding) Type() ProxyType {
 // ProxyName 返回代理名。
 func (binding HTTPProxyBinding) ProxyName() string { return binding.Name }
 
+// OwnerClientID 返回该绑定允许接入的客户端标识。
+func (binding HTTPProxyBinding) OwnerClientID() string { return binding.ClientID }
+
 // ProxyRemotePort 返回服务端入口端口。
 func (binding HTTPProxyBinding) ProxyRemotePort() int { return binding.RemotePort }
 
@@ -270,6 +279,9 @@ func (binding HTTPSProxyBinding) Type() ProxyType {
 // ProxyName 返回代理名。
 func (binding HTTPSProxyBinding) ProxyName() string { return binding.Name }
 
+// OwnerClientID 返回该绑定允许接入的客户端标识。
+func (binding HTTPSProxyBinding) OwnerClientID() string { return binding.ClientID }
+
 // ProxyRemotePort 返回服务端入口端口。
 func (binding HTTPSProxyBinding) ProxyRemotePort() int { return binding.RemotePort }
 
@@ -287,6 +299,8 @@ type ServerProxyBinding interface {
 	Type() ProxyType
 	// ProxyName 返回代理名。
 	ProxyName() string
+	// OwnerClientID 返回该绑定允许接入的客户端标识。
+	OwnerClientID() string
 	// ProxyRemotePort 返回服务端入口端口。
 	ProxyRemotePort() int
 	// ProxyTargets 返回允许的目标地址集合副本。

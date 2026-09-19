@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -232,16 +231,20 @@ func (engine *Engine) openGuestEntries() (
 	}()
 
 	for _, binding := range engine.config.Bindings() {
-		if guests[binding.Name], err = engine.listenGuest(binding.RemotePort); err != nil {
-			return nil, nil, nil, err
+		opened, listenErr := engine.listenGuest(binding.RemotePort)
+		if listenErr != nil {
+			return guests, addresses, udpEntries, listenErr
 		}
-		addresses[binding.Name] = guests[binding.Name].Addr()
+		guests[binding.Name] = opened
+		addresses[binding.Name] = opened.Addr()
 	}
 	for _, binding := range engine.config.HTTPSBindings() {
-		if guests[binding.Name], err = engine.listenGuest(binding.RemotePort); err != nil {
-			return nil, nil, nil, err
+		opened, listenErr := engine.listenGuest(binding.RemotePort)
+		if listenErr != nil {
+			return guests, addresses, udpEntries, listenErr
 		}
-		addresses[binding.Name] = guests[binding.Name].Addr()
+		guests[binding.Name] = opened
+		addresses[binding.Name] = opened.Addr()
 	}
 	openedPorts := make(map[int]bool)
 	for _, binding := range engine.config.HTTPBindings() {
@@ -250,10 +253,12 @@ func (engine *Engine) openGuestEntries() (
 		}
 		openedPorts[binding.RemotePort] = true
 		name := httpEntryName(binding.RemotePort)
-		if guests[name], err = engine.listenGuest(binding.RemotePort); err != nil {
-			return nil, nil, nil, err
+		opened, listenErr := engine.listenGuest(binding.RemotePort)
+		if listenErr != nil {
+			return guests, addresses, udpEntries, listenErr
 		}
-		addresses[name] = guests[name].Addr()
+		guests[name] = opened
+		addresses[name] = opened.Addr()
 	}
 	// 每个 HTTP 代理都能按自身名查到入口地址：共享的是监听器，代理名到地址的
 	// 映射必须完整，否则宿主与测试无法按代理名寻址。
@@ -261,10 +266,12 @@ func (engine *Engine) openGuestEntries() (
 		addresses[binding.Name] = guests[httpEntryName(binding.RemotePort)].Addr()
 	}
 	for _, binding := range engine.config.UDPBindings() {
-		if udpEntries[binding.Name], err = engine.openUDPEntry(binding.Name, binding.RemotePort); err != nil {
-			return nil, nil, nil, err
+		entry, openErr := engine.openUDPEntry(binding.Name, binding.RemotePort)
+		if openErr != nil {
+			return guests, addresses, udpEntries, openErr
 		}
-		addresses[binding.Name] = udpEntries[binding.Name].Addr()
+		udpEntries[binding.Name] = entry
+		addresses[binding.Name] = entry.Addr()
 	}
 	return guests, addresses, udpEntries, nil
 }
@@ -285,6 +292,11 @@ func (engine *Engine) listenGuest(port int) (*transport.Listener, error) {
 // releaseGuestListeners 释放一批已创建的访客监听器。
 func releaseGuestListeners(guests map[string]*transport.Listener) {
 	for _, listener := range guests {
+		// 跳过未成功打开的条目：调用方的失败分支只登记已打开的监听器，
+		// 但释放路径是安全网，不该因为一个 nil 条目而 panic 掉整个清理流程。
+		if listener == nil {
+			continue
+		}
 		_ = listener.Release()
 	}
 }
@@ -426,6 +438,14 @@ func (engine *Engine) GuestAddr(name string) net.Addr {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	return engine.guestAddr[name]
+}
+
+// RejectedGuests 返回累计因暂存队列达上限而被拒绝的访客连接数。
+//
+// 该计数是宿主观察服务端承接能力的入口：拒绝意味着并发等待用户超过了上限，
+// 是运维需要看到的事件，而不是可以静默吞掉的内部状态。
+func (engine *Engine) RejectedGuests() int64 {
+	return engine.workConns.RejectedGuests()
 }
 
 // log 返回可用的日志器；未注入时返回丢弃日志器。
@@ -649,13 +669,30 @@ func (engine *Engine) failAbnormal(err error) {
 	engine.mu.Unlock()
 }
 
-// serveWorkDeclaration 处理一条工作连接的归属声明、校验目标地址并配对访客。
+// serveWorkDeclaration 处理一条工作连接的归属声明、鉴权、目标校验并配对访客。
 //
-// 目标地址越权在配对之前判定：未通过即关闭工作连接，绝不把越权目标接入数据
-// 面（规格 §3.3）。校验通过后才按有等待访客立即配对、否则暂存的既有语义处理。
+// 工作连接是与控制连接平行的独立连接，服务端无从由连接本身判断归属，因此声明
+// 必须携带鉴权材料（PROTOCOL §7 第 2、3 步）。缺少这一步时，任何能连上控制端口
+// 的对端都能声明任意代理名：既能与真实访客配对并读取其数据，也能借该代理名触发
+// 配对中心的副作用（例如释放该代理的暂存访客）。
+//
+// 三级校验按顺序执行，任一失败都关闭连接且不产生副作用：鉴权材料 → 代理归属 →
+// 目标地址允许集合。归属校验先于目标校验，使未认证对端无法借"越权目标"这一
+// 分支触碰配对中心。
 func (engine *Engine) serveWorkDeclaration(raw *transport.Conn, payload []byte) {
 	declaration, err := parseWorkDeclaration(payload)
 	if err != nil {
+		_ = raw.Close()
+		return
+	}
+	if !engine.credentialsMatch(declaration.clientID, declaration.token) {
+		engine.log().Warn("工作连接的鉴权材料无效，已拒绝")
+		_ = raw.Close()
+		return
+	}
+	if !engine.registry.ProxyBelongsTo(declaration.proxy, declaration.clientID) {
+		engine.log().Warn("工作连接声明的代理不属于该客户端，已拒绝",
+			"proxy", declaration.proxy)
 		_ = raw.Close()
 		return
 	}
@@ -664,22 +701,51 @@ func (engine *Engine) serveWorkDeclaration(raw *transport.Conn, payload []byte) 
 			"proxy", declaration.proxy, "target", declaration.target.String())
 		_ = raw.Close()
 		// 该代理的暂存访客同样要释放：它们等的是刚被拒绝的工作连接，
-		// 继续留在队列里只会被永久悬挂。
-		if dropped := engine.workConns.dropGuests(declaration.proxy); dropped > 0 {
+		// 继续留在队列里只会被永久悬挂。此处已通过鉴权与归属校验，
+		// 因此释放只可能由该代理的合法客户端触发。
+		//
+		// 逐个 untrack 必须在锁外进行（dropGuests 返回后）：untrack 取 Engine 锁，
+		// 在 broker 锁内回调会与 Shutdown 构成 ABBA。漏掉这一步会让已关闭的连接
+		// 永久留在活动集合里，引擎长跑时单调增长。
+		if dropped := engine.workConns.dropGuests(declaration.proxy); len(dropped) > 0 {
+			for _, conn := range dropped {
+				engine.untrack(conn)
+			}
 			engine.log().Warn("目标越权已拒绝工作连接，同时释放等待配对的访客",
-				"proxy", declaration.proxy, "访客数", dropped)
+				"proxy", declaration.proxy, "访客数", len(dropped))
 		}
 		return
 	}
-	if !engine.workConns.park(declaration.proxy, raw, engine.track, engine.wg.Add) {
+	// park 只做配对决策，登记与桥接在 broker 锁外完成（见 pairing 的说明）。
+	accepted, pair := engine.workConns.park(declaration.proxy, raw)
+	if !accepted {
 		_ = raw.Close()
+		return
 	}
+	if pair != nil {
+		pair.start(engine.track, engine.wg.Add)
+	}
+}
+
+// credentialsMatch 判断客户端标识与令牌是否与服务端配置的凭据一致。
+func (engine *Engine) credentialsMatch(clientID, token string) bool {
+	if clientID == "" || token == "" {
+		return false
+	}
+	for _, credential := range engine.config.Credentials() {
+		if credential.ClientID == clientID && credential.Token == token {
+			return true
+		}
+	}
+	return false
 }
 
 // workDeclaration 是一条工作连接声明的解出结果。
 type workDeclaration struct {
-	proxy  string
-	target netip.AddrPort
+	clientID string
+	token    string
+	proxy    string
+	target   netip.AddrPort
 }
 
 // parseWorkDeclaration 解析工作连接声明载荷，返回代理归属与本地目标地址。
@@ -690,6 +756,10 @@ func parseWorkDeclaration(payload []byte) (workDeclaration, error) {
 	if err := json.Unmarshal(payload, &request); err != nil {
 		return workDeclaration{}, err
 	}
+	// 鉴权材料与代理名都是必填：缺失即拒绝，不进入后续任何校验或配对流程。
+	if request.ClientID == "" || request.Token == "" {
+		return workDeclaration{}, errors.New("工作连接缺少鉴权材料")
+	}
 	if request.Proxy == "" {
 		return workDeclaration{}, errors.New("工作连接未声明代理归属")
 	}
@@ -697,7 +767,12 @@ func parseWorkDeclaration(payload []byte) (workDeclaration, error) {
 	if err != nil {
 		return workDeclaration{}, errors.New("工作连接声明的目标地址不可解析")
 	}
-	return workDeclaration{proxy: request.Proxy, target: target}, nil
+	return workDeclaration{
+		clientID: request.ClientID,
+		token:    request.Token,
+		proxy:    request.Proxy,
+		target:   target,
+	}, nil
 }
 
 // loginPayload 是 wire v1 登录载荷的最小形态。
@@ -825,17 +900,27 @@ func (engine *Engine) isStopped() bool {
 func (engine *Engine) handleGuest(name string, guest *transport.Conn) {
 	defer engine.wg.Done()
 	engine.track(guest)
-	// parkGuest 接管访客的所有权，结果三态区分处置方式（见 parkOutcome）：
-	// 已配对时桥接负责关闭，已暂存时留在配对中心，被拒时由此处关闭。
-	switch engine.workConns.parkGuest(name, guest, engine.track, engine.wg.Add) {
+	// parkGuest 只做配对决策，不在其锁内登记连接——那会与 Shutdown 的锁序
+	// 构成死锁。登记与启动桥接在此处、broker 锁之外完成。
+	outcome, pair := engine.workConns.parkGuest(name, guest, nil)
+	switch outcome {
 	case parkPaired:
+		// 访客与工作连接都由 start 重新登记，先撤回此处为访客做的登记。
 		engine.untrack(guest)
+		pair.start(engine.track, engine.wg.Add)
 	case parkStaged:
 		// 连接留在配对中心，Shutdown 与 close 负责最终释放。
 		// untrack 不在此处调用，避免重复记账：配对中心的关闭路径统一处理。
-	default:
+	case parkRejected:
 		engine.untrack(guest)
 		_ = guest.Close()
+	case parkCapacityFull:
+		// 容量拒绝必须可见：否则"访客连不上"会被当成客户端问题，而真实原因是
+		// 服务端到达了承接上限。
+		engine.untrack(guest)
+		_ = guest.Close()
+		engine.log().Warn("该代理的等待访客已达上限，拒绝新访客",
+			"proxy", name, "累计拒绝", engine.workConns.RejectedGuests())
 	}
 }
 
@@ -847,8 +932,9 @@ func (engine *Engine) publishRegistry() {
 	registry := make(proxy.Registry)
 	for _, binding := range engine.config.AllBindings() {
 		registry[binding.ProxyName()] = &proxy.Binding{
-			Name:    binding.ProxyName(),
-			Targets: binding.ProxyTargets(),
+			Name:          binding.ProxyName(),
+			OwnerClientID: binding.OwnerClientID(),
+			Targets:       binding.ProxyTargets(),
 		}
 	}
 	engine.registry.Publish(registry)
@@ -932,48 +1018,62 @@ func (engine *Engine) serveUDPEntry(name string, entry *proxy.UDPProxy) {
 // 请求行与首部必须先读出来才能路由，但这些字节属于请求本身，因此路由命中后
 // 要原样回放到桥接流上：漏掉回放会让目标服务收到一个被截断的请求。
 // 未匹配时返回明确的 404 且响应体不回显内部路由表；此后关闭连接，不留悬挂。
+//
+// 访客的记账在移交配对中心时一并移交（见 bridgeHTTPGuest），因此本函数不设
+// defer untrack：那会在桥接接管记账之后把登记撤掉，使活动连接脱离 Shutdown 的
+// 排水等待。
 func (engine *Engine) handleHTTPGuest(port int, guest *transport.Conn) {
 	defer engine.wg.Done()
 	engine.track(guest)
-	defer engine.untrack(guest)
 
 	host, path, pending, err := readRequestTarget(guest)
 	if err != nil {
+		engine.untrack(guest)
 		_ = guest.Close()
 		return
 	}
 	proxyName, ok := engine.selectHTTPProxy(port, host, path)
 	if !ok {
 		_ = writeUnmatchedResponse(guest)
+		engine.untrack(guest)
 		_ = guest.Close()
 		return
 	}
 	engine.bridgeHTTPGuest(proxyName, guest, pending)
 }
 
-// bridgeHTTPGuest 把已解析出代理的访客连接交给配对中心，并回放请求首部。
-//
-// 回放先于桥接：配对中心一旦把连接交给桥接，本函数就不再持有它，因此必须
-// 在移交前把已读出的字节写回同一条连接的方向。
 // bridgeHTTPGuest 把已判定路由的 HTTP 访客交给配对中心。
 //
-// 请求首部在此处已经回放给访客，因此被拒时只能关闭连接，无法再返回 503：
-// 对端已收到请求的首部，此时追加任何响应都会破坏它的解析。
+// 请求首部在解析路由时已从访客连接读走，必须随访客一起交给配对中心保管：配对
+// 时它要补写到**通往目标的连接**（写回访客会让目标收到空请求、访客收到自己请求
+// 的回声），未配对时它随访客一起暂存等后续工作连接。
+//
+// 访客的登记已由 handleHTTPGuest 完成（它 defer 了 untrack），本函数不再重复
+// track：桥接启动时 pairing.start 会为这一对连接重新登记，而调用方的 defer
+// untrack 在桥接登记之后执行会把它撤掉——因此这里先把访客从本函数的记账中
+// 移出，交由 pairing 接管。
 func (engine *Engine) bridgeHTTPGuest(proxyName string, guest *transport.Conn, pending []byte) {
-	if len(pending) > 0 {
-		if _, err := guest.Write(pending); err != nil {
-			_ = guest.Close()
-			return
-		}
-	}
-	switch engine.workConns.parkGuest(proxyName, guest, engine.track, engine.wg.Add) {
+	// parkGuest 只做决策，登记与桥接在 broker 锁外完成（见 pairing 的说明）。
+	outcome, pair := engine.workConns.parkGuest(proxyName, guest, pending)
+	switch outcome {
 	case parkPaired:
 		engine.untrack(guest)
+		// 首部未能送达目标时 pairing.start 已关闭两端，此处的返回值无需额外处理。
+		pair.start(engine.track, engine.wg.Add)
 	case parkStaged:
-		// 连接留在配对中心，Shutdown 与 close 负责最终释放。
-	default:
+		// 访客与首部都留在配对中心，等后续工作连接到达时配对。
+		// 配对中心会在配对或关闭时接管访客的记账，因此这里同样撤掉调用方的登记。
+		engine.untrack(guest)
+	case parkRejected:
 		engine.untrack(guest)
 		_ = guest.Close()
+	case parkCapacityFull:
+		// 容量拒绝必须可见：否则"访客连不上"会被当成客户端问题，而真实原因是
+		// 服务端到达了承接上限。
+		engine.untrack(guest)
+		_ = guest.Close()
+		engine.log().Warn("该代理的等待访客已达上限，拒绝新访客",
+			"proxy", proxyName, "累计拒绝", engine.workConns.RejectedGuests())
 	}
 }
 
@@ -1030,41 +1130,110 @@ const engineRequestReadTimeout = 10 * time.Second
 // 只读请求行与 Host 首部，不解析正文。请求行与首部属于请求本身，必须原样
 // 随后续字节流转发给目标服务，因此本函数把它们原样返回供回放。
 // 读取带截止时间，绝不无限等待。
+// readRequestTarget 读取请求行与首部，返回路由所需的主机与路径以及**已消费的
+// 原始字节**（供后续补写给目标），不读取也不丢弃首部之后的任何字节。
+//
+// 逐字节读取而非用 bufio：bufio 会预读整块，而预读到的字节既不属于 pending、
+// 也无法再被后续的桥接读回——带正文的请求会因此丢掉正文（目标收到
+// Content-Length 却拿不到数据）。逐字节读取保证"读到的就是消费掉的"。
+// 首部通常仅数百字节且每连接只读一次，系统调用开销可接受。
+//
+// 上限是真实生效的：累计字节数超过 requestLineLimit 即按非法请求拒绝。
+// 用 bufio.ReadString 时该常量只是缓冲大小，超长首部会被无界累积。
 func readRequestTarget(guest *transport.Conn) (host, path string, pending []byte, err error) {
 	if deadlineErr := guest.SetReadDeadline(time.Now().Add(engineRequestReadTimeout)); deadlineErr != nil {
 		return "", "", nil, deadlineErr
 	}
 	defer func() { _ = guest.SetReadDeadline(time.Time{}) }()
 
-	reader := bufio.NewReaderSize(guest, requestLineLimit)
-	line, err := reader.ReadString(delimCRLF)
+	head, err := readHeaderBlock(guest)
 	if err != nil {
 		return "", "", nil, err
 	}
-	fields := strings.Fields(line)
+	lines := strings.Split(head, headerEndLF)
+	if len(lines) == 0 {
+		return "", "", nil, errors.New("请求为空")
+	}
+	fields := strings.Fields(lines[0])
 	if len(fields) < 2 {
 		return "", "", nil, errors.New("请求行缺少方法或目标")
 	}
 	path = requestPath(fields[1])
-	pending = append(pending, line...)
-	// Host 首部：逐行读到空行，只取 Host，其余首部随缓冲一并回放。
-	for {
-		header, err := reader.ReadString(delimCRLF)
-		if err != nil {
-			return "", "", nil, err
-		}
-		pending = append(pending, header...)
-		if header == headerEndCRLF || header == headerEndLF {
-			break
-		}
-		if name, value, ok := splitHeader(header); ok && strings.EqualFold(name, "Host") {
-			host = value
+	for _, line := range lines[1:] {
+		name, value, ok := splitHeader(line)
+		if ok && strings.EqualFold(name, "Host") {
+			host = normalizeHost(value)
 		}
 	}
 	if host == "" {
 		return "", "", nil, errors.New("请求缺少 Host 首部")
 	}
-	return host, path, pending, nil
+	return host, path, []byte(head), nil
+}
+
+// readHeaderBlock 逐字节读入首部块，直到空行；返回的字节原样包含行尾。
+//
+// 不预读是刻意的：首部之后可能紧跟请求正文，任何预读都会让那部分字节既不在
+// 返回值里、也无法再被后续读取。上限判定基于实际累计字节数。
+func readHeaderBlock(guest *transport.Conn) (string, error) {
+	var block []byte
+	buffer := make([]byte, 1)
+	for len(block) <= requestLineLimit {
+		if _, err := io.ReadFull(guest, buffer); err != nil {
+			return "", err
+		}
+		block = append(block, buffer[0])
+		if headerBlockComplete(block) {
+			return string(block), nil
+		}
+	}
+	return "", fmt.Errorf("请求首部超过 %d 字节上限", requestLineLimit)
+}
+
+// headerBlockComplete 判断已读字节是否构成完整的首部块。
+//
+// 判据是**空行**而不只是行尾：单看 `\n` 会让第一行就被误判成结束。三种行尾
+// 组合都接受（CRLFCRLF、LFLF、以及混用），与既有解析保持同一宽容度。
+func headerBlockComplete(block []byte) bool {
+	length := len(block)
+	if length >= 4 &&
+		block[length-4] == '\r' && block[length-3] == '\n' &&
+		block[length-2] == '\r' && block[length-1] == '\n' {
+		return true
+	}
+	if length >= 2 && block[length-2] == '\n' && block[length-1] == '\n' {
+		return true
+	}
+	if length >= 3 && block[length-3] == '\n' && block[length-2] == '\r' && block[length-1] == '\n' {
+		return true
+	}
+	if length >= 3 && block[length-3] == '\r' && block[length-2] == '\n' && block[length-1] == '\n' {
+		return true
+	}
+	return false
+}
+
+// normalizeHost 从 Host 首部取出主机名部分。
+//
+// HTTP/1.1 客户端在非默认端口上会把 Host 写成 `host:port`——这是标准行为而非
+// 异常输入。路由表里配置的是裸主机名，若不做这一步，所有带端口的真实请求都会
+// 被判为未匹配。IPv6 字面量形如 `[::1]:8080`，需要连同方括号一起保留。
+func normalizeHost(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return ""
+	}
+	// IPv6 字面量：方括号内的内容才是主机，端口在括号之后。
+	if strings.HasPrefix(trimmed, "[") {
+		if end := strings.Index(trimmed, "]"); end >= 0 {
+			return trimmed[:end+1]
+		}
+		return trimmed
+	}
+	if colon := strings.LastIndex(trimmed, ":"); colon >= 0 {
+		return trimmed[:colon]
+	}
+	return trimmed
 }
 
 // requestPath 从请求目标中取出路径部分，去掉查询串与片段标识。

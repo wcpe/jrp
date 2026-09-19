@@ -280,3 +280,97 @@ func writeAll(target net.Conn, data []byte) error {
 	_, err := target.Write(data)
 	return err
 }
+
+// 入口复用读取缓冲时，已入队的数据报内容不得被后续读取覆写。
+//
+// 回归用例：入口用固定缓冲反复读取，若入队时不复制，队列里尚未处理的数据报会
+// 在下一次读取时被就地改写。跨对端时这会让 A 会话交付 A 的内容变成 B 的载荷，
+// 既是数据损坏也是跨用户数据串扰。
+func TestDeliverCopiesDatagramBuffer(t *testing.T) {
+	session, peerSide, _ := newTestSession(t, time.Second, 4096)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go session.Serve(ctx)
+
+	// net.Pipe 无缓冲：测试端不读时，会话的转发会阻塞，后续数据报积压在队列。
+	first := []byte("AAAAAAAAAAAAAAAA")
+	if !session.Deliver(first) {
+		t.Fatal("首个数据报应被接受")
+	}
+	second := []byte("BBBBBBBBBBBBBBBB")
+	if !session.Deliver(second) {
+		t.Fatal("第二个数据报应被接受")
+	}
+
+	// 模拟入口循环复用同一缓冲：就地覆写，这不应影响已入队的内容。
+	first = append(first[:0], []byte("CCCCCCCCCCCCCCCC")...)
+	second = append(second[:0], []byte("DDDDDDDDDDDDDDDD")...)
+
+	// 逐个读出：内容必须是最初投递的 A 与 B，而不是覆写后的 C 与 D。
+	// 工作连接上走的是线协议帧，用 readDatagram 解出载荷。
+	firstPayload, err := readDatagram(peerSide, 4096)
+	if err != nil {
+		t.Fatalf("读取首个数据报失败：%v", err)
+	}
+	if got := string(firstPayload); got != "AAAAAAAAAAAAAAAA" {
+		t.Fatalf("首个数据报内容被覆写：期望 AAAAAAAAAAAAAAAA，实际 %q", got)
+	}
+
+	secondPayload, err := readDatagram(peerSide, 4096)
+	if err != nil {
+		t.Fatalf("读取第二个数据报失败：%v", err)
+	}
+	if got := string(secondPayload); got != "BBBBBBBBBBBBBBBB" {
+		t.Fatalf("第二个数据报内容被覆写：期望 BBBBBBBBBBBBBBBB，实际 %q", got)
+	}
+}
+
+// 超限数据报之后入口必须继续服务。
+//
+// 回归用例：Windows 的 recvfrom 对大于接收缓冲的数据报返回 WSAEMSGSIZE（非超时
+// 错误），而 Serve 把任何非超时读错误都当作致命错误直接返回——单个超限数据报即
+// 让整个入口永久停止，任何能向入口发包的第三方都能用一个包触发它。
+//
+// 既有用例只断言 Oversized 计数，未验证入口存活：在 Windows 上该计数永远为 0
+// （超限分支不可达），却因"数据报不被接受"而恰好满足"不应建立会话"的断言。
+func TestUDPProxyOversizedDatagramDoesNotStopEntry(t *testing.T) {
+	port, err := transport.ListenUDP(netip.MustParseAddrPort("127.0.0.1:0"))
+	if err != nil {
+		t.Fatalf("打开 UDP 入口失败：%v", err)
+	}
+	entry := proxy.NewUDPProxy(proxy.UDPProxyConfig{
+		Name:        "syslog",
+		Port:        port,
+		Idle:        time.Second,
+		MaxSessions: 4,
+		MaxDatagram: 100,
+		Work:        pipeWork(t),
+	})
+	t.Cleanup(func() { _ = entry.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go entry.Serve(ctx)
+
+	client, err := net.Dial("udp", port.Addr().String())
+	if err != nil {
+		t.Fatalf("拨号 UDP 入口失败：%v", err)
+	}
+	defer client.Close()
+
+	// 先发一个超限数据报。
+	if _, err := client.Write(make([]byte, 2000)); err != nil {
+		t.Fatalf("写入超限数据报失败：%v", err)
+	}
+	waitFor(t, func() bool { return entry.Oversized() >= 1 }, "超限数据报应当被丢弃并计数")
+
+	// 入口必须仍然服务：再发正常数据报应能建立会话。
+	second, err := net.Dial("udp", port.Addr().String())
+	if err != nil {
+		t.Fatalf("第二次拨号失败：%v", err)
+	}
+	defer second.Close()
+	if _, err := second.Write(make([]byte, 50)); err != nil {
+		t.Fatalf("写入正常数据报失败：%v", err)
+	}
+	waitFor(t, func() bool { return entry.Sessions() >= 1 }, "超限数据报之后入口应当继续服务")
+}

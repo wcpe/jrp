@@ -143,6 +143,10 @@ func validateServerBindings(config ServerConfig) []*ConfigError {
 		problems = append(problems, validateHTTPPath(field+"path", binding.Path)...)
 		problems = append(problems, validateBindingClient(field+"clientID", binding.ClientID, knownClients)...)
 	}
+	// 路由条数按**入口端口**累计：多个 HTTP 代理共享同一端口时，参与线性匹配的
+	// 是它们的主机名与路径组合之和，而上限的语义正是约束这个规模。
+	// 只按单条绑定校验会让同端口的路由总数达到限额的若干倍。
+	problems = append(problems, validateHTTPRouteCountPerPort(config.httpBindings)...)
 	for index, binding := range config.httpsBindings {
 		field := itemField("httpsBindings", index)
 		problems = append(problems, validateName(field+"name", binding.Name)...)
@@ -219,6 +223,27 @@ func validateAllowedTargets(field string, targets []netip.AddrPort) []*ConfigErr
 	problems := make([]*ConfigError, 0, len(targets))
 	for index, target := range targets {
 		problems = append(problems, validateTargetAddress(itemField(field, index), target)...)
+	}
+	return problems
+}
+
+// validateHTTPRouteCountPerPort 按入口端口累计 HTTP 路由条数并校验上限。
+//
+// 路由条数是"主机名 × 路径"参与线性匹配的规模：每个主机名各成一条路由，
+// 共用同一端口的多个代理会累加。只按单条绑定校验时，N 个各带 256 个主机名的
+// 绑定能同时通过，而同端口实际有 256N 条路由参与匹配。
+func validateHTTPRouteCountPerPort(bindings []HTTPProxyBinding) []*ConfigError {
+	counts := make(map[int]int)
+	for _, binding := range bindings {
+		counts[binding.RemotePort] += len(binding.Hosts)
+	}
+	problems := make([]*ConfigError, 0)
+	for port, count := range counts {
+		if count > MaxHTTPRouteCount {
+			problems = append(problems, newConfigError(CodeLimitExceeded,
+				"httpBindings[remotePort="+strconv.Itoa(port)+"]",
+				"该入口端口的路由条数超出上限 "+strconv.Itoa(MaxHTTPRouteCount)))
+		}
 	}
 	return problems
 }
@@ -455,6 +480,13 @@ func validateName(field, name string) []*ConfigError {
 	if len(name) > MaxProxyNameLength {
 		return []*ConfigError{newConfigError(CodeLimitExceeded, field,
 			"名称长度超出上限 "+strconv.Itoa(MaxProxyNameLength)+" 字节")}
+	}
+	// 代理名不得含冒号：运行期用它派生共享 HTTP 入口的登记名
+	// （形如 `http:<端口>`），而入口表与代理表共用同一命名空间。允许冒号时，
+	// 名为 `http:<端口>` 的 TCP 代理会与对应 HTTP 入口撞名——轻则代理被误判为
+	// HTTP 入口而静默失效，重则被覆盖的那个监听器不再被释放（监听器泄漏）。
+	if strings.Contains(name, ":") {
+		return []*ConfigError{newConfigError(CodeInvalidName, field, "名称不得包含冒号")}
 	}
 	return nil
 }

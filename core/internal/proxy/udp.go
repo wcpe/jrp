@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -98,6 +99,11 @@ func (session *UDPSession) Dropped() int64 {
 //
 // 返回假表示未接受：会话已结束、数据报超限或队列已满；后两者计入丢弃计数。
 // 超限判定先于任何分配，绝不按声明长度无界分配（规格 §3.4）。
+//
+// 入队前必须复制：入口以固定缓冲反复读取，调用方传进来的切片在下一次读取时
+// 会被就地覆写。若不复制，队列里尚未处理的数据报内容会被后续数据报（可能是
+// 另一个对端的）覆盖——既是数据损坏，也是跨用户的数据串扰。
+// 复制只在上限校验通过后进行，超限的数据报直接丢弃、不做无谓分配。
 func (session *UDPSession) Deliver(datagram []byte) bool {
 	select {
 	case <-session.done:
@@ -108,8 +114,10 @@ func (session *UDPSession) Deliver(datagram []byte) bool {
 		session.dropped.Add(1)
 		return false
 	}
+	owned := make([]byte, len(datagram))
+	copy(owned, datagram)
 	select {
-	case session.inbound <- datagram:
+	case session.inbound <- owned:
 		return true
 	default:
 		session.dropped.Add(1)
@@ -168,6 +176,13 @@ func (session *UDPSession) readResponses(report chan<- error) {
 		if !decoded {
 			report <- errDatagramInvalid
 			return
+		}
+		// 回传方向同样受数据报上限约束：规格要求数据报大小受上限约束、超限丢弃
+		// 并计数，而该约束若只作用于入口方向，超过配置上限的数据报仍会被写入
+		// UDP 对端（可能触发 EMSGSIZE，或超出对端预期的缓冲区大小），且不被计数。
+		if len(datagram) > session.maxDatagram {
+			session.dropped.Add(1)
+			continue
 		}
 		if err := session.send(session.peer, datagram); err != nil {
 			report <- err
@@ -298,6 +313,11 @@ func (entry *UDPProxy) Serve(ctx context.Context) {
 		}
 		read, peer, err := entry.port.Read(buffer)
 		if err != nil {
+			// 读错误分三类：超时（正常轮转）、数据报超限（须丢弃并继续）、
+			// 其余（入口已关闭或真正异常）。
+			if entry.isClosed() {
+				return
+			}
 			var netErr net.Error
 			if isNetError(err, &netErr) && netErr.Timeout() {
 				if serveCtx.Err() != nil {
@@ -305,6 +325,16 @@ func (entry *UDPProxy) Serve(ctx context.Context) {
 				}
 				continue
 			}
+			if isOversizedDatagramError(err) {
+				// Windows 的 recvfrom 对大于缓冲的数据报返回 WSAEMSGSIZE，
+				// 而 Linux/BSD 会截断并正常返回。不识别这一形态时，单个超限
+				// 数据报就会让整个入口永久停止服务——任何能发包的第三方都能
+				// 用一个包触发它。
+				entry.countOversized()
+				continue
+			}
+			// 其余错误按致命处理：但先确认入口是否仍应运行，避免把一次
+			// 瞬时错误当成终止条件。
 			return
 		}
 		if read > entry.maxDatagram {
@@ -313,6 +343,33 @@ func (entry *UDPProxy) Serve(ctx context.Context) {
 		}
 		entry.dispatch(serveCtx, peer, buffer[:read])
 	}
+}
+
+// isOversizedDatagramError 判断读错误是否表示"数据报超出接收缓冲"。
+//
+// 这类错误在语义上等同于"数据报超限"，应当丢弃并继续；把它当致命错误会让
+// 单个超限包终止整个入口。按错误文本识别是因为该错误码（WSAEMSGSIZE）没有
+// 跨平台的标准库常量，按平台分文件又会把同一逻辑分散到多处。
+func isOversizedDatagramError(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := err.Error()
+	// Windows 的 wsarecvfrom 错误文本；Linux/BSD 在截断语义下不产生错误，
+	// 因此该分支只在真正会返回错误的平台上命中。
+	return strings.Contains(text, "larger than the internal message buffer") ||
+		strings.Contains(text, "message too long") ||
+		strings.Contains(text, "Message too long")
+}
+
+// isClosed 报告入口是否已被关闭。
+//
+// 用于区分"入口被关闭"与"读操作出错"：前者是正常的终止条件，后者不应被当作
+// 继续循环的理由，也不该在入口已关闭后再纠缠错误归类。
+func (entry *UDPProxy) isClosed() bool {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	return entry.closed
 }
 
 // dispatch 把一个数据报交给对应会话，必要时建立新会话。

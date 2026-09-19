@@ -9,15 +9,18 @@ import (
 
 // maxPendingGuest 是单代理等待配对的访客连接数上限。
 //
-// 访客只在"工作连接恰好还没到"时排队：一旦工作连接到达即立刻配对，因此队列
-// 长度代表瞬时竞态下的排队数，而不是并发用户数。取 16 是给足余量以吸收
-// "工作连接批量到达前的瞬时堆积"，同时对连接洪水保持有界。
+// 取值要覆盖"并发等待用户数"，而不只是瞬时竞态：工作连接池的默认上限是 1
+// （DefaultWorkConnPoolSize），每条桥接在整个连接生命周期内独占一个槽位，
+// 因此同一代理上第 2 个及以后的在线用户必然排队。此前按"队列长度只是瞬时竞态
+// 排队数"取 16，实际会在 17 个并发用户时开始拒绝——那是代理服务的正常负载，
+// 不是异常。
 //
-// 不开放为配置项：它是内部竞态缓冲而非宿主需要调优的资源配额，开放只会增加
+// 取 64：足以覆盖默认池上限下的常见并发等待，同时对连接洪水保持有界。
+// 不开放为配置项——它是内部的连接接纳上限而非宿主调优的配额，开放只会增加
 // 一个可能被误设的旋钮（误设为 0 或 1 会让正常配对也开始失败）。
 // 也刻意不复用 IdleWorkConnLimit：两者语义相反——待命工作连接由客户端循环补充，
 // 回收最旧的无损失；访客是真实用户连接，拒绝有损。
-const maxPendingGuest = 16
+const maxPendingGuest = 64
 
 // parkOutcome 是访客暂存的结果。
 //
@@ -32,8 +35,13 @@ const (
 	parkPaired parkOutcome = iota
 	// parkStaged 表示已暂存，调用方不得关闭该连接。
 	parkStaged
-	// parkRejected 表示未被接纳（引擎已停止或暂存已达上限），调用方必须关闭该连接。
+	// parkRejected 表示引擎已停止，不再接纳任何连接，调用方必须关闭它。
 	parkRejected
+	// parkCapacityFull 表示该代理的暂存队列已达上限，调用方必须关闭该连接。
+	//
+	// 与 parkRejected 分开是为了让拒绝原因可被记录：容量拒绝是运维需要看见的
+	// 事件（它意味着并发等待用户超过了承接能力），而引擎停止是正常终止。
+	parkCapacityFull
 )
 
 // workBroker 按代理名管理访客与工作连接的双向暂存配对。
@@ -45,7 +53,7 @@ const (
 // 连接全部关闭，不留悬挂 goroutine。
 type workBroker struct {
 	mu     sync.Mutex
-	guests map[string][]*transport.Conn
+	guests map[string][]stagedGuest
 	works  *transport.StagedWorkConns
 	closed bool
 
@@ -58,9 +66,55 @@ type workBroker struct {
 // idleLimit 是单个代理允许暂存的待命工作连接上限，来自配置快照。
 func newWorkBroker(idleLimit int) *workBroker {
 	return &workBroker{
-		guests: make(map[string][]*transport.Conn),
+		guests: make(map[string][]stagedGuest),
 		works:  transport.NewStagedWorkConns(idleLimit),
 	}
+}
+
+// stagedGuest 是队列中等待配对的一条访客连接。
+//
+// pending 是该访客已被读走、但尚未送达目标的字节（HTTP 入口解析路由时读走的
+// 请求首部）。它必须在配对时补写到工作连接方向——丢掉它会让目标收到一个被
+// 截断的请求，而写回访客则会让目标收到空请求。
+type stagedGuest struct {
+	conn    *transport.Conn
+	pending []byte
+}
+
+// pairing 是一对等待桥接的连接。
+//
+// 配对决策由 broker 在自身锁内做出，但登记活动连接要取 Engine 的锁。若在持
+// broker 锁时去取 Engine 锁，就与 Shutdown 的锁序（先 Engine 后 broker）构成
+// ABBA 死锁。因此 broker 只把配对结果交回调用方，由调用方在锁外完成登记与启动。
+type pairing struct {
+	guest *transport.Conn
+	work  *transport.Conn
+	// pending 是配对前需先写入工作连接的字节（见 stagedGuest）。
+	pending []byte
+}
+
+// start 在调用方上下文中登记并启动一对已配对的连接。
+//
+// 必须在 broker 锁之外调用：track 与 add 会取 Engine 的锁。
+// 返回假表示待补写的字节未能送出，此时连接对已关闭，调用方不应再启动桥接。
+func (pair pairing) start(track func(*transport.Conn), add func(int)) bool {
+	if len(pair.pending) > 0 {
+		if _, err := pair.work.Write(pair.pending); err != nil {
+			// 写不进去说明目标侧已不可用，这一对连接都没有继续的意义。
+			_ = pair.guest.Close()
+			_ = pair.work.Close()
+			return false
+		}
+	}
+	track(pair.guest)
+	track(pair.work)
+	add(1)
+	go func() {
+		defer add(-1)
+		defer untrackBoth(track, pair.guest, pair.work)
+		transport.Bridge(context.Background(), pair.guest, pair.work)
+	}()
+	return true
 }
 
 // parkGuest 暂存一个访客；若已有待命工作连接，立即配对。
@@ -71,28 +125,24 @@ func newWorkBroker(idleLimit int) *workBroker {
 // 达到暂存上限时拒绝新访客而不是回收最旧的：访客是真实用户的连接，回收等于
 // 静默掐断一个正在等待的用户，且队列正常长度是瞬时竞态排队数而非并发用户数，
 // 达到上限本身说明出现了异常。已有访客不受影响（与 UDP 会话上限同一口径）。
-// 配对成功后桥接纳入 Engine 的 WaitGroup，由 Shutdown 按排水上限等待。
-func (broker *workBroker) parkGuest(
-	proxyName string,
-	guest *transport.Conn,
-	track func(*transport.Conn),
-	add func(int),
-) parkOutcome {
+//
+// 配对成功时不在本函数内启动桥接：那需要在持 broker 锁时取 Engine 锁，会与
+// Shutdown 构成死锁。调用方须用返回的 pairing 在锁外调用 start。
+func (broker *workBroker) parkGuest(proxyName string, guest *transport.Conn, pending []byte) (parkOutcome, pairing) {
 	broker.mu.Lock()
 	defer broker.mu.Unlock()
 	if broker.closed {
-		return parkRejected
+		return parkRejected, pairing{}
 	}
 	if work := broker.works.Take(proxyName); work != nil {
-		broker.startBridge(guest, work, track, add)
-		return parkPaired
+		return parkPaired, pairing{guest: guest, work: work, pending: pending}
 	}
 	if len(broker.guests[proxyName]) >= maxPendingGuest {
 		broker.rejectedGuests++
-		return parkRejected
+		return parkCapacityFull, pairing{}
 	}
-	broker.guests[proxyName] = append(broker.guests[proxyName], guest)
-	return parkStaged
+	broker.guests[proxyName] = append(broker.guests[proxyName], stagedGuest{conn: guest, pending: pending})
+	return parkStaged, pairing{}
 }
 
 // RejectedGuests 返回累计因超出暂存上限被拒绝的访客数。
@@ -105,7 +155,7 @@ func (broker *workBroker) RejectedGuests() int64 {
 	return broker.rejectedGuests
 }
 
-// dropGuests 关闭并清空指定代理的全部暂存访客，返回被关闭的连接数。
+// dropGuests 关闭并清空指定代理的全部暂存访客，返回被关闭的连接。
 //
 // 用于"该代理的工作连接已被拒绝"的场景：目标地址越权时服务端关闭了工作连接，
 // 而等待配对的访客仍在队列里等一个永远不会到来的连接。不清理它们，访客会被
@@ -113,62 +163,47 @@ func (broker *workBroker) RejectedGuests() int64 {
 // 配对不可能成功。
 //
 // 只清理指定代理：其他代理的配对不受影响。
-func (broker *workBroker) dropGuests(proxyName string) int {
+//
+// 返回连接切片而不是条数：这些连接在 Engine 的活动集合里各有一条记账，调用方
+// 必须在**锁外**逐个 untrack，否则已关闭的连接会永久留在记账表中（引擎长跑时
+// 单调增长）。不在此处直接回调 untrack 是因为那会取 Engine 锁，与 Shutdown 的
+// 锁序构成 ABBA（见 pairing 的说明）。
+func (broker *workBroker) dropGuests(proxyName string) []*transport.Conn {
 	broker.mu.Lock()
 	defer broker.mu.Unlock()
 	queue := broker.guests[proxyName]
 	if len(queue) == 0 {
-		return 0
+		return nil
 	}
 	delete(broker.guests, proxyName)
-	for _, guest := range queue {
-		_ = guest.Close()
+	dropped := make([]*transport.Conn, 0, len(queue))
+	for _, staged := range queue {
+		_ = staged.conn.Close()
+		dropped = append(dropped, staged.conn)
 	}
-	return len(queue)
+	return dropped
 }
 
-// park 暂存一条待命工作连接；若已有等待访客，立即配对并返回真。
-func (broker *workBroker) park(
-	proxyName string,
-	work *transport.Conn,
-	track func(*transport.Conn),
-	add func(int),
-) bool {
+// park 暂存一条待命工作连接；若已有等待访客，立即返回待桥接的一对。
+//
+// 返回值与 parkGuest 同构：paired 为真时调用方须在锁外 start 该配对并在完成后
+// 决定连接归属；为假时表示已暂存或已被拒绝（accepted 区分二者）。
+func (broker *workBroker) park(proxyName string, work *transport.Conn) (accepted bool, paired *pairing) {
 	broker.mu.Lock()
 	defer broker.mu.Unlock()
 	if broker.closed {
-		return false
+		return false, nil
 	}
 	if len(broker.guests[proxyName]) > 0 {
-		guest := broker.guests[proxyName][0]
+		staged := broker.guests[proxyName][0]
 		broker.guests[proxyName] = broker.guests[proxyName][1:]
 		if len(broker.guests[proxyName]) == 0 {
 			delete(broker.guests, proxyName)
 		}
-		broker.startBridge(guest, work, track, add)
-		return true
+		return true, &pairing{guest: staged.conn, work: work, pending: staged.pending}
 	}
 	broker.works.Push(proxyName, work)
-	return true
-}
-
-// startBridge 启动一对已配对连接的双向转发。
-//
-// 转发结束只取决于任一端自然关闭：这里不使用可取消上下文，避免与 Shutdown
-// 的排水上限互相打断——排水由 Engine 统一按上限等待，超限才强制关闭。
-func (broker *workBroker) startBridge(
-	guest, work *transport.Conn,
-	track func(*transport.Conn),
-	add func(int),
-) {
-	track(guest)
-	track(work)
-	add(1)
-	go func() {
-		defer add(-1)
-		defer untrackBoth(track, guest, work)
-		transport.Bridge(context.Background(), guest, work)
-	}()
+	return true, nil
 }
 
 // untrackBoth 从活动集合移除一对已桥接的连接。
@@ -197,11 +232,11 @@ func (broker *workBroker) closeStaged() {
 	}
 	broker.closed = true
 	for _, queue := range broker.guests {
-		for _, guest := range queue {
-			_ = guest.Close()
+		for _, staged := range queue {
+			_ = staged.conn.Close()
 		}
 	}
-	broker.guests = make(map[string][]*transport.Conn)
+	broker.guests = make(map[string][]stagedGuest)
 	_ = broker.works.Close()
 }
 
@@ -209,8 +244,15 @@ func (broker *workBroker) closeStaged() {
 //
 // Target 承载该工作连接最终转发到的本地目标地址，供服务端判定目标是否在该
 // 客户端被允许的地址集合内（FR-06a §3.3）。
+//
+// ClientID 与 Token 是工作连接的鉴权材料：工作连接是与控制连接平行的独立连接，
+// 服务端无从由连接本身判断其归属，必须由声明携带凭据，否则任何能连上控制端口的
+// 对端都可以声明任意代理名（见 PROTOCOL §7 第 2、3 步：声明鉴权材料，服务端验证
+// 工作连接属于当前控制会话）。
 type workConnRequest struct {
-	RunID  string `json:"run_id"`
-	Proxy  string `json:"proxy_name"`
-	Target string `json:"target_addr"`
+	ClientID string `json:"client_id"`
+	Token    string `json:"token"`
+	RunID    string `json:"run_id"`
+	Proxy    string `json:"proxy_name"`
+	Target   string `json:"target_addr"`
 }

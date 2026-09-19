@@ -38,6 +38,9 @@ const (
 	CodeInvalidDuration ErrorCode = "invalid_duration"
 	// CodeLimitExceeded 表示条目数量或名称长度超出 Core 常量上限。
 	CodeLimitExceeded ErrorCode = "limit_exceeded"
+	// CodeInvalidName 表示名称含保留字符；运行期用冒号派生 HTTP 入口登记名，
+	// 代理名含冒号会与入口表撞名。
+	CodeInvalidName ErrorCode = "invalid_name"
 )
 
 // ConfigError 描述一条校验问题：稳定的错误码、字段路径与可公开的中文消息。

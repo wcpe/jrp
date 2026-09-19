@@ -16,6 +16,12 @@ type Registry map[string]*Binding
 type Binding struct {
 	// Name 是代理名。
 	Name string
+	// OwnerClientID 是该绑定允许接入的客户端标识。
+	//
+	// 工作连接必须由绑定的属主客户端发起：工作连接是与控制连接平行的独立连接，
+	// 仅凭代理名无法判断归属，缺少属主校验时任何能连上控制端口的对端都可以声明
+	// 任意代理名（PROTOCOL §7 第 3 步）。
+	OwnerClientID string
 	// Targets 是该代理允许转发到的目标地址集合。
 	Targets []netip.AddrPort
 }
@@ -67,4 +73,15 @@ func (view *RegistryView) TargetAllowed(name string, target netip.AddrPort) bool
 		return false
 	}
 	return binding.TargetAllowed(target)
+}
+
+// ProxyBelongsTo 判定指定代理是否归属于给定客户端。
+//
+// 未注册的代理一律返回假：归属未知的代理不得被任何客户端声明。
+func (view *RegistryView) ProxyBelongsTo(name, clientID string) bool {
+	binding := view.Binding(name)
+	if binding == nil {
+		return false
+	}
+	return binding.OwnerClientID != "" && binding.OwnerClientID == clientID
 }
