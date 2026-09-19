@@ -55,15 +55,8 @@ type Engine struct {
 	registry     *proxy.RegistryView
 	httpRoutes   map[int]*proxy.HTTPRouter
 	workConns    *workBroker
-	clients      map[string]*clientSession
 
 	heartbeat time.Duration
-}
-
-// clientSession 是已登录客户端的会话状态：控制连接与待命工作连接配对。
-type clientSession struct {
-	clientID string
-	control  *transport.Conn
 }
 
 // engineState 是 Engine 的内部状态，切换只在持锁下进行。
@@ -105,7 +98,6 @@ func New(config core.ServerConfig, options ...Option) *Engine {
 		udpEntries:   make(map[string]*proxy.UDPProxy),
 		registry:     &proxy.RegistryView{},
 		workConns:    newWorkBroker(config.IdleWorkConnLimit()),
-		clients:      make(map[string]*clientSession),
 		heartbeat:    config.Heartbeat(),
 		dialer:       transport.Dialer{Timeout: config.Timeout()},
 		drainTimeout: config.DrainTimeout(),
@@ -601,15 +593,13 @@ func (engine *Engine) handleControl(raw *transport.Conn) {
 	}
 	switch first.Type.Name {
 	case "login":
-		clientID, err := engine.handleLogin(raw, first.Payload)
+		err := engine.handleLogin(raw, first.Payload)
 		first.Release()
 		if err != nil {
 			engine.failAbnormal(err)
 			return
 		}
-		engine.registerClient(clientID, raw)
-		engine.serveControlLoop(raw, guard, clientID)
-		engine.unregisterClient(clientID)
+		engine.serveControlLoop(raw, guard)
 	case "new-work-conn":
 		engine.serveWorkDeclaration(raw, first.Payload)
 		first.Release()
@@ -623,8 +613,7 @@ func (engine *Engine) handleControl(raw *transport.Conn) {
 //
 // 心跳中断或未知帧都视为异常终止：记录首个异常错误并关闭 Done，
 // 使宿主可通过 Err() 判定。正常 Shutdown 不经过本路径。
-func (engine *Engine) serveControlLoop(conn *transport.Conn, guard *wire.ConnectionGuard, clientID string) {
-	_ = clientID
+func (engine *Engine) serveControlLoop(conn *transport.Conn, guard *wire.ConnectionGuard) {
 	for {
 		frame, err := guard.ReadFrame()
 		if err != nil {
@@ -788,11 +777,11 @@ type loginResponsePayload struct {
 }
 
 // handleLogin 校验客户端凭证并回复登录结果。
-func (engine *Engine) handleLogin(conn *transport.Conn, payload []byte) (string, error) {
+func (engine *Engine) handleLogin(conn *transport.Conn, payload []byte) error {
 	var request loginPayload
 	if err := json.Unmarshal(payload, &request); err != nil {
 		_ = engine.writeLoginResponse(conn, false, "登录载荷非法")
-		return "", err
+		return err
 	}
 	matched := false
 	for _, credential := range engine.config.Credentials() {
@@ -803,12 +792,12 @@ func (engine *Engine) handleLogin(conn *transport.Conn, payload []byte) (string,
 	}
 	if !matched {
 		_ = engine.writeLoginResponse(conn, false, "鉴权未通过")
-		return "", errors.New("服务端拒绝客户端登录")
+		return errors.New("服务端拒绝客户端登录")
 	}
 	if err := engine.writeLoginResponse(conn, true, ""); err != nil {
-		return "", err
+		return err
 	}
-	return request.ClientID, nil
+	return nil
 }
 
 // writeLoginResponse 写出登录响应帧。
@@ -873,20 +862,6 @@ func (engine *Engine) serveHTTPGuest(port int, listener *transport.Listener) {
 		engine.wg.Add(1)
 		go engine.handleHTTPGuest(port, conn)
 	}
-}
-
-// registerClient 登记已登录客户端的控制连接，供工作连接配对使用。
-func (engine *Engine) registerClient(clientID string, control *transport.Conn) {
-	engine.mu.Lock()
-	defer engine.mu.Unlock()
-	engine.clients[clientID] = &clientSession{clientID: clientID, control: control}
-}
-
-// unregisterClient 移除客户端会话；控制连接断开时调用。
-func (engine *Engine) unregisterClient(clientID string) {
-	engine.mu.Lock()
-	defer engine.mu.Unlock()
-	delete(engine.clients, clientID)
 }
 
 // isStopped 返回引擎是否已进入停止状态。
