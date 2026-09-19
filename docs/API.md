@@ -156,8 +156,15 @@ P1 不提供 `/node`、`/cluster`、节点注册、调度或分布式 RPC 端点
 
 ### 4.7 通知与审计
 
-- `GET/POST/PATCH/DELETE /api/v1/notification-targets`：管理 Webhook 与邮件目标。
-- `POST /api/v1/notification-targets/{targetId}:test`：发送显式测试通知，不伪造业务事件。
+- `GET /api/v1/notification-targets`：列出通知目标，需管理员会话。响应为 `{"items": [...]}`，秘密只以 `maskedSecret` 掩码出现。
+- `POST /api/v1/notification-targets`：创建目标，需会话与 CSRF；成功返回 201。目标标识由服务端生成。
+- `PATCH /api/v1/notification-targets/{targetId}`：更新目标，需会话与 CSRF。**秘密留空表示保留原值**，避免管理员改名字时被迫重输密码，也避免"未填写即清空"。
+- `DELETE /api/v1/notification-targets/{targetId}`：删除目标，需会话与 CSRF，成功返回 204。删除时该目标的在途待发送记录一并转入 `discarded`，不静默丢失。
+- `POST /api/v1/notification-targets/{targetId}:test`：发送显式测试通知，不伪造业务事件，需会话与 CSRF。投递失败返回 502，且同样写入审计（结果记为失败）。
+  - 请求体字段：`name`（必填）、`type`（`webhook` 或 `email`）、`enabled`（缺省为 `true`）、`secret`（只在创建或更新时接收）、`webhookUrl`、`smtpHost`、`smtpPort`、`smtpFrom`、`smtpTo`（数组）、`smtpSecurity`（`starttls` 或 `none`，缺省为 `starttls`）。
+  - Webhook 地址必须使用 HTTPS，不得内嵌凭据；SMTP 收件人上限 20。
+  - 响应字段：`id`、`name`、`type`、`enabled`、`maskedSecret`、`summary`、渠道配置字段、`createdAt`、`updatedAt`。**不返回明文字段 `secret`**。
+  - 校验失败返回 400 且一次给出全部违规项；目标不存在返回 404；**目标已停用返回 409**（停用的含义就是不接收通知，业务投递路径同样拒绝停用目标，两条路径语义保持一致）；渠道未启用返回 503。被拒绝的测试通知同样写入审计，结果记为 `denied`。
 - `GET /api/v1/audit-events`：分页查询审计事件，需管理员会话。
   - 过滤参数：`from`/`to`（RFC 3339 时间范围，闭区间）、`action`（动作枚举）、`objectType`（对象类型枚举）、`result`（`success`/`failure`/`denied`）。
   - 过滤值必须是封闭枚举内的取值；非法值返回 400，不静默忽略。
@@ -166,6 +173,19 @@ P1 不提供 `/node`、`/cluster`、节点注册、调度或分布式 RPC 端点
   - **负面契约**：P1 不提供审计导出接口，也不提供审计删除接口。审计事件不可被管理员经 API 抹除；写入后不可修改。
 
 通知目标中的秘密只在创建/更新时接收，读取时必须掩码。
+
+### 4.8 通知投递契约
+
+通知内容由 outbox 在业务事务提交后投递，外部副作用不在事务内发生。
+
+> **实现进度**：投递侧（渠道、重试、租约、发送循环）已就绪；outbox 的**写入侧尚未接线**——产生通知的业务动作属 FR-10 与 FR-11，未交付前 `notification_outbox` 无生产写入路径。第 4.8 节描述的是目标契约。
+
+- **Webhook 请求体**（UTF-8 JSON）：`eventId`、`eventType`、`occurredAt`（RFC 3339 UTC）、`payload`（已脱敏摘要）。
+- **Webhook 签名**：目标配置了 `secret` 时携带 `X-JRP-Signature` 头，值为 `sha256=` 加请求体的 HMAC-SHA256 十六进制。未配置秘密时不发送该头（不伪造来源证明）。
+- **响应归类**：2xx 为成功；429 与 5xx 判为可重试；3xx、4xx 判为确定性失败（本渠道不跟随重定向）。
+- **邮件**：主题为 `[JRP] {事件类型} {RFC 3339 时间}`，非 ASCII 按 RFC 2047 编码；正文为 UTF-8 中文，只含脱敏摘要。
+- **重试**：可重试失败按有界递增退避重新入队并叠加抖动，达到上限后进入失败终态并记录停止时间。确定性失败不消耗重试次数。
+- **租约**：发送中记录带租约，租约到期后允许重新投递，用于进程崩溃后的恢复；抢占是原子条件更新，同一记录不会被并发投递。
 
 ## 5. P1 jrpc 管理契约
 

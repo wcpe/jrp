@@ -8,12 +8,15 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
+	"syscall"
 	"time"
 
 	"github.com/wcpe/jrp/apps/jrps/internal/buildinfo"
 	"github.com/wcpe/jrp/apps/jrps/internal/httpapi"
+	"github.com/wcpe/jrp/apps/jrps/internal/notify"
 	"github.com/wcpe/jrp/apps/jrps/internal/store"
 )
 
@@ -97,19 +100,125 @@ func handleImmediateCommand(args []string, stdout io.Writer) (bool, int) {
 }
 
 func serve(listen string, database *store.Store, logger *slog.Logger) int {
+	// 优雅退出的根上下文：SIGINT/SIGTERM 触发取消，据此依次停止 HTTP 服务
+	// 与后台发送循环。这是本程序第一处信号处理——此前直接 ListenAndServe，
+	// 收到信号即被杀死，正在进行的投递会停在 sending 状态。
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	loop, err := startOutboxLoop(ctx, database, logger)
+	if err != nil {
+		logger.Error("启动通知发送循环失败，拒绝启动", "错误", err)
+		return 1
+	}
+
 	server := http.Server{
-		Addr:              listen,
-		Handler:           httpapi.NewRouter(httpapi.RouterOptions{Store: database, Logger: logger}),
+		Addr: listen,
+		Handler: httpapi.NewRouter(httpapi.RouterOptions{
+			Store:  database,
+			Logger: logger,
+			// 测试通知与业务通知共用同一套渠道实现，保证测通即可用。
+			TestNotifications: testNotifier{store: database, sender: notify.NewSender()},
+		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	logger.Info("管理服务开始监听", "地址", listen)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		logger.Error("管理服务启动失败", "错误", err)
-		return 1
+
+	serveErr := make(chan error, 1)
+	go func() {
+		logger.Info("管理服务开始监听", "地址", listen)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+			return
+		}
+		serveErr <- nil
+	}()
+
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			logger.Error("管理服务启动失败", "错误", err)
+			shutdownOutboxLoop(loop, logger)
+			return 1
+		}
+		shutdownOutboxLoop(loop, logger)
+		return 0
+	case <-ctx.Done():
+		logger.Info("收到退出信号，开始优雅停止")
 	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		logger.Error("管理服务停止超时", "错误", err)
+	}
+	shutdownOutboxLoop(loop, logger)
 	return 0
+}
+
+// shutdownTimeout 是优雅停止各阶段的超时上限。
+const shutdownTimeout = 10 * time.Second
+
+// startOutboxLoop 装配并启动通知发送循环。
+//
+// 发送器在事务之外独立运行：它只通过数据库读取取得待发送记录，因此未提交
+// 或已回滚的记录对它永远不可见（ADR-0004、FR-15 §3.2）。
+func startOutboxLoop(ctx context.Context, database *store.Store, logger *slog.Logger) (*store.OutboxLoop, error) {
+	adapter := outboxSender{
+		loader: storeTargetLoader{store: database},
+		sender: notify.NewSender(),
+		logger: logger,
+	}
+	dispatcher, err := store.NewOutboxDispatcher(store.OutboxDispatcherConfig{
+		Store:  database,
+		Sender: adapter,
+	})
+	if err != nil {
+		return nil, err
+	}
+	loop, err := store.NewOutboxLoop(store.OutboxLoopConfig{
+		Dispatcher: dispatcher,
+		Logger:     logger,
+		OnTargetMissing: func(ctx context.Context, targetID string) error {
+			return discardOutboxForTarget(ctx, database, targetID, logger)
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	loop.Start()
+	return loop, nil
+}
+
+// discardOutboxForTarget 把已缺失目标的在途记录转入 discarded 并写审计（FR-15 §3.6）。
+func discardOutboxForTarget(ctx context.Context, database *store.Store, targetID string, logger *slog.Logger) error {
+	return database.Transaction(ctx, func(tx *store.Tx) error {
+		count, err := tx.DiscardOutboxForTarget(targetID)
+		if err != nil || count == 0 {
+			return err
+		}
+		return tx.WriteAudit(store.AuditEvent{
+			ActorType:  store.ActorTypeAdmin,
+			ActorID:    "server",
+			Action:     store.ActionNotificationDiscard,
+			ObjectType: store.ObjectTypeNotificationMsg,
+			ObjectID:   targetID,
+			Result:     store.AuditResultSuccess,
+			Context:    "通知目标已不存在，在途通知转入不再投递",
+		})
+	})
+}
+
+// shutdownOutboxLoop 停止后台发送循环并等待当前轮结束。
+func shutdownOutboxLoop(loop *store.OutboxLoop, logger *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := loop.Close(ctx); err != nil {
+		logger.Error("停止通知发送循环超时", "错误", err)
+		return
+	}
+	logger.Info("通知发送循环已停止", "累计投递", loop.Dispatched(), "累计失败", loop.Failed())
 }
 
 // defaultDataDirectory 返回默认数据目录。

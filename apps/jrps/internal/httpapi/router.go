@@ -29,6 +29,8 @@ type RouterOptions struct {
 	InsecureCookies bool
 	// Logger 是外壳日志器；为空时静默。
 	Logger *slog.Logger
+	// TestNotifications 执行测试通知投递；为空时测试通知端点返回 503。
+	TestNotifications TestNotificationSender
 }
 
 type statusResponse struct {
@@ -65,6 +67,7 @@ func registerAPI(router *gin.Engine, options RouterOptions) {
 	session := newSessionAPI(options)
 	audit := newAuditAPI(options)
 	policy := newPolicyAPI(options)
+	notification := newNotificationAPI(options)
 	guard := requireInitialized(options.Store)
 	router.Use(func(context *gin.Context) {
 		if strings.HasPrefix(context.Request.URL.Path, "/api") {
@@ -86,6 +89,16 @@ func registerAPI(router *gin.Engine, options RouterOptions) {
 	// 保留策略：读取需会话，修改额外要求 CSRF；变更写入审计（FR-16 §3.4）。
 	api.GET("/capture-policy", session.authenticate(false), policy.show)
 	api.PUT("/capture-policy", session.authenticate(true), policy.update)
+
+	// 通知目标管理：读取需会话，增删改与测试通知额外要求 CSRF；一律写入审计。
+	api.GET("/notification-targets", session.authenticate(false), notification.list)
+	api.POST("/notification-targets", session.authenticate(true), notification.create)
+	api.PATCH("/notification-targets/:targetId", session.authenticate(true), notification.update)
+	api.DELETE("/notification-targets/:targetId", session.authenticate(true), notification.remove)
+	// 测试通知按契约使用 `{targetId}:test` 形式。gin 的路径段只允许一个通配符，
+	// 无法写出 `:targetId:test`（会 panic），因此用 catch-all 捕获整段再在处理器
+	// 内切分后缀，保证对外 URL 与契约逐字一致。
+	api.POST("/notification-targets/*action", session.authenticate(true), notification.test)
 }
 
 func notImplementedHandler(context *gin.Context) {

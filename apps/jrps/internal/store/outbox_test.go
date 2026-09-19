@@ -162,17 +162,17 @@ func TestNotificationSecretIsMaskedOnRead(t *testing.T) {
 		if err := tx.DB().Create(&target).Error; err != nil {
 			return err
 		}
-		view, err := tx.NotificationTarget("target-1")
+		view, err := tx.NotificationTargetByID("target-1")
 		if err != nil {
 			return err
 		}
-		if strings.Contains(view.MaskedSecret(), secret) {
+		if strings.Contains(view.MaskedSecret, secret) {
 			return errors.New("脱敏展示泄露了完整秘密")
 		}
-		if !strings.HasSuffix(view.MaskedSecret(), secret[len(secret)-4:]) {
+		if !strings.HasSuffix(view.MaskedSecret, secret[len(secret)-4:]) {
 			return errors.New("脱敏展示应保留末四位便于运维识别")
 		}
-		if !strings.HasPrefix(view.MaskedSecret(), "*") {
+		if !strings.HasPrefix(view.MaskedSecret, "*") {
 			return errors.New("脱敏展示应以掩码开头")
 		}
 		return nil

@@ -8,7 +8,7 @@ import (
 )
 
 // currentSchemaVersion 是当前程序期望的数据库架构版本，落库到 PRAGMA user_version。
-const currentSchemaVersion = 2
+const currentSchemaVersion = 3
 
 // migration 是一次架构迁移步骤；apply 在同一事务中被调用。
 type migration struct {
@@ -22,6 +22,7 @@ func migrations() []migration {
 	return []migration{
 		{version: 1, name: "建立 P1 初始表结构", apply: applyInitialSchema},
 		{version: 2, name: "新增保留策略对象并放开审计清理", apply: applyRetentionPolicy},
+		{version: 3, name: "补齐通知目标与 outbox 的投递字段", apply: applyNotificationDelivery},
 	}
 }
 
@@ -117,6 +118,24 @@ func seedCapturePolicy(tx *gorm.DB) error {
 	policy.ID = capturePolicyRowID
 	if err := tx.Create(&policy).Error; err != nil {
 		return fmt.Errorf("写入默认保留策略失败：%w", err)
+	}
+	return nil
+}
+
+// applyNotificationDelivery 补齐通知投递所需的字段（FR-15 规格 §3.4、§3.3）。
+//
+// 两处扩展：
+//   - notification_targets 增加两种渠道各自的配置列。v1 只有 TargetSummary
+//     与 Secret，不足以承载投递所需的 URL 与 SMTP 参数。
+//   - notification_outbox 增加 StoppedAt，记录进入失败终态的时间，使运维能
+//     查到"何时停止重试"而不必从 UpdatedAt 反推语义。
+//
+// 新增列全部可空：既有目标是 v1 时期写入的占位记录，没有投递配置可回填，
+// 给它们编造默认地址比留空更危险；留空的目标在投递时会因配置校验失败而
+// 明确报错，不会被误当作可用目标。
+func applyNotificationDelivery(tx *gorm.DB) error {
+	if err := tx.AutoMigrate(&NotificationTarget{}, &NotificationOutbox{}); err != nil {
+		return fmt.Errorf("补齐通知投递字段失败：%w", err)
 	}
 	return nil
 }

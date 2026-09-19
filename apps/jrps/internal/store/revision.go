@@ -396,6 +396,14 @@ func (tx *Tx) writeAudit(event AuditEvent) error {
 	return nil
 }
 
+// WriteAudit 是 writeAudit 的导出入口，供外壳层在同一事务内写入审计。
+//
+// 仍然只提供这一个入口而不开放直写表：审计的字段校验、脱敏检查与时间覆盖
+// 必须对所有权调用方一致生效，否则绕过入口的写入会让这些约束形同虚设。
+func (tx *Tx) WriteAudit(event AuditEvent) error {
+	return tx.writeAudit(event)
+}
+
 // Transaction 在已有事务句柄上执行嵌套事务，失败整体回滚。
 func (tx *Tx) Transaction(fn func() error) error {
 	return tx.db.Transaction(func(*gorm.DB) error { return fn() })

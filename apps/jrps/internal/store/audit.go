@@ -36,6 +36,13 @@ const (
 	ActionPolicyUpdate       = "policy_update"
 	ActionAuditCleanup       = "audit_cleanup"
 	ActionBodyCaptureCleanup = "body_capture_cleanup"
+
+	// 通知目标管理（FR-15 §3.6）：增删改与测试通知都必须留痕。
+	ActionNotificationTargetCreate = "notification_target_create"
+	ActionNotificationTargetUpdate = "notification_target_update"
+	ActionNotificationTargetDelete = "notification_target_delete"
+	ActionNotificationTargetTest   = "notification_target_test"
+	ActionNotificationDiscard      = "notification_discard"
 )
 
 // FR-16 规格 §2.1 的对象类型封闭集合。
@@ -62,6 +69,9 @@ var auditActions = map[string]struct{}{
 	ActionAdminInitialized: {}, ActionAdminLogin: {}, ActionAdminLogout: {},
 	ActionAdminLoginFailure: {},
 	ActionPolicyUpdate:      {}, ActionAuditCleanup: {}, ActionBodyCaptureCleanup: {},
+	ActionNotificationTargetCreate: {}, ActionNotificationTargetUpdate: {},
+	ActionNotificationTargetDelete: {}, ActionNotificationTargetTest: {},
+	ActionNotificationDiscard: {},
 }
 
 // objectTypes 是允许写入的对象类型全集。

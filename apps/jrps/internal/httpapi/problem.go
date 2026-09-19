@@ -17,6 +17,7 @@ const (
 	codeInvalidInput    = "invalid_input"
 	codeRateLimited     = "rate_limited"
 	codeNotFound        = "not_found"
+	codeConflict        = "conflict"
 	codeInternalError   = "internal_error"
 )
 

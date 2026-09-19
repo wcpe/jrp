@@ -183,16 +183,45 @@ type AuditEvent struct {
 
 func (AuditEvent) TableName() string { return "audit_events" }
 
+// 通知渠道类型；P1 只支持两种，不引入其他渠道。
+const (
+	NotificationTypeWebhook = "webhook"
+	NotificationTypeEmail   = "email"
+)
+
+// SMTP 安全传输选项。
+const (
+	// SMTPSecurityNone 是明文 SMTP，仅允许显式选择：默认值不是它。
+	SMTPSecurityNone = "none"
+	// SMTPSecurityStartTLS 是先明文连接再升级 TLS，P1 的默认与推荐取值。
+	SMTPSecurityStartTLS = "starttls"
+)
+
 // NotificationTarget 保存通知目标；秘密只在写入时接收，读取时掩码。
+//
+// 两种渠道的配置字段互斥共存：Webhook 用 URL 相关列，邮件用 SMTP 相关列。
+// 拆成显式列而非一个 JSON 配置列，是为了让校验（URL 协议/主机/端口、收件人
+// 上限、端口范围）落在明确字段上，避免把校验规则藏进序列化字符串。
 type NotificationTarget struct {
 	ID            string `gorm:"primaryKey;size:64"`
 	Type          string `gorm:"size:32;not null"`
 	Name          string `gorm:"size:128;not null"`
 	TargetSummary string `gorm:"size:255;not null"` // 脱敏后的目标摘要
-	Secret        string `gorm:"size:255"`          // 明文静态存储按已接受风险
+	Secret        string `gorm:"size:255"`          // Webhook 签名密钥或 SMTP 密码，明文静态存储按已接受风险
 	Enabled       bool   `gorm:"not null;default:true"`
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+
+	// WebhookURL 是 Webhook 渠道的投递地址，仅 Type 为 webhook 时非空。
+	WebhookURL string `gorm:"size:512"`
+
+	// SMTP 渠道配置，仅 Type 为 email 时非空。
+	SMTPHost     string `gorm:"size:255"`
+	SMTPPort     int
+	SMTPFrom     string `gorm:"size:255"`
+	SMTPTo       string `gorm:"size:1024"` // 收件人，逗号分隔；读取时按上限校验
+	SMTPSecurity string `gorm:"size:32"`
+
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 func (NotificationTarget) TableName() string { return "notification_targets" }
@@ -218,9 +247,12 @@ type NotificationOutbox struct {
 	Attempts       int    `gorm:"not null;default:0"`
 	NextAttemptAt  time.Time
 	LeaseExpiresAt *time.Time
-	LastError      string    `gorm:"size:255"`
-	CreatedAt      time.Time `gorm:"index"`
-	UpdatedAt      time.Time
+	LastError      string `gorm:"size:255"`
+	// StoppedAt 记录进入失败终态的时间，供运维查询"何时停止重试"（规格 §3.3）。
+	// 只有 failed 与 discarded 会写入它。
+	StoppedAt *time.Time
+	CreatedAt time.Time `gorm:"index"`
+	UpdatedAt time.Time
 }
 
 func (NotificationOutbox) TableName() string { return "notification_outbox" }

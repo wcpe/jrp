@@ -150,7 +150,129 @@ func TestMigrationDoesNotReseedExistingPolicy(t *testing.T) {
 	}
 }
 
-// 保底断言：v2 迁移后审计更新触发器仍然存在。
+// v2 库升级到 v3 后，既有通知目标不被改动，新列可用。
+//
+// 升级不得为旧目标编造投递配置：v1/v2 时期的目标只有摘要与秘密，
+// 没有任何地址可回填，留空比猜一个默认地址安全。
+func TestMigrationUpgradesV2AndKeepsNotificationTargets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "jrps.db")
+	legacy, err := Open(Config{
+		Path:        path,
+		BusyTimeout: time.Second,
+		Logger:      quietLogger(),
+		migrations:  v1Migrations(),
+	})
+	if err != nil {
+		t.Fatalf("建立 v1 数据库失败：%v", err)
+	}
+	// 用 v1 表结构写入一条目标：此时还没有投递配置列。
+	if err := legacy.Transaction(context.Background(), func(tx *Tx) error {
+		return tx.db.Create(&NotificationTarget{
+			ID:            "legacy-target",
+			Type:          NotificationTypeWebhook,
+			Name:          "历史目标",
+			TargetSummary: "https://example.invalid/hook",
+		}).Error
+	}); err != nil {
+		t.Fatalf("写入历史目标失败：%v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("关闭旧库失败：%v", err)
+	}
+
+	upgraded := openServerStore(t, path)
+	if upgraded.SchemaVersion() != currentSchemaVersion {
+		t.Fatalf("升级后架构版本不匹配：%d", upgraded.SchemaVersion())
+	}
+
+	var target NotificationTarget
+	if err := upgraded.View(context.Background(), func(tx *Tx) error {
+		return tx.db.Where("id = ?", "legacy-target").First(&target).Error
+	}); err != nil {
+		t.Fatalf("读取升级后目标失败：%v", err)
+	}
+	if target.Name != "历史目标" || target.TargetSummary != "https://example.invalid/hook" {
+		t.Fatalf("升级不得改动既有目标：%+v", target)
+	}
+	if target.WebhookURL != "" || target.SMTPHost != "" {
+		t.Fatalf("升级不得为旧目标编造投递配置：%+v", target)
+	}
+}
+
+// 升级后的表结构支持两种渠道的完整配置。
+func TestNotificationTargetStoresBothChannels(t *testing.T) {
+	database := openServerStore(t, filepath.Join(t.TempDir(), "jrps.db"))
+
+	if err := database.Transaction(context.Background(), func(tx *Tx) error {
+		return tx.db.Create(&NotificationTarget{
+			ID: "hook-1", Type: NotificationTypeWebhook, Name: "告警钩子",
+			TargetSummary: "https://example.invalid/hook", Secret: "s3cr3t",
+			WebhookURL: "https://example.invalid/hook",
+		}).Error
+	}); err != nil {
+		t.Fatalf("写入 Webhook 目标失败：%v", err)
+	}
+	if err := database.Transaction(context.Background(), func(tx *Tx) error {
+		return tx.db.Create(&NotificationTarget{
+			ID: "mail-1", Type: NotificationTypeEmail, Name: "运维邮箱",
+			TargetSummary: "smtp.example.invalid:587",
+			SMTPHost:      "smtp.example.invalid", SMTPPort: 587,
+			SMTPFrom: "jrp@example.invalid", SMTPTo: "ops@example.invalid",
+			SMTPSecurity: SMTPSecurityStartTLS, Secret: "mail-password",
+		}).Error
+	}); err != nil {
+		t.Fatalf("写入邮件目标失败：%v", err)
+	}
+
+	var hook NotificationTarget
+	if err := database.View(context.Background(), func(tx *Tx) error {
+		return tx.db.Where("id = ?", "hook-1").First(&hook).Error
+	}); err != nil {
+		t.Fatalf("读取 Webhook 目标失败：%v", err)
+	}
+	if hook.WebhookURL != "https://example.invalid/hook" {
+		t.Fatalf("Webhook 地址未落库：%+v", hook)
+	}
+
+	var mail NotificationTarget
+	if err := database.View(context.Background(), func(tx *Tx) error {
+		return tx.db.Where("id = ?", "mail-1").First(&mail).Error
+	}); err != nil {
+		t.Fatalf("读取邮件目标失败：%v", err)
+	}
+	if mail.SMTPPort != 587 || mail.SMTPSecurity != SMTPSecurityStartTLS {
+		t.Fatalf("SMTP 配置未落库：%+v", mail)
+	}
+}
+
+// outbox 的失败终态时间可写入，用于记录"何时停止重试"。
+func TestOutboxStoresStoppedAt(t *testing.T) {
+	database := openServerStore(t, filepath.Join(t.TempDir(), "jrps.db"))
+	stopped := time.Now().UTC()
+
+	if err := database.Transaction(context.Background(), func(tx *Tx) error {
+		return tx.db.Create(&NotificationOutbox{
+			EventID: "event-1", TargetID: "hook-1", EventType: "apply_failure",
+			Payload: "{}", Status: OutboxStatusFailed, Attempts: 5,
+			StoppedAt: &stopped,
+		}).Error
+	}); err != nil {
+		t.Fatalf("写入失败终态记录失败：%v", err)
+	}
+
+	var entry NotificationOutbox
+	if err := database.View(context.Background(), func(tx *Tx) error {
+		return tx.db.Where("event_id = ?", "event-1").First(&entry).Error
+	}); err != nil {
+		t.Fatalf("读取 outbox 记录失败：%v", err)
+	}
+	if entry.StoppedAt == nil {
+		t.Fatal("失败终态时间应被保留")
+	}
+	if entry.Attempts != 5 {
+		t.Fatalf("失败次数应为 5，实际 %d", entry.Attempts)
+	}
+}
 func TestMigrationRetainsAuditUpdateGuard(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "jrps.db")
 	database := openServerStore(t, path)
