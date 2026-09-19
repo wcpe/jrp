@@ -22,6 +22,11 @@ import (
 const (
 	fr06aClientID    = "proxy-client"
 	fr06aClientToken = "proxy-token"
+	// fr06aHTTPHost 与 fr06aHTTPPath 是 FR-06a HTTP 路由用例的已配置主机与路径。
+	// 定义成常量让"配置路由"与"断言响应不回显路由表"引用同一份取值，
+	// 避免两处各写字面量而在改动时漂移。
+	fr06aHTTPHost = "app.example.com"
+	fr06aHTTPPath = "/api"
 )
 
 // controlAndFourPorts 一次性申请控制监听器与四个入口端口，全部取自
@@ -86,8 +91,8 @@ func fr06aServerConfig(t *testing.T, control netip.AddrPort, tcpTarget, udpTarge
 		}),
 		core.WithHTTPProxyBinding(core.HTTPProxyBinding{
 			Name: "http-echo", ClientID: fr06aClientID, RemotePort: ports[2],
-			Hosts:          []string{"app.example.com"},
-			Path:           "/api",
+			Hosts:          []string{fr06aHTTPHost},
+			Path:           fr06aHTTPPath,
 			AllowedTargets: []netip.AddrPort{tcpTarget},
 		}),
 		core.WithHTTPSProxyBinding(core.HTTPSProxyBinding{
@@ -345,8 +350,49 @@ func TestFR06aHTTPUnmatchedRouteReturnsPlainResponse(t *testing.T) {
 		t.Fatalf("未匹配路由应当返回 404，实际：%q", body)
 	}
 	// 不得回显内部路由表：已配置的主机名与路径都不出现在响应中。
-	if strings.Contains(body, "app.example.com") {
+	if strings.Contains(body, fr06aHTTPHost) {
 		t.Fatalf("未匹配响应回显了内部路由表：%q", body)
+	}
+	if strings.Contains(body, fr06aHTTPPath) {
+		t.Fatalf("未匹配响应回显了已配置路径：%q", body)
+	}
+	assertResponseContentLengthMatches(t, body)
+}
+
+// assertResponseContentLengthMatches 校验响应的 Content-Length 与正文实际字节数一致。
+//
+// 长度必须按**字节**比较：正文含中文，字符数与字节数不同（一个汉字 3 字节）。
+// 声明值与实际不符时，合规客户端会按声明值截断正文（并可能在多字节字符中间切断），
+// 而裸 socket 因为没有解析长度，读到的永远是完整字节流——这正是该缺陷此前
+// 逃过测试的原因：断言只查响应里有没有 "404" 子串。
+func assertResponseContentLengthMatches(t *testing.T, raw string) {
+	t.Helper()
+	head, tail, found := strings.Cut(raw, "\r\n\r\n")
+	if !found {
+		t.Fatalf("响应缺少首部与正文的分隔：%q", raw)
+	}
+	declared := -1
+	for _, line := range strings.Split(head, "\r\n") {
+		name, value, ok := strings.Cut(line, ":")
+		if !ok || !strings.EqualFold(strings.TrimSpace(name), "Content-Length") {
+			continue
+		}
+		parsed, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil {
+			t.Fatalf("Content-Length 不是合法整数：%q", value)
+		}
+		declared = parsed
+	}
+	if declared < 0 {
+		t.Fatal("未匹配响应必须显式声明 Content-Length")
+	}
+	if declared != len(tail) {
+		t.Fatalf("Content-Length 声明 %d 字节，正文实际 %d 字节：合规客户端会截断正文",
+			declared, len(tail))
+	}
+	// 正文完整可读：防止"长度对了但内容被截"这类改写。
+	if !strings.HasSuffix(tail, "路由") {
+		t.Fatalf("未匹配响应正文不完整：%q", tail)
 	}
 }
 
@@ -409,16 +455,21 @@ func TestFR06aTargetOutsideAllowedSetIsRejected(t *testing.T) {
 	t.Cleanup(func() { _ = clientEngine.Shutdown(context.Background()) })
 
 	// 访客能连上入口（入口已注册），但因工作连接被拒绝而收不到数据：
-	// 关键断言是访客不被悬挂——写入后能读到关闭，而不是永久阻塞。
+	// 关键断言是访客不被悬挂——服务端必须关闭它，而不是让它永久等待。
 	guest, err := net.Dial("tcp", serverEngine.GuestAddr("tcp-echo").String())
 	if err != nil {
 		t.Fatalf("访客连接失败：%v", err)
 	}
 	defer guest.Close()
+	// 截止时间的存在是为了让"永久悬挂"表现为失败而不是挂死整个测试；
+	// 但仅断言 err != nil 不足以区分两种结局——读超时同样返回非 nil 错误，
+	// 于是"悬挂"会被误判为通过。必须显式排除超时，要求读到的是关闭。
 	_ = guest.SetReadDeadline(time.Now().Add(5 * time.Second))
 	buffer := make([]byte, 1)
 	if _, err := guest.Read(buffer); err == nil {
 		t.Fatalf("目标越权时代理不应当转发任何数据")
+	} else if netError, ok := err.(net.Error); ok && netError.Timeout() {
+		t.Fatalf("目标越权时访客被悬挂：服务端应在拒绝工作连接后关闭访客连接，实际等到读超时")
 	}
 }
 

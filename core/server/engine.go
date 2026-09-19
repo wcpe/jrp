@@ -663,6 +663,12 @@ func (engine *Engine) serveWorkDeclaration(raw *transport.Conn, payload []byte) 
 		engine.log().Warn("工作连接的目标地址不在允许集合内，已拒绝",
 			"proxy", declaration.proxy, "target", declaration.target.String())
 		_ = raw.Close()
+		// 该代理的暂存访客同样要释放：它们等的是刚被拒绝的工作连接，
+		// 继续留在队列里只会被永久悬挂。
+		if dropped := engine.workConns.dropGuests(declaration.proxy); dropped > 0 {
+			engine.log().Warn("目标越权已拒绝工作连接，同时释放等待配对的访客",
+				"proxy", declaration.proxy, "访客数", dropped)
+		}
 		return
 	}
 	if !engine.workConns.park(declaration.proxy, raw, engine.track, engine.wg.Add) {
@@ -819,20 +825,18 @@ func (engine *Engine) isStopped() bool {
 func (engine *Engine) handleGuest(name string, guest *transport.Conn) {
 	defer engine.wg.Done()
 	engine.track(guest)
-	// parkGuest 接管访客的所有权：配对成功后桥接负责关闭，未配对时暂存；
-	// 暂存失败（引擎停止）时此处关闭。
-	paired := engine.workConns.parkGuest(name, guest, engine.track, engine.wg.Add)
-	if paired {
+	// parkGuest 接管访客的所有权，结果三态区分处置方式（见 parkOutcome）：
+	// 已配对时桥接负责关闭，已暂存时留在配对中心，被拒时由此处关闭。
+	switch engine.workConns.parkGuest(name, guest, engine.track, engine.wg.Add) {
+	case parkPaired:
 		engine.untrack(guest)
-		return
-	}
-	if engine.isStopped() {
+	case parkStaged:
+		// 连接留在配对中心，Shutdown 与 close 负责最终释放。
+		// untrack 不在此处调用，避免重复记账：配对中心的关闭路径统一处理。
+	default:
 		engine.untrack(guest)
 		_ = guest.Close()
-		return
 	}
-	// 暂存成功：连接留在配对中心，Shutdown 与 close 负责最终释放。
-	// untrack 不在此处调用，避免重复记账：配对中心的关闭路径统一处理。
 }
 
 // publishRegistry 从配置快照构造代理注册表并原子发布。
@@ -951,6 +955,10 @@ func (engine *Engine) handleHTTPGuest(port int, guest *transport.Conn) {
 //
 // 回放先于桥接：配对中心一旦把连接交给桥接，本函数就不再持有它，因此必须
 // 在移交前把已读出的字节写回同一条连接的方向。
+// bridgeHTTPGuest 把已判定路由的 HTTP 访客交给配对中心。
+//
+// 请求首部在此处已经回放给访客，因此被拒时只能关闭连接，无法再返回 503：
+// 对端已收到请求的首部，此时追加任何响应都会破坏它的解析。
 func (engine *Engine) bridgeHTTPGuest(proxyName string, guest *transport.Conn, pending []byte) {
 	if len(pending) > 0 {
 		if _, err := guest.Write(pending); err != nil {
@@ -958,11 +966,14 @@ func (engine *Engine) bridgeHTTPGuest(proxyName string, guest *transport.Conn, p
 			return
 		}
 	}
-	if !engine.workConns.parkGuest(proxyName, guest, engine.track, engine.wg.Add) {
-		if engine.isStopped() {
-			engine.untrack(guest)
-			_ = guest.Close()
-		}
+	switch engine.workConns.parkGuest(proxyName, guest, engine.track, engine.wg.Add) {
+	case parkPaired:
+		engine.untrack(guest)
+	case parkStaged:
+		// 连接留在配对中心，Shutdown 与 close 负责最终释放。
+	default:
+		engine.untrack(guest)
+		_ = guest.Close()
 	}
 }
 
@@ -986,15 +997,23 @@ const (
 	headerEndLF   = "\n"
 )
 
-// unmatchedResponse 是路由未命中时返回的响应。
+// unmatchedBody 是路由未命中时返回的响应体。
 //
-// 响应体只说明「无匹配路由」，不列出已配置的主机或路径：内部路由表不得经
-// 响应回显（规格 §3.5）。
-const unmatchedResponse = "HTTP/1.1 404 Not Found\r\n" +
+// 只说明「无匹配路由」，不列出已配置的主机或路径：内部路由表不得经响应回显
+// （规格 §3.5）。
+const unmatchedBody = "未找到匹配该主机与路径的路由"
+
+// unmatchedResponse 是路由未命中时返回的完整响应。
+//
+// Content-Length 由 unmatchedBody 的**字节数**在包初始化时算出，不写字面量：
+// 手写的长度会随正文改动而漂移，而声明值与实际不符会让合规客户端截断正文
+// （甚至切在多字节字符中间），产出非法 HTTP 消息。len 对 string 即为字节数，
+// 正是 Content-Length 要求的语义。
+var unmatchedResponse = "HTTP/1.1 404 Not Found\r\n" +
 	"Content-Type: text/plain; charset=utf-8\r\n" +
-	"Content-Length: 33\r\n" +
+	"Content-Length: " + strconv.Itoa(len(unmatchedBody)) + "\r\n" +
 	"Connection: close\r\n\r\n" +
-	"未找到匹配该主机与路径的路由"
+	unmatchedBody
 
 // requestLineLimit 是单个 HTTP 请求行与首部的读取上限。
 //
