@@ -37,14 +37,18 @@ func newLoginLimiter() *loginLimiter {
 }
 
 // RecordFailure 记录一次失败尝试；达到阈值后进入锁定时长。
-func (l *loginLimiter) RecordFailure(subject string) {
+//
+// 返回本次是否刚刚跨过阈值：调用方据此只在临界点发一次通知，
+// 而不是每次失败都发。达到阈值后的请求会被 IsLimited 拦在校验之前，
+// 不再进入这里，因此一个锁定窗口内最多触发一次。
+func (l *loginLimiter) RecordFailure(subject string) (reachedLimit bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now().UTC()
 	entry, ok := l.entries[normalizeSubject(subject)]
 	if !ok {
 		if len(l.entries) >= loginFailureTrackMax {
-			return
+			return false
 		}
 		entry = &loginFailure{firstFail: now}
 		l.entries[normalizeSubject(subject)] = entry
@@ -56,7 +60,11 @@ func (l *loginLimiter) RecordFailure(subject string) {
 	entry.count++
 	if entry.count >= loginFailureLimit {
 		entry.limitedUntil = now.Add(loginFailureWindow)
+		// 只在计数正好等于阈值时为真：后续失败（若发生）都已处于锁定态，
+		// 重复告警会让锁定窗口内的每一次试探都变成一条通知。
+		return entry.count == loginFailureLimit
 	}
+	return false
 }
 
 // IsLimited 判断主体当前是否处于限流状态。

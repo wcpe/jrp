@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -10,6 +12,40 @@ import (
 
 	"gorm.io/gorm"
 )
+
+// outboxEventIDBytes 是事件标识的随机字节数。
+//
+// 与通知目标标识同量级：事件标识出现在投递出去的载荷里，不可猜测能避免
+// 被外部据以推断业务发生频次。16 字节经 base64 编码为 22 字符，
+// 加上前缀仍在 EventID 的 64 字符列宽内。
+const outboxEventIDBytes = 16
+
+// 已接入的 outbox 事件类型。
+//
+// 规格把「按事件类型订阅与分级路由」列为 P3，因此这里只登记实际产生通知的
+// 业务动作，不建立事件类型到目标的映射关系：每个事件广播给全部启用目标。
+const (
+	// EventTypeTargetCreated 是通知目标被创建。
+	EventTypeTargetCreated = "notification_target_created"
+	// EventTypeTargetUpdated 是通知目标被更新。
+	EventTypeTargetUpdated = "notification_target_updated"
+	// EventTypeTargetDeleted 是通知目标被删除。
+	EventTypeTargetDeleted = "notification_target_deleted"
+	// EventTypeLoginFailureLimit 是管理员登录失败连续达到限流阈值。
+	EventTypeLoginFailureLimit = "admin_login_failure_limit_reached"
+)
+
+// NewOutboxEventID 生成不可猜测的 outbox 事件标识。
+//
+// 用 crypto/rand 而非 math/rand：事件标识参与唯一索引，且随通知投递到外部，
+// 不可预测才能避免被枚举出业务发生的规模。
+func NewOutboxEventID() (string, error) {
+	buffer := make([]byte, outboxEventIDBytes)
+	if _, err := cryptorand.Read(buffer); err != nil {
+		return "", fmt.Errorf("生成通知事件标识失败：%w", err)
+	}
+	return "evt_" + base64.RawURLEncoding.EncodeToString(buffer), nil
+}
 
 // OutboxEnqueue 在业务事务内写入一条待发送记录。
 //
@@ -374,4 +410,47 @@ func (tx *Tx) PendingOutboxCount() (int64, error) {
 		return 0, fmt.Errorf("统计待发送通知失败：%w", translateSQLError(err))
 	}
 	return count, nil
+}
+
+// BroadcastOutbox 在业务事务内为每个启用目标各写一条待发送记录。
+//
+// 规格把「按事件类型订阅与分级路由」列为 P3，P1 没有订阅关系可依据，因此
+// 事件对每个启用目标各产生一条：一条记录对应一次真实投递，成败各自独立，
+// 不会因某个目标失败而牵连其他目标。没有启用目标时不写任何记录，也不报错——
+// 没有任何接收方本就无通知可发。
+//
+// excludeID 排除被本次动作变更的那个目标：通知配置被变更是要让**其余**目标
+// 的管理员知道，发给变更对象自己是自我指涉，且它随后一旦被停用或删除，这条
+// 记录会立刻被清理扫掉——留不下任何东西，只是空转。
+//
+// 调用方必须已在事务内：记录与业务结果同生共死，这是事务 outbox 的语义
+// （FR-15 §3.2）。
+func (tx *Tx) BroadcastOutbox(eventType, payload, excludeID string) (int, error) {
+	if eventType == "" {
+		return 0, errors.New("outbox 事件类型不能为空")
+	}
+	targets, err := tx.NotificationTargets()
+	if err != nil {
+		return 0, err
+	}
+	written := 0
+	for _, target := range targets {
+		if !target.Enabled || target.ID == excludeID {
+			continue
+		}
+		eventID, err := NewOutboxEventID()
+		if err != nil {
+			return 0, err
+		}
+		if _, err := tx.OutboxEnqueue(NotificationOutbox{
+			EventID:   eventID,
+			TargetID:  target.ID,
+			EventType: eventType,
+			Payload:   payload,
+		}); err != nil {
+			return 0, err
+		}
+		written++
+	}
+	return written, nil
 }

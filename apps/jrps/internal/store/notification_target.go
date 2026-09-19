@@ -273,6 +273,13 @@ func (tx *Tx) CreateNotificationTarget(actor Actor, input NotificationTargetInpu
 	if err != nil {
 		return NotificationTargetView{}, err
 	}
+	// 与业务写入同属一个事务：上面的闭包若返回错误，这里便不会执行，
+	// 不存在"业务已回滚却发出通知"的窗口。排除新建的目标自身：它此刻刚入库，
+	// 向它投递"你被创建了"只是自我指涉。
+	if _, err := tx.BroadcastOutbox(EventTypeTargetCreated,
+		"通知目标已创建（名称 "+record.Name+"，渠道 "+record.Type+"）", record.ID); err != nil {
+		return NotificationTargetView{}, err
+	}
 	return viewFromNotificationTarget(record), nil
 }
 
@@ -316,6 +323,12 @@ func (tx *Tx) UpdateNotificationTarget(actor Actor, id string, input Notificatio
 			"更新通知目标（渠道 "+replacement.Type+"，秘密已掩码）"); err != nil {
 			return err
 		}
+		// 在停用处理之前广播：目标被停用后其待发送记录会被转入 discarded，
+		// 若放在之后，这条通知会立刻被自己触发的清理扫掉。排除被改的目标自身。
+		if _, err := tx.BroadcastOutbox(EventTypeTargetUpdated,
+			"通知目标已更新（名称 "+replacement.Name+"，渠道 "+replacement.Type+"）", id); err != nil {
+			return err
+		}
 		// 目标被停用时，其待发送记录不再有投递意义。
 		if !replacement.Enabled {
 			return tx.discardForDisabledTarget(id)
@@ -344,6 +357,20 @@ func (tx *Tx) DeleteNotificationTarget(actor Actor, id string) error {
 		}
 		if err := tx.db.Where("id = ?", id).Delete(&NotificationTarget{}).Error; err != nil {
 			return fmt.Errorf("删除通知目标失败：%w", translateSQLError(err))
+		}
+		// 删除事件不指定目标：目标此刻已从库中消失，发送器必然找不到它，
+		// 带上 TargetID 会让这条通知以"投递失败"的面貌出现在运维视野里，
+		// 而真实原因是目标已不存在。留空由发送器广播给其余启用目标。
+		eventID, err := NewOutboxEventID()
+		if err != nil {
+			return err
+		}
+		if _, err := tx.OutboxEnqueue(NotificationOutbox{
+			EventID:   eventID,
+			EventType: EventTypeTargetDeleted,
+			Payload:   "通知目标已删除（名称 " + existing.Name + "，渠道 " + existing.Type + "）",
+		}); err != nil {
+			return err
 		}
 		return writeTargetAudit(tx, actor, ActionNotificationTargetDelete, id,
 			"删除通知目标（渠道 "+existing.Type+"）")

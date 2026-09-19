@@ -54,6 +54,35 @@ func (loader storeTargetLoader) LoadTarget(_ context.Context, targetID string) (
 	}, nil
 }
 
+// LoadEnabledTargets 读取全部启用目标，供未指定目标的广播事件使用。
+//
+// 单独提供而不是让调用方拼 LoadTarget：逐个按 ID 加载需要先知道 ID 列表，
+// 那会把 store 的查询细节泄漏到本层之外。
+func (loader storeTargetLoader) LoadEnabledTargets(_ context.Context) ([]notify.Target, error) {
+	var records []store.NotificationTarget
+	if err := loader.store.View(context.Background(), func(tx *store.Tx) error {
+		return tx.DB().Where("enabled = ?", true).Find(&records).Error
+	}); err != nil {
+		return nil, err
+	}
+	targets := make([]notify.Target, 0, len(records))
+	for _, record := range records {
+		targets = append(targets, notify.Target{
+			ID:           record.ID,
+			Type:         record.Type,
+			Name:         record.Name,
+			Secret:       record.Secret,
+			WebhookURL:   record.WebhookURL,
+			SMTPHost:     record.SMTPHost,
+			SMTPPort:     record.SMTPPort,
+			SMTPFrom:     record.SMTPFrom,
+			SMTPTo:       splitRecipients(record.SMTPTo),
+			SMTPSecurity: record.SMTPSecurity,
+		})
+	}
+	return targets, nil
+}
+
 // splitRecipients 把逗号分隔的收件人拆成列表，忽略空白项。
 func splitRecipients(value string) []string {
 	if strings.TrimSpace(value) == "" {
@@ -81,7 +110,21 @@ type outboxSender struct {
 }
 
 // Send 按 outbox 记录投递通知。
+//
+// 记录未指定目标时广播给全部启用目标：删除类事件无法指向任何目标——被删的
+// 目标此刻已不存在，指向它会让记录以"投递失败"收场，而真实原因是目标已消失。
+// 广播时只有投递全部失败才返回错误，避免部分目标故障让整条记录反复重试、
+// 把同一条通知重复塞给已经收过的目标。
 func (adapter outboxSender) Send(ctx context.Context, entry store.NotificationOutbox) error {
+	notification := notify.Notification{
+		EventID:    entry.EventID,
+		EventType:  entry.EventType,
+		OccurredAt: entry.CreatedAt,
+		Payload:    entry.Payload,
+	}
+	if entry.TargetID == "" {
+		return adapter.broadcast(ctx, notification)
+	}
 	target, err := adapter.loader.LoadTarget(ctx, entry.TargetID)
 	if err != nil {
 		if errors.Is(err, notify.ErrTargetNotFound) {
@@ -90,13 +133,36 @@ func (adapter outboxSender) Send(ctx context.Context, entry store.NotificationOu
 		}
 		return notify.RetryableDeliveryError("读取通知目标失败")
 	}
-	notification := notify.Notification{
-		EventID:    entry.EventID,
-		EventType:  entry.EventType,
-		OccurredAt: entry.CreatedAt,
-		Payload:    entry.Payload,
-	}
 	return adapter.sender.Send(ctx, target, notification)
+}
+
+// broadcast 把通知投递给全部启用目标。
+func (adapter outboxSender) broadcast(ctx context.Context, notification notify.Notification) error {
+	targets, err := adapter.loader.LoadEnabledTargets(ctx)
+	if err != nil {
+		return notify.RetryableDeliveryError("读取通知目标失败")
+	}
+	if len(targets) == 0 {
+		// 没有任何接收方：这不是故障，重试也不会凭空产生目标。
+		if adapter.logger != nil {
+			adapter.logger.Warn("广播通知时无启用目标，该事件无人接收",
+				"eventType", notification.EventType, "eventID", notification.EventID)
+		}
+		return nil
+	}
+	var lastError error
+	delivered := 0
+	for index := range targets {
+		if err := adapter.sender.Send(ctx, targets[index], notification); err != nil {
+			lastError = err
+			continue
+		}
+		delivered++
+	}
+	if delivered == 0 {
+		return lastError
+	}
+	return nil
 }
 
 // testNotifier 执行测试通知投递。

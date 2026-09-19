@@ -363,3 +363,103 @@ func TestRateLimitDoesNotAffectActiveSession(t *testing.T) {
 		t.Fatal("限流不得使已建立的会话失效")
 	}
 }
+
+// 连续登录失败跨过限流阈值时产生一条通知。
+//
+// 回归用例：FR-15 的 outbox 此前没有任何生产写入点。登录失败是本阶段第一个
+// 接入的业务动作，且按"只在阈值点发一次"接入——单次失败是噪声，达到阈值才
+// 意味着有人在尝试爆破管理员凭据。
+func TestLoginFailureLimitEnqueuesNotification(t *testing.T) {
+	database := openInitializedStore(t, "correct-horse-battery")
+	// 需要一个启用目标作为接收方，否则广播无人可发。
+	if err := database.Transaction(context.Background(), func(tx *store.Tx) error {
+		_, err := tx.CreateNotificationTarget(store.ActorAdmin("admin"), store.NotificationTargetInput{
+			Name: "运维群", Type: store.NotificationTypeWebhook, Enabled: true,
+			WebhookURL: "https://hooks.example.com/hook", Secret: "webhook-secret-value",
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("创建通知目标失败：%v", err)
+	}
+	router := newTestRouter(database)
+
+	countOutbox := func(t *testing.T, eventType string) int {
+		t.Helper()
+		var total int
+		if err := database.View(context.Background(), func(tx *store.Tx) error {
+			entries, err := tx.OutboxEntries()
+			if err != nil {
+				return err
+			}
+			for _, entry := range entries {
+				if entry.EventType == eventType {
+					total++
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("读取 outbox 失败：%v", err)
+		}
+		return total
+	}
+
+	// 前 threshold-1 次失败不应产生通知。
+	for attempt := 1; attempt < loginFailureLimit; attempt++ {
+		doLogin(t, router, `{"username":"admin","password":"wrong-password"}`)
+		if got := countOutbox(t, store.EventTypeLoginFailureLimit); got != 0 {
+			t.Fatalf("第 %d 次失败不应产生通知，实际已产生 %d 条", attempt, got)
+		}
+	}
+
+	// 第 threshold 次跨过阈值，产生且仅产生一条。
+	doLogin(t, router, `{"username":"admin","password":"wrong-password"}`)
+	if got := countOutbox(t, store.EventTypeLoginFailureLimit); got != 1 {
+		t.Fatalf("达到阈值应产生 1 条通知，实际 %d 条", got)
+	}
+}
+
+// 登录成功不产生登录失败通知，且会重置阈值。
+func TestSuccessfulLoginResetsFailureNotification(t *testing.T) {
+	database := openInitializedStore(t, "correct-horse-battery")
+	if err := database.Transaction(context.Background(), func(tx *store.Tx) error {
+		_, err := tx.CreateNotificationTarget(store.ActorAdmin("admin"), store.NotificationTargetInput{
+			Name: "运维群", Type: store.NotificationTypeWebhook, Enabled: true,
+			WebhookURL: "https://hooks.example.com/hook", Secret: "webhook-secret-value",
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("创建通知目标失败：%v", err)
+	}
+	router := newTestRouter(database)
+
+	// 制造两次失败（未达阈值），随后成功登录。
+	doLogin(t, router, `{"username":"admin","password":"wrong-password"}`)
+	doLogin(t, router, `{"username":"admin","password":"wrong-password"}`)
+	recorder := doLogin(t, router, `{"username":"admin","password":"correct-horse-battery"}`)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("正确凭据应登录成功，实际 %d：%s", recorder.Code, recorder.Body.String())
+	}
+
+	// 成功后阈值被重置，再失败两次仍不应触发通知。
+	for attempt := 0; attempt < loginFailureLimit-1; attempt++ {
+		doLogin(t, router, `{"username":"admin","password":"wrong-password"}`)
+	}
+	var total int
+	if err := database.View(context.Background(), func(tx *store.Tx) error {
+		entries, err := tx.OutboxEntries()
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			if entry.EventType == store.EventTypeLoginFailureLimit {
+				total++
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("读取 outbox 失败：%v", err)
+	}
+	if total != 0 {
+		t.Fatalf("登录成功后阈值应重置，不应产生通知，实际 %d 条", total)
+	}
+}

@@ -290,8 +290,27 @@ func TestNotificationTargetDeleteDiscardsPending(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("读取 outbox 失败：%v", err)
 	}
-	if len(entries) != 1 || entries[0].Status != store.OutboxStatusDiscarded {
+	// 两类记录分开断言：在途记录必须被清理，而删除事件本身是删除动作新产生的
+	// 通知，它不属于"在途"，不该被清理掉。
+	var discarded, deletionEvents []store.NotificationOutbox
+	for _, entry := range entries {
+		switch entry.EventType {
+		case store.EventTypeTargetDeleted:
+			deletionEvents = append(deletionEvents, entry)
+		default:
+			discarded = append(discarded, entry)
+		}
+	}
+	if len(discarded) != 1 || discarded[0].Status != store.OutboxStatusDiscarded {
 		t.Fatalf("删除目标后在途记录应转入 discarded：%+v", entries)
+	}
+	if len(deletionEvents) != 1 {
+		t.Fatalf("删除应产生一条删除事件：%+v", entries)
+	}
+	// 删除事件不指向任何目标：被删的目标已不存在，指向它会让这条记录以
+	// "投递失败"收场，而真实原因是目标已消失。
+	if deletionEvents[0].TargetID != "" {
+		t.Fatalf("删除事件不应指定目标，实际 %q", deletionEvents[0].TargetID)
 	}
 	assertAuditAction(t, database, store.ActionNotificationTargetDelete)
 }

@@ -378,3 +378,108 @@ func TestUpdateNotificationTargetKeepsEnabledWhenOmitted(t *testing.T) {
 		t.Fatal("省略启用状态时不得把已启用的目标停用")
 	}
 }
+
+// 目标变更动作必须为每个其他启用目标各写一条 outbox 记录。
+//
+// 回归用例：FR-15 的发送侧此前已完整，但 outbox 没有任何生产写入点——
+// 业务动作未接入，通知在真实运行中永远不会产生。本用例守住"业务动作写入
+// outbox"这一环，且验证是同事务的：动作失败时不得留下孤立的通知。
+func TestTargetChangeEnqueuesOutboxForOtherTargets(t *testing.T) {
+	database := openQueryStore(t)
+	first := createWebhookTarget(t, database, "第一个目标", true)
+
+	// 第二个目标的创建应给第一个目标写一条通知，但不写给自己。
+	second := createWebhookTarget(t, database, "第二个目标", true)
+	entries := mustOutboxEntries(t, database)
+	if len(entries) != 1 {
+		t.Fatalf("第二个目标创建应产生 1 条通知（只给第一个目标），实际 %d：%+v", len(entries), entries)
+	}
+	if entries[0].TargetID != first.ID {
+		t.Fatalf("通知应投递给第一个目标，实际 %q", entries[0].TargetID)
+	}
+	if entries[0].EventType != EventTypeTargetCreated {
+		t.Fatalf("事件类型应为 %q，实际 %q", EventTypeTargetCreated, entries[0].EventType)
+	}
+	if entries[0].Status != OutboxStatusPending {
+		t.Fatalf("新写入的通知应处于待发送，实际 %q", entries[0].Status)
+	}
+
+	// 更新第二个目标同样只通知第一个。
+	if err := database.Transaction(context.Background(), func(tx *Tx) error {
+		_, err := tx.UpdateNotificationTarget(ActorAdmin("admin"), second.ID, NotificationTargetInput{
+			Name: "第二个目标改名", Type: NotificationTypeWebhook,
+			WebhookURL: "https://hooks.example.com/hook",
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("更新目标失败：%v", err)
+	}
+	entries = mustOutboxEntries(t, database)
+	if len(entries) != 2 {
+		t.Fatalf("更新后应共 2 条通知，实际 %d：%+v", len(entries), entries)
+	}
+}
+
+// 停用的目标不接收通知。
+func TestTargetChangeSkipsDisabledTargets(t *testing.T) {
+	database := openQueryStore(t)
+	createWebhookTarget(t, database, "停用目标", false)
+	createWebhookTarget(t, database, "第二个目标", true)
+
+	// 唯一启用的是第二个目标，而它是本次创建的对象，被排除在接收方之外，
+	// 因此没有任何接收方，不产生通知。
+	if entries := mustOutboxEntries(t, database); len(entries) != 0 {
+		t.Fatalf("无其他启用目标时不应产生通知，实际 %d：%+v", len(entries), entries)
+	}
+}
+
+// 删除目标产生的事件不指向任何目标。
+//
+// 回归用例：删除是硬删除，目标行会消失。若事件带着 TargetID，发送器必然
+// 找不到目标并把它记为投递失败——而 failed 会被读成"投递出了问题"，
+// 真实原因却是目标已不存在（规格 §3.6 要求不得静默丢失，也不得误报）。
+func TestDeleteTargetEnqueuesEventWithoutTarget(t *testing.T) {
+	database := openQueryStore(t)
+	target := createWebhookTarget(t, database, "待删除", true)
+
+	if err := database.Transaction(context.Background(), func(tx *Tx) error {
+		return tx.DeleteNotificationTarget(ActorAdmin("admin"), target.ID)
+	}); err != nil {
+		t.Fatalf("删除目标失败：%v", err)
+	}
+
+	entries := mustOutboxEntries(t, database)
+	if len(entries) != 1 {
+		t.Fatalf("删除应产生 1 条事件，实际 %d：%+v", len(entries), entries)
+	}
+	if entries[0].TargetID != "" {
+		t.Fatalf("删除事件不应指向目标，实际 %q", entries[0].TargetID)
+	}
+	if entries[0].EventType != EventTypeTargetDeleted {
+		t.Fatalf("事件类型应为 %q，实际 %q", EventTypeTargetDeleted, entries[0].EventType)
+	}
+}
+
+// 业务动作失败时不得留下通知。
+//
+// 回归用例：outbox 写入必须与业务结果同事务。若通知已写而业务回滚，
+// 管理员会收到一条对应"从未发生过的变更"的通知。
+func TestFailedTargetChangeLeavesNoOutbox(t *testing.T) {
+	database := openQueryStore(t)
+	createWebhookTarget(t, database, "存在目标", true)
+
+	// 更新一个不存在的目标：事务整体回滚。
+	if err := database.Transaction(context.Background(), func(tx *Tx) error {
+		_, err := tx.UpdateNotificationTarget(ActorAdmin("admin"), "nt_missing", NotificationTargetInput{
+			Name: "改名", Type: NotificationTypeWebhook,
+			WebhookURL: "https://hooks.example.com/hook",
+		})
+		return err
+	}); err == nil {
+		t.Fatal("更新不存在的目标应失败")
+	}
+
+	if entries := mustOutboxEntries(t, database); len(entries) != 0 {
+		t.Fatalf("业务失败时不得留下通知，实际 %d：%+v", len(entries), entries)
+	}
+}

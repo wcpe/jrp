@@ -127,11 +127,25 @@ func (api *sessionAPI) login(c *gin.Context) {
 }
 
 // handleLoginFailure 记录失败尝试并写入审计，对外只返回统一问题详情。
+//
+// 连续失败跨过限流阈值时额外入队一条通知：单次失败是噪声，而达到阈值意味着
+// 有人在尝试爆破管理员凭据，这是真正需要管理员离开控制台也能知道的事。
 func (api *sessionAPI) handleLoginFailure(c *gin.Context, username string, err error) {
 	if errors.Is(err, store.ErrInvalidCredentials) {
-		api.limiter.RecordFailure(username)
+		reachedLimit := api.limiter.RecordFailure(username)
+		// 审计与通知同事务：任一步失败则两者都不落库，不留下"已告警但无审计"
+		// 或反向的残缺痕迹。返回值仍被丢弃——登录失败没有业务副作用要回滚，
+		// 留痕失败不该把 401 变成 500，只记日志。
 		_ = api.store.Transaction(c.Request.Context(), func(tx *store.Tx) error {
-			return tx.RecordLoginFailure(username)
+			if err := tx.RecordLoginFailure(username); err != nil {
+				return err
+			}
+			if !reachedLimit {
+				return nil
+			}
+			_, err := tx.BroadcastOutbox(store.EventTypeLoginFailureLimit,
+				"管理员登录连续失败已达到限流阈值，该账号已被临时锁定", "")
+			return err
 		})
 		writeProblem(c, http.StatusUnauthorized, codeUnauthenticated, "登录失败", "用户名或密码错误")
 		return
