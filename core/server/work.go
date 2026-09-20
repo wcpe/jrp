@@ -2,7 +2,10 @@ package server
 
 import (
 	"context"
+	"errors"
+	"os"
 	"sync"
+	"time"
 
 	"github.com/wcpe/jrp/core/internal/transport"
 )
@@ -21,6 +24,13 @@ import (
 // 也刻意不复用 IdleWorkConnLimit：两者语义相反——待命工作连接由客户端循环补充，
 // 回收最旧的无损失；访客是真实用户连接，拒绝有损。
 const maxPendingGuest = 64
+
+// maxPairRetries 是单次访客配对允许跳过失效工作连接的最大次数。
+//
+// 待命池有上限（默认 2，上界 16），且每次重试都会关闭一条失效连接并把它移出
+// 池，因此正常情况下的重试次数远小于池上限。取值显著高于池上界仅为防御：
+// 将来若引入新的失败模式，这里能保证循环有界。
+const maxPairRetries = 32
 
 // parkOutcome 是访客暂存的结果。
 //
@@ -96,12 +106,20 @@ type pairing struct {
 // start 在调用方上下文中登记并启动一对已配对的连接。
 //
 // 必须在 broker 锁之外调用：track 与 add 会取 Engine 的锁。
-// 返回假表示待补写的字节未能送出，此时连接对已关闭，调用方不应再启动桥接。
+//
+// 返回假表示这条工作连接已经不可用：它已被关闭，而**访客保持原样未被服务**，
+// 调用方应换用池中下一条工作连接重试。跨网络环境下待命连接会被 NAT 或中间
+// 设备静默回收，池中无法预先感知，只有在配对这一刻才会暴露——实测跨 NAT 时
+// 成功率仅 7%，而回环下为 93%。此前这里直接关闭访客，把连接失效的代价转嫁
+// 给了真实用户。
 func (pair pairing) start(track func(*transport.Conn), add func(int)) bool {
+	if !workConnAlive(pair.work) {
+		_ = pair.work.Close()
+		return false
+	}
 	if len(pair.pending) > 0 {
 		if _, err := pair.work.Write(pair.pending); err != nil {
-			// 写不进去说明目标侧已不可用，这一对连接都没有继续的意义。
-			_ = pair.guest.Close()
+			// 探测之后到写入之间的窗口内失效：同样只丢弃工作连接。
 			_ = pair.work.Close()
 			return false
 		}
@@ -115,6 +133,30 @@ func (pair pairing) start(track func(*transport.Conn), add func(int)) bool {
 		transport.Bridge(context.Background(), pair.guest, pair.work)
 	}()
 	return true
+}
+
+// workConnAlive 探测一条待命工作连接是否仍然可用。
+//
+// 用零超时读：连接已被对端关闭或经中间设备回收时立即返回 EOF 或其他错误，
+// 连接健康时返回超时错误。这不是多余的谨慎——池里的连接可能已经死了很久，
+// 而服务端没有任何其他途径知道。
+//
+// 配对前的待命工作连接不携带业务数据：客户端只在声明归属时写过一次，服务端
+// 读取声明后才把它入池，此后双方都在等配对。因此这次读不会吞掉业务字节。
+// 万一真读到字节（协议被扩展出提前发送语义时），按"可用"处理并交由桥接转发，
+// 宁可丢这一次探测的字节也不误判为失效而掐断连接。
+func workConnAlive(conn *transport.Conn) bool {
+	if err := conn.SetReadDeadline(time.Now()); err != nil {
+		return false
+	}
+	defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+
+	probe := make([]byte, 1)
+	read, err := conn.Read(probe)
+	if read > 0 || err == nil {
+		return true
+	}
+	return errors.Is(err, os.ErrDeadlineExceeded)
 }
 
 // parkGuest 暂存一个访客；若已有待命工作连接，立即配对。

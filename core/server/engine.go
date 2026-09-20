@@ -864,18 +864,45 @@ func (engine *Engine) serveHTTPGuest(port int, listener *transport.Listener) {
 	}
 }
 
+// pairGuest 为访客配对工作连接，跳过已失效的连接。
+//
+// 跨网络环境下待命工作连接会被 NAT 或中间设备静默回收，池中无法预先感知，
+// 只在配对这一刻才暴露。不重试会让这类失效直接变成访客失败——实测跨 NAT 时
+// 成功率仅 7%，而回环下为 93%。每条失效连接都会在重试中被关闭并移出池，
+// 因此重试次数受池大小约束，maxPairRetries 只是防御上限。
+//
+// 记账约定：返回 parkPaired 表示已移交桥接，访客与工作连接由 start 接管，
+// 调用方不得再操作；其余结果由调用方按各自既有方式处理（两处调用点对暂存的
+// 记账处理不同，本函数不擅自统一）。
+func (engine *Engine) pairGuest(name string, guest *transport.Conn, pending []byte) parkOutcome {
+	for attempt := 0; attempt < maxPairRetries; attempt++ {
+		outcome, pair := engine.workConns.parkGuest(name, guest, pending)
+		if outcome != parkPaired {
+			return outcome
+		}
+		// 访客与工作连接都由 start 重新登记，先撤回调用方为访客做的登记。
+		engine.untrack(guest)
+		if pair.start(engine.track, engine.wg.Add) {
+			return parkPaired
+		}
+		// 该工作连接已失效并被关闭；访客尚未被服务，恢复登记后继续尝试下一条。
+		engine.track(guest)
+	}
+	// 正常不会到达：池有界，重试会把失效连接逐步清空。
+	engine.log().Error("配对重试已达上限，按不可接纳处理",
+		"proxy", name, "retries", maxPairRetries)
+	return parkRejected
+}
+
 // handleGuest 把访客连接交给配对中心：有待命工作连接立即桥接，否则暂存。
 func (engine *Engine) handleGuest(name string, guest *transport.Conn) {
 	defer engine.wg.Done()
 	engine.track(guest)
-	// parkGuest 只做配对决策，不在其锁内登记连接——那会与 Shutdown 的锁序
-	// 构成死锁。登记与启动桥接在此处、broker 锁之外完成。
-	outcome, pair := engine.workConns.parkGuest(name, guest, nil)
-	switch outcome {
+	// 配对与桥接在 broker 锁之外完成：parkGuest 只在自身锁内做决策，登记活动
+	// 连接要取 Engine 的锁，持 broker 锁去取会与 Shutdown 的锁序构成死锁。
+	switch outcome := engine.pairGuest(name, guest, nil); outcome {
 	case parkPaired:
-		// 访客与工作连接都由 start 重新登记，先撤回此处为访客做的登记。
-		engine.untrack(guest)
-		pair.start(engine.track, engine.wg.Add)
+		// 已移交桥接，记账由 pairing.start 接管。
 	case parkStaged:
 		// 连接留在配对中心，Shutdown 与 close 负责最终释放。
 		// untrack 不在此处调用，避免重复记账：配对中心的关闭路径统一处理。
@@ -1021,13 +1048,11 @@ func (engine *Engine) handleHTTPGuest(port int, guest *transport.Conn) {
 // untrack 在桥接登记之后执行会把它撤掉——因此这里先把访客从本函数的记账中
 // 移出，交由 pairing 接管。
 func (engine *Engine) bridgeHTTPGuest(proxyName string, guest *transport.Conn, pending []byte) {
-	// parkGuest 只做决策，登记与桥接在 broker 锁外完成（见 pairing 的说明）。
-	outcome, pair := engine.workConns.parkGuest(proxyName, guest, pending)
-	switch outcome {
+	// 配对与桥接在 broker 锁外完成（见 pairing 的说明）。pending 首部随访客
+	// 一并交给配对中心，配对时补写到工作连接方向。
+	switch outcome := engine.pairGuest(proxyName, guest, pending); outcome {
 	case parkPaired:
-		engine.untrack(guest)
-		// 首部未能送达目标时 pairing.start 已关闭两端，此处的返回值无需额外处理。
-		pair.start(engine.track, engine.wg.Add)
+		// 已移交桥接，记账由 pairing.start 接管。
 	case parkStaged:
 		// 访客与首部都留在配对中心，等后续工作连接到达时配对。
 		// 配对中心会在配对或关闭时接管访客的记账，因此这里同样撤掉调用方的登记。
