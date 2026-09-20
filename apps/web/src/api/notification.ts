@@ -96,3 +96,61 @@ export async function deleteTarget(id: string, csrfToken: string): Promise<void>
     throw new Error(await problemDetail(response));
   }
 }
+
+/** 发送一条测试通知；服务端投递失败时返回 502，此处如实抛错。 */
+export async function sendTestNotification(id: string, csrfToken: string): Promise<string> {
+  const response = await fetch(`/api/v1/notification-targets/${encodeURIComponent(id)}:test`, {
+    method: 'POST',
+    headers: { 'X-CSRF-Token': csrfToken },
+  });
+  if (!response.ok) {
+    throw new Error(await problemDetail(response));
+  }
+  const payload: unknown = await response.json();
+  if (isRecord(payload) && typeof payload.message === 'string') {
+    return payload.message;
+  }
+  return '测试通知已发送';
+}
+
+export interface NotificationDelivery {
+  id: number;
+  eventId: string;
+  targetId: string;
+  eventType: string;
+  status: string;
+  attempts: number;
+  lastError: string;
+  nextAttemptAt: string;
+  stoppedAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+function isDelivery(value: unknown): value is NotificationDelivery {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'number' &&
+    typeof value.eventId === 'string' &&
+    typeof value.status === 'string' &&
+    typeof value.attempts === 'number'
+  );
+}
+
+/**
+ * 读取投递结果，只取已停止重试的记录。
+ *
+ * 用 `stopped=true` 而不是在客户端过滤：页面要呈现的是"最终失败状态"
+ * （FR-15 §5），把仍在重试的记录混进来会把"正在重试"误报成"已失败"。
+ */
+export async function fetchStoppedDeliveries(): Promise<NotificationDelivery[]> {
+  const response = await fetch('/api/v1/notification-deliveries?stopped=true&limit=20');
+  if (!response.ok) {
+    throw new Error(await problemDetail(response));
+  }
+  const payload: unknown = await response.json();
+  if (!isRecord(payload) || !Array.isArray(payload.items) || !payload.items.every(isDelivery)) {
+    throw new Error('投递结果返回了无法识别的数据');
+  }
+  return payload.items;
+}

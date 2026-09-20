@@ -257,6 +257,25 @@ type NotificationOutbox struct {
 
 func (NotificationOutbox) TableName() string { return "notification_outbox" }
 
+// outboxStatuses 是投递状态的封闭枚举。
+//
+// 与审计动作、对象类型同样按封闭枚举校验：查询参数里出现枚举外的值时返回
+// 400，而不是静默忽略让调用方误以为过滤生效。
+var outboxStatuses = map[string]struct{}{
+	OutboxStatusPending:   {},
+	OutboxStatusSending:   {},
+	OutboxStatusSent:      {},
+	OutboxStatusRetrying:  {},
+	OutboxStatusFailed:    {},
+	OutboxStatusDiscarded: {},
+}
+
+// IsOutboxStatus 判断投递状态是否在封闭枚举内。
+func IsOutboxStatus(status string) bool {
+	_, ok := outboxStatuses[status]
+	return ok
+}
+
 // RequestRecord 是 HTTP 请求元数据，仅在采集开启时产生（ADR-0007）。
 type RequestRecord struct {
 	ID            uint64    `gorm:"primaryKey"`

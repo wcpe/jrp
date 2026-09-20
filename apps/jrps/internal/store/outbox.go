@@ -365,6 +365,34 @@ func (tx *Tx) OutboxEntries() ([]NotificationOutbox, error) {
 	return entries, nil
 }
 
+// MarkOutboxTerminalForTest 把指定事件置为终态，仅供测试构造失败证据。
+//
+// 生产路径的状态流转只发生在发送器的抢占与结果记录中，那些路径要求真实
+// 投递；测试若要断言终态查询，需要一个不经过投递的构造入口。
+//
+// 只有 failed 与 discarded 会写入 StoppedAt：仍在重试的记录没有"停止时间"，
+// 给它写上会让"何时停止重试"这个字段失去意义。
+func (tx *Tx) MarkOutboxTerminalForTest(eventID, status string, attempts int, lastError string, stoppedAt time.Time) error {
+	if !IsOutboxStatus(status) {
+		return fmt.Errorf("状态不在封闭枚举内：%s", status)
+	}
+	updates := map[string]any{
+		"attempts":   attempts,
+		"last_error": lastError,
+		"status":     status,
+	}
+	if status == OutboxStatusFailed || status == OutboxStatusDiscarded {
+		updates["stopped_at"] = stoppedAt.UTC()
+	}
+	err := tx.db.Model(&NotificationOutbox{}).
+		Where("event_id = ?", eventID).
+		Updates(updates).Error
+	if err != nil {
+		return fmt.Errorf("更新投递记录失败：%w", translateSQLError(err))
+	}
+	return nil
+}
+
 // DiscardOutboxForTarget 把某目标的全部在途记录转入 discarded。
 //
 // 目标被禁用或删除后，其待发送记录已无投递意义：继续重试只会对着一个不存在

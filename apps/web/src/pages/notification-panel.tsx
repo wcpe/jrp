@@ -3,7 +3,13 @@ import { useState } from 'react';
 
 import { SignalTag } from '@jrp/ui';
 
-import { createWebhookTarget, deleteTarget, fetchTargets } from '../api/notification';
+import {
+  createWebhookTarget,
+  deleteTarget,
+  fetchStoppedDeliveries,
+  fetchTargets,
+  sendTestNotification,
+} from '../api/notification';
 
 /**
  * 通知目标管理面板。
@@ -40,6 +46,19 @@ export function NotificationPanel({ csrfToken }: { csrfToken: string }) {
     onSuccess: invalidate,
   });
 
+  // 投递结果只在有目标时查询：没有目标就没有投递记录，省掉一次必然为空的请求。
+  const deliveries = useQuery({
+    queryFn: fetchStoppedDeliveries,
+    queryKey: ['notification-deliveries'],
+  });
+
+  const sendTest = useMutation({
+    mutationFn: (id: string) => sendTestNotification(id, csrfToken),
+    onSuccess: async () => {
+      await deliveries.refetch();
+    },
+  });
+
   return (
     <section className="notification-section" aria-labelledby="notification-title">
       <div className="section-heading">
@@ -70,6 +89,14 @@ export function NotificationPanel({ csrfToken }: { csrfToken: string }) {
                 </div>
                 <button
                   className="list-action"
+                  disabled={sendTest.isPending}
+                  onClick={() => sendTest.mutate(target.id)}
+                  type="button"
+                >
+                  {sendTest.isPending ? '发送中…' : '测试'}
+                </button>
+                <button
+                  className="list-action"
                   disabled={remove.isPending}
                   onClick={() => remove.mutate(target.id)}
                   type="button"
@@ -84,6 +111,41 @@ export function NotificationPanel({ csrfToken }: { csrfToken: string }) {
               {remove.error.message}
             </p>
           ) : null}
+          {sendTest.isError ? (
+            <p className="form-error" role="alert">
+              {sendTest.error.message}
+            </p>
+          ) : null}
+          {sendTest.isSuccess ? (
+            <p className="form-note" role="status">
+              {sendTest.data}
+            </p>
+          ) : null}
+        </div>
+
+        <div className="delivery-board">
+          <h3>发送结果</h3>
+          {deliveries.isPending ? <p>正在读取投递结果…</p> : null}
+          {deliveries.isError ? (
+            <p className="form-error" role="alert">
+              {deliveries.error.message}
+            </p>
+          ) : null}
+          {deliveries.data && deliveries.data.length === 0 ? <p>暂无停止重试的投递记录。</p> : null}
+          <ul>
+            {(deliveries.data ?? []).map((delivery) => (
+              <li key={delivery.id}>
+                <div>
+                  <strong>{delivery.status === 'discarded' ? '已丢弃' : '最终失败'}</strong>
+                  <span>
+                    {delivery.eventType} · 尝试 {delivery.attempts} 次
+                  </span>
+                  {delivery.lastError ? <span>{delivery.lastError}</span> : null}
+                  {delivery.stoppedAt ? <span>停止于 {delivery.stoppedAt}</span> : null}
+                </div>
+              </li>
+            ))}
+          </ul>
         </div>
 
         <form

@@ -68,6 +68,7 @@ func registerAPI(router *gin.Engine, options RouterOptions) {
 	audit := newAuditAPI(options)
 	policy := newPolicyAPI(options)
 	notification := newNotificationAPI(options)
+	delivery := newDeliveryAPI(options)
 	guard := requireInitialized(options.Store)
 	router.Use(func(context *gin.Context) {
 		if strings.HasPrefix(context.Request.URL.Path, "/api") {
@@ -100,6 +101,11 @@ func registerAPI(router *gin.Engine, options RouterOptions) {
 	// 无法写出 `:targetId:test`（会 panic），因此用 catch-all 捕获整段再在处理器
 	// 内切分后缀，保证对外 URL 与契约逐字一致。
 	api.POST("/notification-targets/*action", session.authenticate(true), notification.test)
+
+	// 投递结果查询：读取需会话。供 Web 通知页展示发送结果与最终失败状态
+	// （FR-15 §3.3“测试通知入口与发送结果查询”、§5“失败次数、脱敏摘要与
+	// 停止时间可被运维查询”）。只读，不要求 CSRF。
+	api.GET("/notification-deliveries", session.authenticate(false), delivery.list)
 }
 
 func statusHandler(context *gin.Context) {

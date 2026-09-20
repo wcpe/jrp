@@ -795,3 +795,51 @@ code,
 .list-action:disabled {
   opacity: 0.6;
 }
+
+/* 投递结果面板：与目标列表并列，呈现失败终态的次数、脱敏摘要与停止时间。 */
+.delivery-board {
+  background: rgba(12, 14, 18, 0.72);
+  border: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 1rem;
+}
+
+.delivery-board h3 {
+  font-size: 0.95rem;
+  letter-spacing: 0.04em;
+  margin: 0;
+}
+
+.delivery-board ul {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.delivery-board li > div {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.delivery-board li strong {
+  color: var(--alert);
+  font-size: 0.85rem;
+}
+
+.delivery-board li span {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+/* 测试通知的成功提示：中性色，与错误提示区分。 */
+.form-note {
+  color: var(--muted);
+  font-size: 0.82rem;
+  margin: 0;
+}
