@@ -269,7 +269,13 @@ func TestConnPeerTerminationReleasesResources(t *testing.T) {
 	//
 	// 直接 Accept 后立刻重置会与 Dial 产生竞态：负载高的机器上服务端可能早于
 	// 拨号完成就关闭，客户端在拨号阶段即吃到 connection reset，测试还没验证到
-	// 目标行为就已失败。先做一次单向握手即可消除该竞态。
+	// 目标行为就已失败。因此这里做一次完整的单向握手——服务端写入一个字节，
+	// 等到客户端确认读到之后才重置。
+	//
+	// 只做"写入即放行"是不够的：RST 会把内核接收缓冲区里尚未被应用读走的字节
+	// 一并丢弃，客户端随后读到的是连接重置而非握手字节。macOS 上重置到达更快，
+	// 这个窗口会稳定复现，因此必须等对端确认读取完成。
+	handshakeRead := make(chan struct{})
 	ready := make(chan struct{})
 	go func() {
 		conn, err := listener.Accept()
@@ -285,6 +291,8 @@ func TestConnPeerTerminationReleasesResources(t *testing.T) {
 		}
 		_, _ = conn.Write([]byte("r"))
 		close(ready)
+		// 等客户端把字节读走再重置；客户端异常退出时由测试进程结束兜底。
+		<-handshakeRead
 		_ = tcpConn.SetLinger(0)
 		_ = tcpConn.Close()
 	}()
@@ -292,12 +300,18 @@ func TestConnPeerTerminationReleasesResources(t *testing.T) {
 	dialer := transport.Dialer{Timeout: 2 * time.Second}
 	conn, err := dialer.Dial(context.Background(), listener.Addr().String(), transport.PurposeControl)
 	if err != nil {
+		close(handshakeRead)
 		t.Fatalf("拨号失败：%v", err)
 	}
 	defer conn.Close()
 
-	// 等到对端确实接受并写入后再让它重置，保证后续读到的是重置错误而非拨号期错误。
+	// 先读走握手字节，确认连接已建立且对端尚未重置。
 	<-ready
+	handshake := make([]byte, 1)
+	if _, err := io.ReadFull(conn, handshake); err != nil {
+		t.Fatalf("读取握手字节失败：%v", err)
+	}
+	close(handshakeRead)
 
 	deadline := time.Now().Add(3 * time.Second)
 	for {
