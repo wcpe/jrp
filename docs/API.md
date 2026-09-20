@@ -165,6 +165,13 @@ P1 不提供 `/node`、`/cluster`、节点注册、调度或分布式 RPC 端点
   - Webhook 地址必须使用 HTTPS，不得内嵌凭据；SMTP 收件人上限 20。
   - 响应字段：`id`、`name`、`type`、`enabled`、`maskedSecret`、`summary`、渠道配置字段、`createdAt`、`updatedAt`。**不返回明文字段 `secret`**。
   - 校验失败返回 400 且一次给出全部违规项；目标不存在返回 404；**目标已停用返回 409**（停用的含义就是不接收通知，业务投递路径同样拒绝停用目标，两条路径语义保持一致）；渠道未启用返回 503。被拒绝的测试通知同样写入审计，结果记为 `denied`。
+- `GET /api/v1/notification-deliveries`：分页查询通知投递结果，需管理员会话。只读，不要求 CSRF。
+  - 用途：供运维与 Web 通知页查看发送结果，尤其是失败终态的失败次数、最后脱敏错误摘要与停止时间（FR-15 §3.3、§5）。
+  - 过滤参数：`targetId`、`eventType`（事件类型）、`status`（`pending`/`sending`/`sent`/`retrying`/`failed`/`discarded`，封闭枚举）、`stopped`（取 `true` 时只返回已停止重试的 `failed` 与 `discarded`，用于把"仍在重试"排除在"最终失败"之外）。
+  - 过滤值必须是封闭枚举内的取值；非法值返回 400，不静默忽略。
+  - 分页遵循 §1.5：`limit` 默认 50、最大 200；`cursor` 为不透明字符串，非法游标返回 400。排序为最新的记录在前。
+  - 响应字段：`items` 数组（每项含 `id`、`eventId`、`targetId`、`eventType`、`status`、`attempts`、`lastError`、`nextAttemptAt`、`stoppedAt`、`createdAt`、`updatedAt`）与可选 `nextCursor`。`lastError` 在写入时已脱敏，不含堆栈、秘密或内部地址。
+  - **负面契约**：不返回投递载荷原文的完整字段，也不提供删除投递记录的接口；投递记录由保留策略统一清理。
 - `GET /api/v1/audit-events`：分页查询审计事件，需管理员会话。
   - 过滤参数：`from`/`to`（RFC 3339 时间范围，闭区间）、`action`（动作枚举）、`objectType`（对象类型枚举）、`result`（`success`/`failure`/`denied`）。
   - 过滤值必须是封闭枚举内的取值；非法值返回 400，不静默忽略。
