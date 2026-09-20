@@ -79,6 +79,13 @@ func (handle *Listener) Accept(purpose Purpose, proxy ...string) (*Conn, AcceptA
 	if err != nil {
 		return nil, AcceptErrorAction(err), err
 	}
+	// 服务端侧同样启用保活：半开连接是对称问题，客户端的待命连接会被
+	// NAT 回收，服务端视角下的已接入连接同样会。单侧启用只保护一端，
+	// 另一端的死连接仍要等应用层数据失败才暴露。
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(keepAliveInterval)
+	}
 	bound := ""
 	if len(proxy) > 0 {
 		bound = proxy[0]

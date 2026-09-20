@@ -14,6 +14,18 @@ import (
 // 规格 §3.4 禁止无超时拨号：零超时会让不可达地址上的拨号无限悬挂。
 var ErrDialTimeoutMissing = errors.New("拨号必须配置超时")
 
+// keepAliveInterval 是工作与控制连接的 TCP 保活间隔。
+//
+// 待命工作连接可能被 NAT 或中间设备静默回收（连接表项超时后丢弃，两端都
+// 不知道对端已不可达，即"半开连接"）。半开连接上读取只会永远超时、写入
+// 则被本端发送缓冲吞掉而不报错——应用层无从感知，直到真正的业务数据
+// 丢失。保活报文由内核周期性探测：死连接在探测失败后被内核标记关闭，
+// 此后读写立即出错，服务端的配对探测与客户端的重建循环都能立刻得到反馈。
+//
+// 取值 30 秒：显著短于常见 NAT 的 UDP/TCP 空闲回收窗口（家用设备多为
+// 数分钟），保证表项在被回收前就有保活流量刷新。
+const keepAliveInterval = 30 * time.Second
+
 // Dialer 是带超时约束的 TCP 拨号器。
 //
 // 超时是构造参数而非可选修饰：零值拨号器一律拒绝拨号，调用方必须显式给出
@@ -60,7 +72,7 @@ func (dialer Dialer) Dial(ctx context.Context, address string, purpose Purpose, 
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, dialer.Timeout)
 	defer cancel()
-	netDialer := &net.Dialer{Timeout: dialer.Timeout}
+	netDialer := &net.Dialer{Timeout: dialer.Timeout, KeepAlive: keepAliveInterval}
 	conn, err := netDialer.DialContext(dialCtx, "tcp", address)
 	if err != nil {
 		// 拨号失败返回包装错误：不含地址之外的敏感上下文。
