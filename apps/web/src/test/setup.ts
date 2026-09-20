@@ -8,6 +8,8 @@ beforeAll(() => mockServer.listen({ onUnhandledRequest: 'error' }));
 afterEach(() => {
   cleanup();
   mockServer.resetHandlers();
+  // 地址栏在 jsdom 中跨用例保留：复位到首页，避免上一个用例的跳转改变下一个用例的初始位置。
+  window.history.replaceState(null, '', '/');
 });
 afterAll(() => mockServer.close());
 

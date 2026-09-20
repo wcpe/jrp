@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -11,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -38,6 +43,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	dataDirectory := flags.String("data-dir", defaultDataDirectory(), "数据目录，SQLite 与运行数据存放位置")
 	databasePath := flags.String("database", "", "SQLite 主文件路径，缺省为数据目录下的 jrps.db")
 	showVersion := flags.Bool("version", false, "显示版本信息")
+	tlsCert := flags.String("tls-cert", "", "管理服务 TLS 证书路径；与 --tls-key 同时提供即启用 HTTPS")
+	tlsKey := flags.String("tls-key", "", "管理服务 TLS 私钥路径；与 --tls-cert 同时提供即启用 HTTPS")
 	flags.Usage = func() { _ = writeUsage(stderr) }
 	if err := flags.Parse(args); err != nil {
 		return 2
@@ -72,7 +79,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		logger.Error("配置恢复失败，拒绝启动", "错误", err)
 		return 1
 	}
-	return serve(*listen, database, logger)
+	return serve(*listen, *tlsCert, *tlsKey, database, logger)
 }
 
 // openStore 打开独占的配置数据库：迁移失败、数据库归属错误或已有实例占用时返回错误。
@@ -99,7 +106,24 @@ func handleImmediateCommand(args []string, stdout io.Writer) (bool, int) {
 	return false, 0
 }
 
-func serve(listen string, database *store.Store, logger *slog.Logger) int {
+func serve(listen, tlsCert, tlsKey string, database *store.Store, logger *slog.Logger) int {
+	// 两个 TLS 参数必须成对出现：只给一个是配置错误，按启动失败处理而不是
+	// 静默降级为明文——静默降级会让管理员以为自己在用 HTTPS。
+	if (tlsCert == "") != (tlsKey == "") {
+		logger.Error("TLS 参数不完整：--tls-cert 与 --tls-key 必须同时提供")
+		return 2
+	}
+	useTLS := tlsCert != "" && tlsKey != ""
+	var fingerprint string
+	if useTLS {
+		computed, err := certificateFingerprint(tlsCert)
+		if err != nil {
+			logger.Error("读取 TLS 证书失败，拒绝启动", "错误", err)
+			return 1
+		}
+		fingerprint = computed
+	}
+
 	// 优雅退出的根上下文：SIGINT/SIGTERM 触发取消，据此依次停止 HTTP 服务
 	// 与后台发送循环。这是本程序第一处信号处理——此前直接 ListenAndServe，
 	// 收到信号即被杀死，正在进行的投递会停在 sending 状态。
@@ -127,7 +151,18 @@ func serve(listen string, database *store.Store, logger *slog.Logger) int {
 
 	serveErr := make(chan error, 1)
 	go func() {
-		logger.Info("管理服务开始监听", "地址", listen)
+		if useTLS {
+			// 指纹随启动日志输出：自签场景下管理员据此核对证书，
+			// 规格 §5 要求「自签名场景记录并核对证书指纹」。
+			logger.Info("管理服务开始监听", "地址", listen, "协议", "https", "证书指纹", fingerprint)
+			if err := server.ListenAndServeTLS(tlsCert, tlsKey); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				serveErr <- err
+				return
+			}
+			serveErr <- nil
+			return
+		}
+		logger.Info("管理服务开始监听", "地址", listen, "协议", "http")
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serveErr <- err
 			return
@@ -234,8 +269,33 @@ func defaultDataDirectory() string {
 	return "/var/lib/jrp/jrps"
 }
 
+// certificateFingerprint 计算证书文件的 SHA-256 指纹，供管理员核对。
+//
+// 输出按字节分组的十六进制：与浏览器和 openssl 的常见展示形态一致，
+// 便于逐段比对。只取文件中的第一张证书——服务端证书在前是通行约定。
+func certificateFingerprint(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("读取证书文件失败：%w", err)
+	}
+	block, _ := pem.Decode(raw)
+	if block == nil {
+		return "", errors.New("证书文件不含 PEM 块")
+	}
+	certificate, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return "", fmt.Errorf("解析证书失败：%w", err)
+	}
+	sum := sha256.Sum256(certificate.Raw)
+	octets := make([]string, 0, len(sum))
+	for _, value := range sum {
+		octets = append(octets, fmt.Sprintf("%02X", value))
+	}
+	return strings.Join(octets, ":"), nil
+}
+
 func writeUsage(output io.Writer) error {
-	return writeText(output, "使用方法：jrps [--listen 地址] [--data-dir 目录] [--database 路径] [--version]\n")
+	return writeText(output, "使用方法：jrps [--listen 地址] [--data-dir 目录] [--database 路径] [--tls-cert 证书] [--tls-key 私钥] [--version]\n")
 }
 
 func writeText(output io.Writer, value string) error {

@@ -16,6 +16,9 @@ export default defineConfig(({ command }) => ({
     proxy: {
       '/healthz': 'http://127.0.0.1:7500',
       '/readyz': 'http://127.0.0.1:7500',
+      // 管理 API 与页面同源部署（生产由 jrps 内嵌资源提供）；开发态经此代理
+      // 转发到本地 jrps，使会话 Cookie 与 CSRF 流程在 dev 下与生产一致。
+      '/api': 'http://127.0.0.1:7500',
     },
   },
   test: {

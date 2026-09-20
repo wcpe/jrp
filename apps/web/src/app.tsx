@@ -4,7 +4,7 @@ import { useState } from 'react';
 
 import { JrpThemeProvider } from '@jrp/ui';
 
-import { router } from './router';
+import { createAppRouter } from './router';
 
 function createQueryClient() {
   return new QueryClient({
@@ -19,11 +19,12 @@ function createQueryClient() {
 
 export function App() {
   const [queryClient] = useState(createQueryClient);
+  const [appRouter] = useState(createAppRouter);
 
   return (
     <JrpThemeProvider>
       <QueryClientProvider client={queryClient}>
-        <RouterProvider router={router} />
+        <RouterProvider router={appRouter} />
       </QueryClientProvider>
     </JrpThemeProvider>
   );

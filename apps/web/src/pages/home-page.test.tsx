@@ -1,13 +1,23 @@
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 
-import { createHealthFailureHandler, createMalformedHealthHandler } from '@jrp/devmock';
+import {
+  createAuthenticatedSessionHandler,
+  createHealthFailureHandler,
+  createMalformedHealthHandler,
+  createTargetListHandler,
+} from '@jrp/devmock';
 import { mockServer } from '@jrp/devmock/server';
 
 import { App } from '../app';
 
 describe('JRP 首页', () => {
+  // 首页需要已认证会话：默认 handler 是未登录（401），不覆盖会跳到登录页。
+  beforeEach(() => {
+    mockServer.use(createAuthenticatedSessionHandler(), createTargetListHandler([]));
+  });
+
   it('在 MSW 健康响应下展示 jrps 与固定兼容基线', async () => {
     const { container } = render(<App />);
 

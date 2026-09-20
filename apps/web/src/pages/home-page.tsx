@@ -1,8 +1,13 @@
 import { useQuery } from '@tanstack/react-query';
+import { useNavigate } from '@tanstack/react-router';
+import { useEffect } from 'react';
 
 import { SignalTag, TelemetryPanel, type SignalTone } from '@jrp/ui';
 
 import { fetchHealth, type HealthSnapshot } from '../api/health';
+import { fetchSession } from '../api/session';
+import { NotificationPanel } from './notification-panel';
+import { SessionBar } from './session-bar';
 
 const COMPATIBILITY_BASELINE = 'jrp@e1f1d6ab1b591ec9b596f4b1b6a81cd2960c6314';
 
@@ -198,14 +203,48 @@ function StatusSection() {
 }
 
 export function HomePage() {
+  const navigate = useNavigate();
+  const session = useQuery({ queryFn: fetchSession, queryKey: ['session'] });
+
+  // 未登录跳转登录页：查得空会话是"未登录"的确定信号。
+  useEffect(() => {
+    if (session.data === null) {
+      void navigate({ to: '/login' });
+    }
+  }, [session.data, navigate]);
+
+  if (session.isPending) {
+    return (
+      <div className="console-shell">
+        <main>
+          <p>正在校验会话…</p>
+        </main>
+      </div>
+    );
+  }
+  if (!session.data) {
+    // 查询失败与未登录分开呈现：失败时不该静默跳转，那会掩盖真实故障。
+    return (
+      <div className="console-shell">
+        <main>
+          <p className="form-error" role="alert">
+            {session.isError ? session.error.message : '会话不可用，正在跳转登录页…'}
+          </p>
+        </main>
+      </div>
+    );
+  }
+
   return (
     <div className="console-shell">
       <div className="signal-noise" aria-hidden="true" />
       <ConsoleHeader />
       <main>
+        <SessionBar csrfToken={session.data.csrfToken} username={session.data.username} />
         <HeroSection />
         <TopologySection />
         <StatusSection />
+        <NotificationPanel csrfToken={session.data.csrfToken} />
       </main>
       <footer>
         <span>JRP / 工业控制界面</span>
