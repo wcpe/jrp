@@ -158,6 +158,19 @@ func TestClientTokenActionUnknownClient(t *testing.T) {
 	}
 }
 
+// 创建时名称为空返回 400 与中文说明。
+func TestClientCreateRejectsEmptyName(t *testing.T) {
+	router, _ := newNotificationRouter(t, &stubTestNotifier{})
+
+	recorder := doClientRequest(t, router, http.MethodPost, "/api/v1/clients", `{"name":""}`, true)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("空名称应返回 400，实际 %d", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), "名称不能为空") {
+		t.Fatalf("应给中文说明：%s", recorder.Body.String())
+	}
+}
+
 // 客户端 token 不能用于访问管理员端点（两类凭据互不通用）。
 func TestClientTokenCannotAccessAdminEndpoints(t *testing.T) {
 	router, _ := newNotificationRouter(t, &stubTestNotifier{})

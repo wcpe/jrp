@@ -147,6 +147,10 @@ func (api *clientAPI) create(c *gin.Context) {
 		return err
 	})
 	if err != nil {
+		if errors.Is(err, store.ErrClientNameInvalid) {
+			writeProblem(c, http.StatusBadRequest, codeInvalidInput, "请求体不合法", nameViolationDetail(err))
+			return
+		}
 		api.logError("创建客户端失败", err, c)
 		writeProblem(c, http.StatusInternalServerError, codeInternalError, "服务内部错误", "创建客户端失败，请稍后重试")
 		return
@@ -256,6 +260,17 @@ func (api *clientAPI) logError(message string, err error, c *gin.Context) {
 		return
 	}
 	api.logger.Error(message, "错误", err, "请求标识", requestID(c))
+}
+
+// nameViolationDetail 提取名称校验失败的中文说明。
+//
+// 从哨兵错误的包装文本里取冒号后的部分，不回显用户输入的名称本身。
+func nameViolationDetail(err error) string {
+	message := err.Error()
+	if index := strings.Index(message, "："); index >= 0 {
+		return message[index+len("："):]
+	}
+	return "名称不合法"
 }
 
 // clientItemFrom 把脱敏视图转为响应项。

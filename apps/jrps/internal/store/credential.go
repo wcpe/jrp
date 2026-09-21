@@ -134,15 +134,19 @@ func (tx *Tx) RedeemEnrollmentCredential(secret string) (ClientView, string, err
 		token = issued
 		now := time.Now().UTC()
 
-		// 凭据作废与 token 生效同事务：避免并发兑换拿到同一张凭据。
-		used := tx.db.Model(&EnrollmentCredential{}).
-			Where("id = ? AND used_at IS NULL", credential.ID).
-			Update("used_at", now)
-		if used.Error != nil {
-			return fmt.Errorf("作废 enrollment 凭据失败：%w", translateSQLError(used.Error))
+		// 凭据作废与 token 生效同事务。抢占走条件更新：只有把 used_at 从
+		// NULL 改成非空的那一次才算成功，避免"读检查通过之后、写入之前"
+		// 被第二个请求插手。
+		//
+		// 注意：当前连接模型（MaxOpenConns=1 + EXCLUSIVE 锁）把事务串行化了，
+		// 第二个请求会在上面的读检查处就被拦下，走不到这里。这道条件更新是为
+		// 放宽并发模型时准备的防线，因此它是被单独测试覆盖的（见
+		// TestMarkCredentialUsedIsConditional），而不是靠并发兑换用例间接覆盖。
+		won, err := tx.markCredentialUsed(credential.ID, now)
+		if err != nil {
+			return err
 		}
-		if used.RowsAffected == 0 {
-			// 条件更新未命中：另一并发请求已抢先兑换。
+		if !won {
 			return ErrCredentialRejected
 		}
 
@@ -163,7 +167,7 @@ func (tx *Tx) RedeemEnrollmentCredential(secret string) (ClientView, string, err
 			ObjectType: ObjectTypeToken,
 			ObjectID:   client.ID,
 			Result:     AuditResultSuccess,
-			Context:    fmt.Sprintf("客户端 %s 完成 enrollment，token 摘要前缀 %s", client.Name, DigestPrefix(DigestToken(issued))),
+			Context:    fmt.Sprintf("客户端 %s 完成 enrollment，token 摘要前缀 %s", truncateAuditLabel(client.Name), DigestPrefix(DigestToken(issued))),
 		})
 	})
 	if err != nil {
@@ -215,7 +219,7 @@ func (tx *Tx) RotateClientToken(clientID string) (ClientView, string, error) {
 			ObjectType: ObjectTypeToken,
 			ObjectID:   client.ID,
 			Result:     AuditResultSuccess,
-			Context:    fmt.Sprintf("客户端 %s 的 token 已轮换，新摘要前缀 %s", client.Name, DigestPrefix(client.TokenDigest)),
+			Context:    fmt.Sprintf("客户端 %s 的 token 已轮换，新摘要前缀 %s", truncateAuditLabel(client.Name), DigestPrefix(client.TokenDigest)),
 		}); err != nil {
 			return err
 		}
@@ -269,7 +273,7 @@ func (tx *Tx) RevokeClientToken(clientID string) (ClientView, error) {
 			ObjectType: ObjectTypeToken,
 			ObjectID:   client.ID,
 			Result:     AuditResultSuccess,
-			Context:    fmt.Sprintf("客户端 %s 的 token 已吊销，摘要前缀 %s", client.Name, DigestPrefix(client.TokenDigest)),
+			Context:    fmt.Sprintf("客户端 %s 的 token 已吊销，摘要前缀 %s", truncateAuditLabel(client.Name), DigestPrefix(client.TokenDigest)),
 		}); err != nil {
 			return err
 		}
@@ -292,6 +296,20 @@ func viewOfClient(client Client) ClientView {
 		DesiredRevision: client.DesiredRevision,
 		ActiveRevision:  client.ActiveRevision,
 	}
+}
+
+// markCredentialUsed 把凭据标记为已使用，返回是否由本次调用抢占成功。
+//
+// 条件是 used_at 仍为 NULL：凭据可能已被另一请求用掉，或在轮换/吊销时被作废。
+// 把判断放进 UPDATE 的 WHERE 而不是先读后写，使抢占在数据库层成为一次原子操作。
+func (tx *Tx) markCredentialUsed(credentialID string, at time.Time) (bool, error) {
+	used := tx.db.Model(&EnrollmentCredential{}).
+		Where("id = ? AND used_at IS NULL", credentialID).
+		Update("used_at", at)
+	if used.Error != nil {
+		return false, fmt.Errorf("作废 enrollment 凭据失败：%w", translateSQLError(used.Error))
+	}
+	return used.RowsAffected > 0, nil
 }
 
 // newCredentialID 生成凭据标识。

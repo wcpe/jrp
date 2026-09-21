@@ -90,6 +90,26 @@ var auditResults = map[string]struct{}{
 // 中文按 UTF-8 最大 3 字节计，85 字中文落在 255 字节内。
 const maxAuditContextRunes = 85
 
+// auditLabelLimit 是嵌入审计上下文的用户输入标签长度上限。
+//
+// 取一个远小于 maxAuditContextRunes 的值，使"标签 + 固定模板"永远落在上下文
+// 上限内：审计长度校验是防止脏数据落库的护栏，不该反过来变成业务写入的隐式约束。
+// 早先的实现把不限长的客户端名称直接拼进上下文，导致名字较长的客户端在轮换与
+// 吊销时因审计校验失败而整体回滚——管理员因此无法吊销已失陷客户端的凭据。
+const auditLabelLimit = 32
+
+// truncateAuditLabel 把用户输入截断为可安全嵌入审计上下文的标签。
+//
+// 按 rune 截断而不是按字节：按字节切会撕裂多字节字符，落库后是无法阅读的乱码。
+// 超长时追加省略号，让读审计的人知道这里被截断过，而不是以为名称本就这么短。
+func truncateAuditLabel(value string) string {
+	if utf8.RuneCountInString(value) <= auditLabelLimit {
+		return value
+	}
+	runes := []rune(value)
+	return string(runes[:auditLabelLimit]) + "…"
+}
+
 // maxAuditIdentifierRunes 是主体标识与对象标识的最大字符数。
 //
 // 模型列宽为 128 字节；中文按 3 字节计，取 42 字以保证任何字符集下都不超列宽。

@@ -323,3 +323,157 @@ func hasAuditAction(events []AuditEvent, action string) bool {
 	}
 	return false
 }
+
+// 条件更新守卫必须真的按 used_at 判条件：已使用的凭据不能被再次抢占。
+//
+// 这条直接调用守卫函数，不依赖并发。之所以要单独覆盖它，是因为并发兑换用例在
+// 单连接模型下走不到守卫分支（第二个请求在更早的读检查处就返回了），实测把
+// WHERE 里的 used_at IS NULL 去掉，那个用例仍然通过——也就是说守卫本身在
+// 原有用例下没有任何守护者。
+func TestMarkCredentialUsedIsConditional(t *testing.T) {
+	store := openServerStore(t, t.TempDir()+"/jrps.db")
+	first, _ := seedTwoClients(t, store)
+
+	status, err := issueCredentialStatus(t, store, first.ID)
+	if err != nil {
+		t.Fatalf("发行凭据失败：%v", err)
+	}
+
+	// 第一次抢占应成功。
+	won, err := markUsed(t, store, status.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("首次标记失败：%v", err)
+	}
+	if !won {
+		t.Fatal("首次标记应抢占成功")
+	}
+
+	// 第二次必须失败：used_at 已经非空。
+	again, err := markUsed(t, store, status.ID, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("二次标记返回错误：%v", err)
+	}
+	if again {
+		t.Fatal("已使用的凭据不得被再次抢占——条件更新的 WHERE 守卫失效了")
+	}
+}
+
+// credentialStatus 是测试用的凭据标识与明文组合。
+type credentialStatus struct {
+	ID     string
+	Secret string
+}
+
+// issueCredentialStatus 发行凭据并读出其标识。
+func issueCredentialStatus(t *testing.T, store *Store, clientID string) (credentialStatus, error) {
+	t.Helper()
+	var result credentialStatus
+	err := store.Transaction(context.Background(), func(tx *Tx) error {
+		secret, err := tx.IssueEnrollmentCredential(clientID)
+		if err != nil {
+			return err
+		}
+		var credential EnrollmentCredential
+		if err := tx.db.First(&credential, "token_digest = ?", DigestToken(secret)).Error; err != nil {
+			return err
+		}
+		result = credentialStatus{ID: credential.ID, Secret: secret}
+		return nil
+	})
+	return result, err
+}
+
+// markUsed 在事务内调用条件更新守卫。
+func markUsed(t *testing.T, store *Store, credentialID string, at time.Time) (bool, error) {
+	t.Helper()
+	var won bool
+	err := store.Transaction(context.Background(), func(tx *Tx) error {
+		var err error
+		won, err = tx.markCredentialUsed(credentialID, at)
+		return err
+	})
+	return won, err
+}
+
+// 长名称客户端必须仍可完成全部生命周期动作。
+//
+// 这条守护一个曾经真实存在的缺陷：审计上下文有 85 字符上限，而客户端名称当时
+// 没有长度校验，名字较长的客户端在轮换与吊销时因审计校验失败整体回滚——
+// 管理员因此无法吊销一个已失陷客户端的凭据。修法是让审计对用户输入免疫
+// （截断而非失败），并给名称加显式上限。
+func TestLongClientNameStillAllowsRevoke(t *testing.T) {
+	store := openServerStore(t, t.TempDir()+"/jrps.db")
+
+	// 取一个接近名称上限的长度，确保"长名称"这条路径确实被走到。
+	name := strings.Repeat("客", maxClientNameLength-1)
+	token, err := NewClientToken()
+	if err != nil {
+		t.Fatalf("生成 token 失败：%v", err)
+	}
+	err = store.Transaction(context.Background(), func(tx *Tx) error {
+		_, err := tx.CreateClient(ClientInput{ID: "cli_long", Name: name, Token: token})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("创建长名称客户端失败：%v", err)
+	}
+
+	for stage, action := range map[string]func() error{
+		"轮换": func() error {
+			_, _, err := rotateToken(t, store, "cli_long")
+			return err
+		},
+		"吊销": func() error {
+			_, err := revokeToken(t, store, "cli_long")
+			return err
+		},
+	} {
+		if err := action(); err != nil {
+			t.Fatalf("长名称客户端的%s动作失败（审计长度不应成为业务写入的隐式约束）：%v", stage, err)
+		}
+	}
+}
+
+// 名称超出上限被拒绝，且返回可判定错误而不是落库后爆掉。
+func TestCreateClientRejectsOverlongName(t *testing.T) {
+	store := openServerStore(t, t.TempDir()+"/jrps.db")
+	token, _ := NewClientToken()
+
+	err := store.Transaction(context.Background(), func(tx *Tx) error {
+		_, err := tx.CreateClient(ClientInput{
+			ID: "cli_too_long", Name: strings.Repeat("客", maxClientNameLength+1), Token: token,
+		})
+		return err
+	})
+	if !errors.Is(err, ErrClientNameInvalid) {
+		t.Fatalf("超长名称应返回可判定的名称错误，实际 %v", err)
+	}
+}
+
+// 空名称同样按名称错误返回，而不是落到数据库约束上。
+func TestCreateClientRejectsBlankName(t *testing.T) {
+	store := openServerStore(t, t.TempDir()+"/jrps.db")
+	token, _ := NewClientToken()
+
+	err := store.Transaction(context.Background(), func(tx *Tx) error {
+		_, err := tx.CreateClient(ClientInput{ID: "cli_blank", Name: "   ", Token: token})
+		return err
+	})
+	if !errors.Is(err, ErrClientNameInvalid) {
+		t.Fatalf("空白名称应返回名称错误，实际 %v", err)
+	}
+}
+
+// 读取不存在的客户端返回哨兵错误，使 HTTP 层能把 404 与 500 分开。
+func TestClientReadMissingReturnsSentinel(t *testing.T) {
+	store := openServerStore(t, t.TempDir()+"/jrps.db")
+
+	var err error
+	_ = store.View(context.Background(), func(tx *Tx) error {
+		_, err = tx.Client("cli_missing")
+		return nil
+	})
+	if !errors.Is(err, ErrClientNotFound) {
+		t.Fatalf("读取不存在的客户端应返回 ErrClientNotFound，实际 %v", err)
+	}
+}
