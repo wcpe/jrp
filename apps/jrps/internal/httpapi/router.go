@@ -69,6 +69,8 @@ func registerAPI(router *gin.Engine, options RouterOptions) {
 	policy := newPolicyAPI(options)
 	notification := newNotificationAPI(options)
 	delivery := newDeliveryAPI(options)
+	clients := newClientAPI(options)
+	agents := newAgentAPI(options)
 	guard := requireInitialized(options.Store)
 	router.Use(func(context *gin.Context) {
 		if strings.HasPrefix(context.Request.URL.Path, "/api") {
@@ -77,6 +79,12 @@ func registerAPI(router *gin.Engine, options RouterOptions) {
 		}
 		context.Next()
 	})
+
+	// /agent/v1 是 jrpc 的管理通道（FR-07 §3.4）：用客户端 token 鉴权，与管理员
+	// 会话是两套独立体系。enrollment 兑换是唯一不需要 token 的端点——凭据本身
+	// 就是入场券；desired state、apply result 与 connect 属 FR-08，此处不注册。
+	agent := router.Group("/agent/v1")
+	agent.POST("/enrollments", agents.enroll)
 
 	api := router.Group("/api/v1")
 	api.POST("/session", session.login)
@@ -101,6 +109,18 @@ func registerAPI(router *gin.Engine, options RouterOptions) {
 	// 无法写出 `:targetId:test`（会 panic），因此用 catch-all 捕获整段再在处理器
 	// 内切分后缀，保证对外 URL 与契约逐字一致。
 	api.POST("/notification-targets/*action", session.authenticate(true), notification.test)
+
+	// 客户端与 token 管理（FR-07）：读取需会话，生命周期动作额外要求 CSRF
+	// 并写入审计。token 明文只在创建、轮换与兑换响应中出现一次。
+	//
+	// 子动作全部走一个 catch-all：gin 不允许同一路径段既有静态段又有通配符，
+	// `tokens:rotate` 与 `tokens:revoke` 也会被判定为冲突通配符（与 FR-15 的
+	// `{targetId}:test` 是同一限制）。统一捕获后在处理器内切分，保证对外 URL
+	// 与契约逐字一致。
+	api.GET("/clients", session.authenticate(false), clients.list)
+	api.POST("/clients", session.authenticate(true), clients.create)
+	api.GET("/clients/:clientId", session.authenticate(false), clients.show)
+	api.POST("/clients/:clientId/*action", session.authenticate(true), clients.clientAction)
 
 	// 投递结果查询：读取需会话。供 Web 通知页展示发送结果与最终失败状态
 	// （FR-15 §3.3“测试通知入口与发送结果查询”、§5“失败次数、脱敏摘要与

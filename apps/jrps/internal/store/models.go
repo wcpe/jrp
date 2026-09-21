@@ -79,6 +79,27 @@ type Client struct {
 
 func (Client) TableName() string { return "clients" }
 
+// EnrollmentCredential 是一次性 enrollment 凭据。
+//
+// 与客户端 token 是两种不同的凭据（FR-07 §3.4）：凭据用于首次注册换取独立
+// token，本身不可用于管理通道鉴权；客户端 token 才是后续请求的凭据。两者
+// 都只存摘要，明文只在发行响应中出现一次。
+type EnrollmentCredential struct {
+	ID string `gorm:"primaryKey;size:64"`
+	// ClientID 是这张凭据绑定的待注册客户端。
+	ClientID string `gorm:"size:64;index;not null"`
+	// TokenDigest 是凭据明文的摘要，落库内容不可用于直接鉴权。
+	TokenDigest string `gorm:"size:128;uniqueIndex;not null"`
+	// ExpiresAt 是凭据的过期时间；过期与已使用都会使兑换失败。
+	ExpiresAt time.Time `gorm:"index;not null"`
+	// UsedAt 非空表示凭据已被兑换；一次性语义靠它保证。
+	UsedAt    *time.Time
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+func (EnrollmentCredential) TableName() string { return "enrollment_credentials" }
+
 // Proxy 是代理定义；任何变更都会生成新的配置版本，不原地修改历史。
 type Proxy struct {
 	ID             string `gorm:"primaryKey;size:64"`

@@ -8,7 +8,7 @@ import (
 )
 
 // currentSchemaVersion 是当前程序期望的数据库架构版本，落库到 PRAGMA user_version。
-const currentSchemaVersion = 3
+const currentSchemaVersion = 4
 
 // migration 是一次架构迁移步骤；apply 在同一事务中被调用。
 type migration struct {
@@ -23,7 +23,19 @@ func migrations() []migration {
 		{version: 1, name: "建立 P1 初始表结构", apply: applyInitialSchema},
 		{version: 2, name: "新增保留策略对象并放开审计清理", apply: applyRetentionPolicy},
 		{version: 3, name: "补齐通知目标与 outbox 的投递字段", apply: applyNotificationDelivery},
+		{version: 4, name: "建立一次性 enrollment 凭据表", apply: applyEnrollmentCredential},
 	}
+}
+
+// applyEnrollmentCredential 建立一次性 enrollment 凭据表（FR-07）。
+//
+// 凭据独立成表而不是复用 clients 的 token 列：凭据在兑换后即失效，而客户端
+// token 要长期有效；两者生命周期不同，混在一列会让"已兑换"与"已轮换"无法区分。
+func applyEnrollmentCredential(tx *gorm.DB) error {
+	if err := tx.AutoMigrate(&EnrollmentCredential{}); err != nil {
+		return fmt.Errorf("建立 enrollment 凭据表失败：%w", err)
+	}
+	return nil
 }
 
 // applyInitialSchema 建立 FR-09 规格 §3.3 的实体表与不可变版本触发器。
