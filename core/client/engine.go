@@ -34,30 +34,99 @@ const (
 	poolRetryBackoff = 100 * time.Millisecond
 )
 
+// generation 是一个 revision 对应的运行资源与连接集合。
+//
+// 连接、等待组与工作连接池按代隔离，是「切换期间已有桥接不中断」的实现基础：
+// drain 只等待旧代的活动桥接结束，新代连接不受牵连。共用一个等待组会让 drain
+// 连带等待新代，切换就退化成"停下来等所有人"。
+//
+// 控制连接刻意**不在**代里：它是登录与心跳通道，跨代存活。drain 旧代时若关闭
+// 它，旧代的维持循环停摆尚可接受，但新代也会失去控制会话——代理集合的变化并不
+// 要求重拨控制连接。
+type generation struct {
+	// engine 回指所属引擎：conns 复用引擎的锁，本类型不另设互斥量。
+	engine   *Engine
+	revision uint64
+	// config 是本代的不可变配置。凭据、代理集合与池上限都从它读取，而不是从
+	// engine.config：代一经发布就不再修改，指针切换即是同步点；若共享一个可写
+	// 字段，维持循环会与切换路径竞争读。
+	config core.ClientConfig
+	// pool 是本代的工作连接池。池上限随快照变化，因此必须按代隔离：共用一个池
+	// 会让旧代的在途槽位继续占用新代的容量。
+	pool *transport.WorkConnPool
+	// dialer 是本代的拨号器，超时来自本代快照。
+	dialer transport.Dialer
+	// stopCh 停止本代的维持循环。
+	stopCh chan struct{}
+	// forwardCtx 是本代的转发上下文，随本代停止取消，用于中断阻塞的双向转发。
+	forwardCtx context.Context
+	cancel     context.CancelFunc
+	// stopping 标记本代是否已停止接收流量：drain 旧代时置位的是**旧代的**标记，
+	// 新代不受影响。
+	stopping bool
+	stopOnce sync.Once
+	// wg 跟踪本代的维持循环、桥接与 UDP 会话。
+	wg sync.WaitGroup
+	// conns 是本代登记的活动连接（工作连接）。
+	conns map[*transport.Conn]struct{}
+}
+
+// newGeneration 构造一代的池与停止信号；维持循环由 startGeneration 在 publish 后启动。
+func newGeneration(engine *Engine, revision uint64, config core.ClientConfig) *generation {
+	forwardCtx, cancel := context.WithCancel(context.Background())
+	return &generation{
+		engine:     engine,
+		revision:   revision,
+		config:     config,
+		pool:       transport.NewWorkConnPool(config.WorkConnPoolSize()),
+		dialer:     transport.Dialer{Timeout: config.Timeout()},
+		stopCh:     make(chan struct{}),
+		forwardCtx: forwardCtx,
+		cancel:     cancel,
+		conns:      make(map[*transport.Conn]struct{}),
+	}
+}
+
 // Engine 是 Core 暴露给宿主的客户端运行门面。
 //
 // 生命周期为 New → Start → Shutdown → Done。构造函数只做纯内存装配；Start 按
-// 配置拨号并建立控制会话与本地目标监听；Shutdown 释放全部资源。
+// 配置拨号并建立控制会话与工作连接维持循环；Shutdown 释放全部资源。
 // 同一进程可并行运行多个 Engine。
+//
+// 配置热更：Start 建立第 0 代（revision 0），此后用 Apply 提交新 revision；
+// 运行资源按「代」隔离（见 generation）。
 type Engine struct {
 	config       core.ClientConfig
 	logger       *slog.Logger
 	dialer       transport.Dialer
 	drainTimeout time.Duration
-	pool         *transport.WorkConnPool
+
+	// shutdownCh 在 Shutdown 时关闭，只约束跨代存活的控制会话读写与心跳循环；
+	// 各代的维持循环与转发由该代自己的停止信号收口。
+	shutdownCh chan struct{}
 
 	mu       sync.Mutex
 	state    engineState
 	done     chan struct{}
 	finalErr error
 	stopOnce sync.Once
-	wg       sync.WaitGroup
-	conns    map[*transport.Conn]struct{}
+	// control 是控制会话，跨代存活：代理集合的变化不重拨控制连接，因此已有桥接
+	// 不受换代影响。控制会话的身份（服务端端点、客户端标识、令牌）由 Start 固定，
+	// 热更身份被 Apply 拒绝（见 controlIdentityMatches）。
+	control *controlSession
+	// controlWG 跟踪控制会话的读循环与心跳循环，Shutdown 时按排水上限等待。
+	controlWG sync.WaitGroup
+	// active 是当前生效的代；首次应用之前为 nil。
+	active *generation
+	// lastGood 是最近一次成功 publish 的 revision。
+	lastGood uint64
+	// applying 表示有一次配置应用正在进行，用于单飞约束。
+	applying bool
+	// healthCheckHook 是包内测试注入的失败点；生产路径恒为 nil。
+	healthCheckHook func(*generation) error
+	// targetLn 是历史遗留字段：当前实现不使用本地目标监听器（转发直接拨号目标），
+	// 保留以免改动既有装配面。
 	targetLn map[string]net.Listener
-	stopCh   chan struct{}
-	stopCtx  context.Context
-	// cancelWork 取消转发上下文，在 Shutdown 时调用一次。
-	cancelWork context.CancelFunc
 }
 
 // engineState 是 Engine 的内部状态，切换只在持锁下进行。
@@ -85,27 +154,24 @@ func WithLogger(logger *slog.Logger) Option {
 }
 
 // New 构造客户端 Engine，只做纯内存装配，不拨号、不启动 goroutine。
+//
+// config 是首次应用（Start）使用的配置；后续通过 Apply 提交新 revision 替换它。
 func New(config core.ClientConfig, options ...Option) *Engine {
 	engine := &Engine{
 		config:       config,
 		done:         make(chan struct{}),
-		conns:        make(map[*transport.Conn]struct{}),
+		shutdownCh:   make(chan struct{}),
 		targetLn:     make(map[string]net.Listener),
-		stopCh:       make(chan struct{}),
 		dialer:       transport.Dialer{Timeout: config.Timeout()},
 		drainTimeout: config.DrainTimeout(),
-		pool:         transport.NewWorkConnPool(config.WorkConnPoolSize()),
 	}
-	// 转发上下文：Engine 生命周期内唯一，随 Shutdown 取消，用于中断阻塞的转发。
-	// 每条工作连接各建一个会随连接轮换累积 goroutine，此处必须按 Engine 持有。
-	engine.stopCtx, engine.cancelWork = context.WithCancel(context.Background())
 	for _, option := range options {
 		option(engine)
 	}
 	return engine
 }
 
-// Start 校验配置、建立控制会话并启动本地目标监听。
+// Start 校验配置、建立控制会话并启动第 0 代的工作连接维持循环。
 //
 // 只能成功一次；重复调用返回 ErrAlreadyStarted。失败时不遗留半启动的连接或
 // 监听器，宿主可修正后重试。
@@ -127,13 +193,13 @@ func (engine *Engine) Start(ctx context.Context) error {
 		return err
 	}
 
-	engine.commitRunning()
+	// 首次应用建立第 0 代。revision 取 SnapshotRevisionUnknown：版本号由宿主
+	// 分配并单调递增，宿主从 1 开始即可，0 自然表示"尚未由宿主指定版本"。
+	gen := newGeneration(engine, core.SnapshotRevisionUnknown, engine.config)
+	engine.commitRunning(control, gen)
 
-	engine.track(control.conn)
-	engine.wg.Add(3)
-	go engine.serveControl(control)
-	go engine.heartbeatLoop(control)
-	go engine.maintainWorkConns(endpoint)
+	engine.startControl(control)
+	engine.startGeneration(gen)
 	return nil
 }
 
@@ -188,11 +254,32 @@ func (engine *Engine) releaseStartSlot() {
 	}
 }
 
-// commitRunning 把认领成功的启动位推进到 running。
-func (engine *Engine) commitRunning() {
+// commitRunning 把认领成功的启动位推进到 running，并登记控制会话与第 0 代。
+func (engine *Engine) commitRunning(control *controlSession, gen *generation) {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	engine.state = stateRunning
+	engine.control = control
+	engine.active = gen
+	engine.lastGood = gen.revision
+}
+
+// startControl 启动控制会话的读循环与心跳循环。
+//
+// 它们归 Engine 而不是某一代：控制会话跨代存活，换代不重拨控制连接。
+func (engine *Engine) startControl(control *controlSession) {
+	engine.controlWG.Add(2)
+	go engine.serveControl(control)
+	go engine.heartbeatLoop(control)
+}
+
+// startGeneration 启动一代的工作连接维持循环。
+//
+// 与 publish 分开：维持循环要等 active 已指向该代之后才能开始拨号，否则新拨出的
+// 待命连接可能在 active 尚未切换时被服务端按旧代凭据校验。
+func (engine *Engine) startGeneration(gen *generation) {
+	gen.wg.Add(1)
+	go engine.maintainWorkConns(gen)
 }
 
 // Shutdown 幂等关闭：停止心跳与控制会话，按排水上限等待活动连接，随后释放全部资源。
@@ -209,24 +296,37 @@ func (engine *Engine) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// markStopped 标记停止、清理异常记录、取消转发上下文并关闭本地监听器。
+// markStopped 标记停止、清理异常记录、停止当前代并关闭控制会话。
 //
-// 取消转发上下文会中断阻塞的双向转发：工作连接随 Engine 一起收尾，不留悬挂
-// goroutine。活动连接仍交由 waitDrained 按排水上限等待，不在此处强制关闭。
+// 取消当前代的转发上下文会中断阻塞的双向转发：工作连接随 Engine 一起收尾，不留
+// 悬挂 goroutine。活动连接仍交由 waitDrained 按排水上限等待，不在此处强制关闭。
 func (engine *Engine) markStopped() {
 	engine.mu.Lock()
 	engine.state = stateStopped
 	engine.finalErr = nil
-	close(engine.stopCh)
-	engine.cancelWork()
+	close(engine.shutdownCh)
+	active := engine.active
+	control := engine.control
 	for _, listener := range engine.targetLn {
 		_ = listener.Close()
 	}
 	engine.mu.Unlock()
+
+	if active != nil {
+		active.stop(true)
+	}
+	if control != nil {
+		_ = control.conn.Close()
+	}
 }
 
-// waitDrained 等待活动连接按排水上限结束；超限后强制关闭并继续等待。
+// waitDrained 等待控制会话与当前代的活动连接按排水上限结束；超限后强制关闭并继续等待。
 func (engine *Engine) waitDrained(ctx context.Context) error {
+	engine.mu.Lock()
+	active := engine.active
+	limit := engine.drainTimeout
+	engine.mu.Unlock()
+
 	if err := ctx.Err(); err != nil {
 		engine.closeConns()
 		return err
@@ -234,10 +334,13 @@ func (engine *Engine) waitDrained(ctx context.Context) error {
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
-		engine.wg.Wait()
+		engine.controlWG.Wait()
+		if active != nil {
+			active.wg.Wait()
+		}
 	}()
 
-	deadline := engine.drainTimeout
+	deadline := limit
 	if ctxDeadline, ok := ctx.Deadline(); ok {
 		if remaining := time.Until(ctxDeadline); remaining < deadline {
 			deadline = remaining
@@ -259,14 +362,10 @@ func (engine *Engine) waitDrained(ctx context.Context) error {
 	return nil
 }
 
-// closeDone 在完全停止后关闭 Done 通道并释放转发上下文；重复调用安全。
-//
-// 取消函数在此统一收口：未 Start 就 Shutdown 的路径也经过这里，因此不会
-// 残留未取消的 context（go vet 的 lostcancel 检查点）。
+// closeDone 在完全停止后关闭 Done 通道；重复调用安全。
 func (engine *Engine) closeDone() {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
-	engine.cancelWork()
 	select {
 	case <-engine.done:
 	default:
@@ -303,31 +402,145 @@ func (engine *Engine) log() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// track 登记一条活动连接。
-func (engine *Engine) track(conn *transport.Conn) {
-	engine.mu.Lock()
-	defer engine.mu.Unlock()
-	engine.conns[conn] = struct{}{}
+// track 登记本代的一条活动连接。
+func (gen *generation) track(conn *transport.Conn) {
+	gen.engine.mu.Lock()
+	defer gen.engine.mu.Unlock()
+	gen.conns[conn] = struct{}{}
 }
 
-// untrack 移除一条活动连接。
-func (engine *Engine) untrack(conn *transport.Conn) {
-	engine.mu.Lock()
-	defer engine.mu.Unlock()
-	delete(engine.conns, conn)
+// untrack 移除本代的一条活动连接。
+func (gen *generation) untrack(conn *transport.Conn) {
+	gen.engine.mu.Lock()
+	defer gen.engine.mu.Unlock()
+	delete(gen.conns, conn)
 }
 
-// closeConns 强制关闭全部活动连接。
+// closeConns 强制关闭控制连接与当前代的全部活动连接。
+//
+// 先取快照再关闭：关闭连接会阻塞在系统调用上，持锁关闭会把锁暴露给网络 IO。
 func (engine *Engine) closeConns() {
 	engine.mu.Lock()
-	conns := make([]*transport.Conn, 0, len(engine.conns))
-	for conn := range engine.conns {
+	control := engine.control
+	active := engine.active
+	engine.mu.Unlock()
+	if control != nil {
+		_ = control.conn.Close()
+	}
+	if active != nil {
+		active.closeConns()
+	}
+}
+
+// closeConns 强制关闭本代的全部活动连接。
+func (gen *generation) closeConns() {
+	gen.engine.mu.Lock()
+	conns := make([]*transport.Conn, 0, len(gen.conns))
+	for conn := range gen.conns {
 		conns = append(conns, conn)
 	}
-	engine.mu.Unlock()
+	gen.engine.mu.Unlock()
 	for _, conn := range conns {
 		_ = conn.Close()
 	}
+}
+
+// stop 停止本代补充维持连接，并按需取消本代的转发上下文。
+//
+// final 只在 Engine 终停时为真：drain 旧代（Apply 路径）只停维持循环，**不**取消
+// 在途桥接的转发上下文——已有流要继续到自然结束或排水上限，取消它会当场切断
+// 用户连接，正是本功能要避免的。
+// 幂等：drain 与 Shutdown 各可能调用一次，重复调用安全（cancel 本身可重复调用）。
+func (gen *generation) stop(final bool) {
+	gen.stopOnce.Do(func() {
+		gen.engine.mu.Lock()
+		gen.stopping = true
+		gen.engine.mu.Unlock()
+		close(gen.stopCh)
+	})
+	if final {
+		gen.cancel()
+	}
+}
+
+// release 释放 prepare 阶段新建、但 publish 之前失败的资源。
+//
+// 本代尚未发布：没有维持循环与桥接，直接取消上下文并关闭池即可。
+func (gen *generation) release() {
+	gen.cancel()
+	if gen.pool != nil {
+		_ = gen.pool.Close()
+	}
+}
+
+// waitDrained 等待本代的维持循环与桥接按排水上限结束；超限后强制关闭并继续等待。
+//
+// 只等待本代的等待组：新代连接不受牵连。这正是"切换期间已有流不中断"的实现要点，
+// 共用一个等待组会让切换退化成停下来等所有人。
+func (gen *generation) waitDrained(ctx context.Context, limit time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		gen.closeConns()
+		return err
+	}
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		gen.wg.Wait()
+	}()
+
+	deadline := limit
+	if ctxDeadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(ctxDeadline); remaining < deadline {
+			deadline = remaining
+		}
+	}
+	timer := time.NewTimer(deadline)
+	defer timer.Stop()
+	select {
+	case <-finished:
+	case <-timer.C:
+		gen.closeConns()
+		<-finished
+		return context.DeadlineExceeded
+	case <-ctx.Done():
+		gen.closeConns()
+		<-finished
+		return ctx.Err()
+	}
+	return nil
+}
+
+// countProxies 统计一代维持的代理数量，供 Apply 结果报告变更规模。
+func countProxies(gen *generation) int {
+	return len(gen.config.AllProxies())
+}
+
+// activeGeneration 返回当前生效的代；首次应用之前为 nil。
+//
+// 生产路径读 engine.active 时也持同一把锁；这里供包内测试观察代内状态，
+// 避免测试直接触碰字段而绕开锁。
+func (engine *Engine) activeGeneration() *generation {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	return engine.active
+}
+
+// isStopping 返回本代是否已停止接收流量。
+//
+// 供包内测试核验 drain 与 Shutdown 是否真的停掉了对应的代。
+func (gen *generation) isStopping() bool {
+	gen.engine.mu.Lock()
+	defer gen.engine.mu.Unlock()
+	return gen.stopping
+}
+
+// connCount 返回本代已登记的活动连接数。
+//
+// 供包内测试等待维持循环真正建起桥接，避免切换用例跑在"还没有在途流"的窗口里。
+func (gen *generation) connCount() int {
+	gen.engine.mu.Lock()
+	defer gen.engine.mu.Unlock()
+	return len(gen.conns)
 }
 
 // clientLogin 是 wire v1 登录载荷的最小形态。
@@ -413,13 +626,14 @@ func (control *controlSession) readLoginResponse(timeout time.Duration) error {
 }
 
 // serveControl 维持控制连接的读循环：服务端主动关闭或出错即记录异常并退出。
+//
+// 控制会话跨代存活，因此停止信号取 Engine 级的 shutdownCh 而不是某一代的标记。
 func (engine *Engine) serveControl(control *controlSession) {
-	defer engine.wg.Done()
-	defer engine.untrack(control.conn)
+	defer engine.controlWG.Done()
 	reader := wire.NewV1Reader(control.conn, wire.DefaultV1PayloadLimit)
 	for {
 		select {
-		case <-engine.stopCh:
+		case <-engine.shutdownCh:
 			return
 		default:
 		}
@@ -432,34 +646,47 @@ func (engine *Engine) serveControl(control *controlSession) {
 	}
 }
 
-// heartbeatLoop 按配置心跳间隔发送 ping；写入失败即记录异常并退出。
+// heartbeatLoop 按当前生效代的心跳间隔发送 ping；写入失败即记录异常并退出。
+//
+// 每个周期重新读取间隔：心跳属于配置快照，换代后新的间隔应立即生效，而不是
+// 绑定在控制会话建立时的取值上。
 func (engine *Engine) heartbeatLoop(control *controlSession) {
-	defer engine.wg.Done()
-	interval := engine.config.Heartbeat()
-	if interval <= 0 {
-		interval = core.DefaultHeartbeat
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	defer engine.controlWG.Done()
 	for {
+		ticker := time.NewTicker(engine.heartbeatInterval())
 		select {
-		case <-engine.stopCh:
+		case <-engine.shutdownCh:
+			ticker.Stop()
 			return
 		case <-ticker.C:
-			encoded, err := wire.EncodeV1Frame(wire.Frame{Type: wire.MessageTypePing, Payload: []byte(`{}`)})
-			if err != nil {
-				engine.failAbnormal(err)
-				return
-			}
-			control.mu.Lock()
-			_, err = control.conn.Write(encoded)
-			control.mu.Unlock()
-			if err != nil {
-				engine.failAbnormal(err)
-				return
-			}
+		}
+		ticker.Stop()
+
+		encoded, err := wire.EncodeV1Frame(wire.Frame{Type: wire.MessageTypePing, Payload: []byte(`{}`)})
+		if err != nil {
+			engine.failAbnormal(err)
+			return
+		}
+		control.mu.Lock()
+		_, err = control.conn.Write(encoded)
+		control.mu.Unlock()
+		if err != nil {
+			engine.failAbnormal(err)
+			return
 		}
 	}
+}
+
+// heartbeatInterval 返回当前生效代的心跳间隔；无生效代时取 Core 默认值。
+func (engine *Engine) heartbeatInterval() time.Duration {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	if engine.active != nil {
+		if interval := engine.active.config.Heartbeat(); interval > 0 {
+			return interval
+		}
+	}
+	return core.DefaultHeartbeat
 }
 
 // failAbnormal 记录异常停止的首个错误并关闭 Done。
@@ -484,16 +711,16 @@ func (engine *Engine) failAbnormal(err error) {
 	engine.mu.Unlock()
 }
 
-// maintainWorkConns 为每个代理维持待命工作连接。
+// maintainWorkConns 为本代的每个代理维持待命工作连接。
 //
 // 每个代理独立循环：先占用池槽位（受池上限约束），再建链、声明归属并服务
-// 转发；连接结束后释放槽位并重建下一条。停止时全部待命连接随 Engine 一起关闭。
+// 转发；连接结束后释放槽位并重建下一条。停止时本代的待命连接随该代一起关闭。
 // 四种代理共用本循环：差异只在本地目标的网络类型与转发形态。
-func (engine *Engine) maintainWorkConns(endpoint core.ServerEndpoint) {
-	defer engine.wg.Done()
-	for _, proxy := range engine.config.AllProxies() {
-		engine.wg.Add(1)
-		go engine.maintainOneProxy(endpoint, proxy)
+func (engine *Engine) maintainWorkConns(gen *generation) {
+	defer gen.wg.Done()
+	for _, proxy := range gen.config.AllProxies() {
+		gen.wg.Add(1)
+		go engine.maintainOneProxy(gen, proxy)
 	}
 }
 
@@ -504,34 +731,34 @@ func (engine *Engine) maintainWorkConns(endpoint core.ServerEndpoint) {
 // UDP 会话长期占用一条工作连接，若等它结束再建下一条，第二个对端将永远拿
 // 不到连接。因此 UDP 代理的转发交给独立 goroutine，本循环只负责持续补充待命
 // 连接，二者的生命周期解耦。
-func (engine *Engine) maintainOneProxy(endpoint core.ServerEndpoint, proxy core.ClientProxy) {
-	defer engine.wg.Done()
+func (engine *Engine) maintainOneProxy(gen *generation, proxy core.ClientProxy) {
+	defer gen.wg.Done()
 	for {
 		select {
-		case <-engine.stopCh:
+		case <-gen.stopCh:
 			return
 		default:
 		}
-		slot, err := engine.pool.Acquire(context.Background(), proxy.ProxyName())
+		slot, err := gen.pool.Acquire(context.Background(), proxy.ProxyName())
 		if err != nil {
 			// 池已满：退避后重试，避免忙循环。
 			select {
-			case <-engine.stopCh:
+			case <-gen.stopCh:
 				return
 			case <-time.After(poolRetryBackoff):
 				continue
 			}
 		}
 		if proxy.Type() == core.ProxyTypeUDP {
-			engine.wg.Add(1)
+			gen.wg.Add(1)
 			go func() {
-				defer engine.wg.Done()
+				defer gen.wg.Done()
 				defer slot.Release()
-				engine.serveOneWorkConn(endpoint, proxy)
+				engine.serveOneWorkConn(gen, proxy)
 			}()
 			continue
 		}
-		engine.serveOneWorkConn(endpoint, proxy)
+		engine.serveOneWorkConn(gen, proxy)
 		slot.Release()
 	}
 }
@@ -540,24 +767,25 @@ func (engine *Engine) maintainOneProxy(endpoint core.ServerEndpoint, proxy core.
 //
 // 声明载荷携带本地目标地址：服务端据此判定目标是否在该客户端被允许的地址
 // 集合内，越权即拒绝（FR-06a §3.3）。
-func (engine *Engine) serveOneWorkConn(endpoint core.ServerEndpoint, proxy core.ClientProxy) {
-	work, err := engine.dial(context.Background(), endpoint.Address.String(), transport.PurposeWork, proxy.ProxyName())
+func (engine *Engine) serveOneWorkConn(gen *generation, proxy core.ClientProxy) {
+	work, err := gen.dialer.Dial(
+		context.Background(), gen.config.ServerEndpoint().Address.String(), transport.PurposeWork, proxy.ProxyName())
 	if err != nil {
 		select {
-		case <-engine.stopCh:
+		case <-gen.stopCh:
 		case <-time.After(retryBackoff):
 		}
 		return
 	}
-	auth := engine.config.Auth()
-	if err := declareWorkConn(work, engine.config.ClientID(), auth.Token, proxy.ProxyName(), proxy.ProxyLocalAddr()); err != nil {
+	auth := gen.config.Auth()
+	if err := declareWorkConn(work, gen.config.ClientID(), auth.Token, proxy.ProxyName(), proxy.ProxyLocalAddr()); err != nil {
 		_ = work.Close()
 		return
 	}
 	// 声明已发送：服务端暂存该连接等待访客，本端拨号本地目标后进入转发。
-	engine.track(work)
-	engine.serveWorkConn(work, proxy)
-	engine.untrack(work)
+	gen.track(work)
+	engine.serveWorkConn(gen, work, proxy)
+	gen.untrack(work)
 	_ = work.Close()
 }
 
@@ -566,37 +794,37 @@ func (engine *Engine) serveOneWorkConn(endpoint core.ServerEndpoint, proxy core.
 // UDP 代理的本地目标是数据报语义，因此按会话形态转发而非字节流桥接
 // （规格 §3.4：不得用 TCP 的关闭语义推断 UDP 状态）。
 // 本地目标的拨号同样带配置超时，禁止无超时拨号。
-func (engine *Engine) serveWorkConn(work *transport.Conn, proxy core.ClientProxy) {
+func (engine *Engine) serveWorkConn(gen *generation, work *transport.Conn, proxy core.ClientProxy) {
 	if proxy.Type() == core.ProxyTypeUDP {
-		engine.serveUDPWorkConn(work, proxy.ProxyLocalAddr())
+		engine.serveUDPWorkConn(gen, work, proxy.ProxyLocalAddr())
 		return
 	}
-	targetConn, err := engine.dialer.Dial(context.Background(), proxy.ProxyLocalAddr().String(), transport.PurposeWork)
+	targetConn, err := gen.dialer.Dial(context.Background(), proxy.ProxyLocalAddr().String(), transport.PurposeWork)
 	if err != nil {
 		return
 	}
 	defer func() { _ = targetConn.Close() }()
-	transport.Bridge(engine.stopCtx, work, targetConn)
+	transport.Bridge(gen.forwardCtx, work, targetConn)
 }
 
 // serveUDPWorkConn 把一条工作连接上的数据报往返转发到本地 UDP 目标。
 //
 // UDP 会话是长驻的：它会一直服务到会话空闲回收，不像 TCP 转发那样随任一端
-// 关闭而自然结束。因此这里必须显式响应停止信号：由 stopCh 与转发上下文共同
-// 收口，避免 Shutdown 被一条长驻会话悬挂。
-func (engine *Engine) serveUDPWorkConn(work *transport.Conn, target netip.AddrPort) {
-	socket, err := engine.dialer.DialUDP(target)
+// 关闭而自然结束。因此这里必须显式响应停止信号：由本代的停止信号与转发上下文
+// 共同收口，避免 Shutdown 被一条长驻会话悬挂。
+func (engine *Engine) serveUDPWorkConn(gen *generation, work *transport.Conn, target netip.AddrPort) {
+	socket, err := gen.dialer.DialUDP(target)
 	if err != nil {
 		return
 	}
 	defer func() { _ = socket.Close() }()
 
-	sessionCtx, stop := context.WithCancel(engine.stopCtx)
+	sessionCtx, stop := context.WithCancel(gen.forwardCtx)
 	defer stop()
 	go func() {
-		// Engine 停止即关闭会话两侧的承载连接：会话无处可退，必须显式收口。
+		// 本代停止即关闭会话两侧的承载连接：会话无处可退，必须显式收口。
 		select {
-		case <-engine.stopCh:
+		case <-gen.stopCh:
 			_ = socket.Close()
 			stop()
 		case <-sessionCtx.Done():
