@@ -324,6 +324,69 @@ func hasAuditAction(events []AuditEvent, action string) bool {
 	return false
 }
 
+// token 变更必须产生通知事件，且事件载荷不含凭据材料（FR-15 挂起补验项）。
+func TestTokenLifecycleBroadcastsWithoutSecrets(t *testing.T) {
+	store := openServerStore(t, t.TempDir()+"/jrps.db")
+	first, _ := seedTwoClients(t, store)
+	// 先建一个通知目标，否则广播会因"无启用目标"而不入队。
+	createWebhookTarget(t, store, "验收目标", true)
+
+	_, rotated, err := rotateToken(t, store, first.ID)
+	if err != nil {
+		t.Fatalf("轮换失败：%v", err)
+	}
+	if _, err := revokeToken(t, store, first.ID); err != nil {
+		t.Fatalf("吊销失败：%v", err)
+	}
+
+	entries := readOutboxForTest(t, store)
+	var rotatedEvents, revokedEvents []NotificationOutbox
+	for _, entry := range entries {
+		switch entry.EventType {
+		case EventTypeClientTokenRotated:
+			rotatedEvents = append(rotatedEvents, entry)
+		case EventTypeClientTokenRevoked:
+			revokedEvents = append(revokedEvents, entry)
+		}
+	}
+	if len(rotatedEvents) == 0 {
+		t.Fatalf("轮换应产生 %s 事件，实际 outbox 内容：%+v", EventTypeClientTokenRotated, entries)
+	}
+	if len(revokedEvents) == 0 {
+		t.Fatalf("吊销应产生 %s 事件", EventTypeClientTokenRevoked)
+	}
+
+	// 载荷不得含 token 值或摘要：通知渠道是外部系统。
+	// 注意 TargetID 存的是"这条通知发给谁"，不是"事件讲的是谁"——广播语义下
+	// 它必然是通知目标的标识，因此这里不对它做断言。
+	for _, entry := range append(rotatedEvents, revokedEvents...) {
+		if strings.Contains(entry.Payload, rotated) {
+			t.Fatalf("通知载荷不得含 token 明文：%s", entry.Payload)
+		}
+		if strings.Contains(entry.Payload, DigestToken(rotated)) {
+			t.Fatalf("通知载荷不得含 token 摘要：%s", entry.Payload)
+		}
+		if !strings.Contains(entry.Payload, first.ID) {
+			t.Fatalf("载荷应指明被变更的客户端标识：%s", entry.Payload)
+		}
+	}
+}
+
+// readOutboxForTest 读取 outbox 记录。
+func readOutboxForTest(t *testing.T, store *Store) []NotificationOutbox {
+	t.Helper()
+	var entries []NotificationOutbox
+	err := store.View(context.Background(), func(tx *Tx) error {
+		var readErr error
+		entries, readErr = tx.OutboxEntries()
+		return readErr
+	})
+	if err != nil {
+		t.Fatalf("读取 outbox 失败：%v", err)
+	}
+	return entries
+}
+
 // 条件更新守卫必须真的按 used_at 判条件：已使用的凭据不能被再次抢占。
 //
 // 这条直接调用守卫函数，不依赖并发。之所以要单独覆盖它，是因为并发兑换用例在
@@ -475,5 +538,55 @@ func TestClientReadMissingReturnsSentinel(t *testing.T) {
 	})
 	if !errors.Is(err, ErrClientNotFound) {
 		t.Fatalf("读取不存在的客户端应返回 ErrClientNotFound，实际 %v", err)
+	}
+}
+
+// 业务失败时不得留下通知：广播与业务写入同事务。
+func TestFailedTokenActionLeavesNoOutbox(t *testing.T) {
+	store := openServerStore(t, t.TempDir()+"/jrps.db")
+	createWebhookTarget(t, store, "验收目标", true)
+
+	// 对不存在的客户端轮换/吊销：两者都应失败，且不留任何 outbox 记录。
+	if _, _, err := rotateToken(t, store, "cli_missing"); err == nil {
+		t.Fatal("对不存在客户端的轮换应失败")
+	}
+	if _, err := revokeToken(t, store, "cli_missing"); err == nil {
+		t.Fatal("对不存在客户端的吊销应失败")
+	}
+
+	entries := readOutboxForTest(t, store)
+	if len(entries) != 0 {
+		t.Fatalf("失败的业务动作不得留下通知记录，实际 %d 条：%+v", len(entries), entries)
+	}
+}
+
+// 广播必须为每个启用目标各写一条记录，且指向该目标。
+//
+// 若 TargetID 写空，投递侧会走"发送时再枚举全部目标"的分支，与入队时的扇出
+// 叠加，导致同一目标收到重复投递。
+func TestTokenEventFanOutTargetsEachEnabledTarget(t *testing.T) {
+	store := openServerStore(t, t.TempDir()+"/jrps.db")
+	first, _ := seedTwoClients(t, store)
+	createWebhookTarget(t, store, "目标甲", true)
+	createWebhookTarget(t, store, "目标乙", true)
+
+	if _, _, err := rotateToken(t, store, first.ID); err != nil {
+		t.Fatalf("轮换失败：%v", err)
+	}
+
+	entries := readOutboxForTest(t, store)
+	var rotated []NotificationOutbox
+	for _, entry := range entries {
+		if entry.EventType == EventTypeClientTokenRotated {
+			rotated = append(rotated, entry)
+		}
+	}
+	if len(rotated) != 2 {
+		t.Fatalf("两个启用目标应各得一条记录，实际 %d 条", len(rotated))
+	}
+	for _, entry := range rotated {
+		if entry.TargetID == "" {
+			t.Fatal("TargetID 不得为空：空值会让投递侧再枚举一次目标，造成重复投递")
+		}
 	}
 }

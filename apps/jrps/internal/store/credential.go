@@ -223,7 +223,9 @@ func (tx *Tx) RotateClientToken(clientID string) (ClientView, string, error) {
 		}); err != nil {
 			return err
 		}
-		return nil
+		// 与业务写入同事务：上面的写入若失败，这里不会执行，不存在"轮换没成功却发了通知"。
+		// 事件不指向该客户端——它不是通知目标，指向它会让记录以"投递失败"收场。
+		return tx.broadcastClientTokenEvent(EventTypeClientTokenRotated, client, "已轮换")
 	})
 	if err != nil {
 		return ClientView{}, "", err
@@ -277,7 +279,7 @@ func (tx *Tx) RevokeClientToken(clientID string) (ClientView, error) {
 		}); err != nil {
 			return err
 		}
-		return nil
+		return tx.broadcastClientTokenEvent(EventTypeClientTokenRevoked, client, "已吊销")
 	})
 	if err != nil {
 		return ClientView{}, err
@@ -310,6 +312,19 @@ func (tx *Tx) markCredentialUsed(credentialID string, at time.Time) (bool, error
 		return false, fmt.Errorf("作废 enrollment 凭据失败：%w", translateSQLError(used.Error))
 	}
 	return used.RowsAffected > 0, nil
+}
+
+// broadcastClientTokenEvent 广播一次客户端 token 变更通知。
+//
+// 载荷只含客户端名称、标识与动作，不含 token 值或摘要：通知渠道是外部系统，
+// 把凭据材料写到那里等于把秘密复制到一个不受控的位置（FR-07 §3.3）。
+//
+// 不排除任何目标：被变更的是客户端而不是通知目标，不存在自我指涉。
+func (tx *Tx) broadcastClientTokenEvent(eventType string, client Client, action string) error {
+	_, err := tx.BroadcastOutbox(eventType, fmt.Sprintf(
+		"客户端 %s（%s）的 token %s", client.Name, client.ID, action,
+	), "")
+	return err
 }
 
 // newCredentialID 生成凭据标识。

@@ -33,6 +33,13 @@ const (
 	EventTypeTargetDeleted = "notification_target_deleted"
 	// EventTypeLoginFailureLimit 是管理员登录失败连续达到限流阈值。
 	EventTypeLoginFailureLimit = "admin_login_failure_limit_reached"
+	// EventTypeClientTokenRotated 是客户端 token 被轮换。
+	//
+	// 事件发给全部启用目标，但**不指向被轮换的客户端**：客户端不是通知目标，
+	// 指向它会让记录以"投递失败"收场，而真实原因是通知渠道里没有这个对象。
+	EventTypeClientTokenRotated = "client_token_rotated"
+	// EventTypeClientTokenRevoked 是客户端 token 被吊销。
+	EventTypeClientTokenRevoked = "client_token_revoked"
 )
 
 // NewOutboxEventID 生成不可猜测的 outbox 事件标识。
