@@ -51,12 +51,12 @@ func TestPendingGuestsAreBounded(t *testing.T) {
 	// 因此以计数而非拨号失败作为判定依据。
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if engine.workConns.RejectedGuests() >= 1 {
+		if engine.RejectedGuests() >= 1 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if rejected := engine.workConns.RejectedGuests(); rejected < 1 {
+	if rejected := engine.RejectedGuests(); rejected < 1 {
 		t.Fatalf("超出暂存上限 %d 后应有访客被拒绝，实际拒绝 %d 个", maxPendingGuest, rejected)
 	}
 
@@ -180,7 +180,7 @@ func TestDroppedGuestsAreUntracked(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	engine.mu.Lock()
-	before := len(engine.conns)
+	before := len(engine.currentGeneration().conns)
 	engine.mu.Unlock()
 	if before < 4 {
 		t.Fatalf("暂存访客应已登记活动记账，实际 %d 条", before)
@@ -191,11 +191,11 @@ func TestDroppedGuestsAreUntracked(t *testing.T) {
 		t.Fatalf("应释放 4 条暂存访客，实际 %d 条", len(dropped))
 	}
 	for _, conn := range dropped {
-		engine.untrack(conn)
+		engine.activeGeneration().untrack(conn)
 	}
 
 	engine.mu.Lock()
-	after := len(engine.conns)
+	after := len(engine.currentGeneration().conns)
 	engine.mu.Unlock()
 	if after != before-4 {
 		t.Fatalf("释放的访客必须撤销记账：释放前 %d 条，释放后 %d 条，期望 %d 条",
@@ -256,7 +256,7 @@ func TestUnauthorizedTargetPathUntracksGuests(t *testing.T) {
 func assertGuestDropUntracks(t *testing.T, engine *Engine, controlAddr string) {
 	t.Helper()
 	engine.mu.Lock()
-	before := len(engine.conns)
+	before := len(engine.currentGeneration().conns)
 	engine.mu.Unlock()
 
 	raw, err := net.Dial("tcp", controlAddr)
@@ -296,7 +296,7 @@ func assertGuestDropUntracks(t *testing.T, engine *Engine, controlAddr string) {
 	// 释放是异步的：给调用点留出撤销记账的时间。
 	time.Sleep(50 * time.Millisecond)
 	engine.mu.Lock()
-	after := len(engine.conns)
+	after := len(engine.currentGeneration().conns)
 	engine.mu.Unlock()
 	// 允许控制连接自身占一条记账。
 	if after > before-3+1 {

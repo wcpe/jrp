@@ -12,6 +12,12 @@ import (
 // 规格 §3.6：临时错误退避后继续，致命错误停止监听并上报。
 type AcceptAction int
 
+// ErrListenerNotHandoverable 表示该监听器无法在不关闭套接字的前提下交接。
+//
+// 见 Listener.SetAcceptDeadline：交接依赖 Accept 截止时间，底层监听器不支持时
+// 只能退回"关闭再重建"，那会让端口在切换窗口内消失，因此显式拒绝而不是静默降级。
+var ErrListenerNotHandoverable = errors.New("监听器不支持免关闭交接")
+
 const (
 	// AcceptContinue 表示 Accept 成功，循环继续。
 	AcceptContinue AcceptAction = iota
@@ -96,6 +102,35 @@ func (handle *Listener) Accept(purpose Purpose, proxy ...string) (*Conn, AcceptA
 // Listener 返回底层监听器，供需要 net.Listener 的宿主注入点使用。
 func (handle *Listener) Listener() net.Listener {
 	return handle.listener
+}
+
+// Handoverable 报告该监听器能否免关闭交接。
+//
+// 交接要求在**不关闭套接字**的前提下停掉旧代的 Accept 循环，因此底层监听器必须
+// 支持 Accept 截止时间。Core 自建的访客入口总是 net.Listen 产出的 TCP 监听器，
+// 必然满足；该判定用于在复用决策时排除不满足的结构，而不是事后补救。
+func (handle *Listener) Handoverable() bool {
+	_, ok := handle.listener.(acceptDeadliner)
+	return ok
+}
+
+// acceptDeadliner 是支持设置 Accept 截止时间的底层监听器（*net.TCPListener 满足）。
+type acceptDeadliner interface {
+	SetDeadline(time.Time) error
+}
+
+// SetAcceptDeadline 设置下一次 Accept 的截止时间。
+//
+// 交接用：把截止时间设为已过去的时刻，阻塞中的 Accept 会立即以超时错误返回
+// （归类 AcceptTemporary），旧代据此退出接收循环而**不必关闭套接字**——关闭会让
+// 端口短暂消失并在 backlog 里丢弃待接入的连接。唤醒后必须用零值清空，否则新代的
+// Accept 会一直立即超时。
+func (handle *Listener) SetAcceptDeadline(deadline time.Time) error {
+	deadliner, ok := handle.listener.(acceptDeadliner)
+	if !ok {
+		return ErrListenerNotHandoverable
+	}
+	return deadliner.SetDeadline(deadline)
 }
 
 // Release 关闭监听器并返回首次关闭的结果；重复释放安全。

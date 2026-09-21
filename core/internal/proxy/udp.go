@@ -247,6 +247,12 @@ type UDPProxy struct {
 	delivered int64
 	closed    bool
 
+	// suspend 表示入口被要求停止接收（见 Suspend）。
+	//
+	// 与 closed 分开：交接要求停掉本代的接收循环，但活动会话必须继续服务到自然
+	// 结束，而 Close 会把会话一并回收。
+	suspended atomic.Bool
+
 	// cancel 与会话侧同理：构造期确定，避免 Serve 与 Close 并发时的数据竞争。
 	cancel context.CancelFunc
 	serve  sync.WaitGroup
@@ -300,8 +306,12 @@ func (entry *UDPProxy) Delivered() int64 {
 	return entry.delivered
 }
 
-// Serve 接收数据报并分发到会话，直到入口关闭或上下文取消。
+// Serve 接收数据报并分发到会话，直到入口关闭、上下文取消或入口被 Suspend。
+//
+// 每次进入都从"接收中"开始：交接后由新一代调用本方法恢复接收，因此 Suspend 只是
+// 停掉**当次**接收循环的信号，不是入口的持久状态。
 func (entry *UDPProxy) Serve(ctx context.Context) {
+	entry.suspended.Store(false)
 	serveCtx, stopServe := context.WithCancel(ctx)
 	defer stopServe()
 
@@ -320,7 +330,7 @@ func (entry *UDPProxy) Serve(ctx context.Context) {
 			}
 			var netErr net.Error
 			if isNetError(err, &netErr) && netErr.Timeout() {
-				if serveCtx.Err() != nil {
+				if serveCtx.Err() != nil || entry.suspended.Load() {
 					return
 				}
 				continue
@@ -343,6 +353,16 @@ func (entry *UDPProxy) Serve(ctx context.Context) {
 		}
 		entry.dispatch(serveCtx, peer, buffer[:read])
 	}
+}
+
+// Suspend 停止当前接收循环但不回收活动会话。
+//
+// 入口交接用：套接字要随入口一起归后继代，因此本代的接收循环必须先退出，否则
+// 两个循环会争抢同一套接字。不能用 Close 代替：它会把活动会话一并回收，而交接
+// 要求已有会话不受影响（它们继续服务到自然结束）。
+// 下一次 Serve 会恢复接收，因此本状态只在两次 Serve 之间有效。
+func (entry *UDPProxy) Suspend() {
+	entry.suspended.Store(true)
 }
 
 // isOversizedDatagramError 判断读错误是否表示"数据报超出接收缓冲"。
