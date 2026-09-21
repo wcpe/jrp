@@ -481,18 +481,24 @@ func TestLongClientNameStillAllowsRevoke(t *testing.T) {
 		t.Fatalf("创建长名称客户端失败：%v", err)
 	}
 
-	for stage, action := range map[string]func() error{
-		"轮换": func() error {
+	// 顺序必须固定：吊销之后客户端就不可再轮换（轮换会报"客户端不存在"），
+	// 用 map 组织这两步会因遍历顺序随机而间歇性失败。
+	stages := []struct {
+		name string
+		run  func() error
+	}{
+		{"轮换", func() error {
 			_, _, err := rotateToken(t, store, "cli_long")
 			return err
-		},
-		"吊销": func() error {
+		}},
+		{"吊销", func() error {
 			_, err := revokeToken(t, store, "cli_long")
 			return err
-		},
-	} {
-		if err := action(); err != nil {
-			t.Fatalf("长名称客户端的%s动作失败（审计长度不应成为业务写入的隐式约束）：%v", stage, err)
+		}},
+	}
+	for _, stage := range stages {
+		if err := stage.run(); err != nil {
+			t.Fatalf("长名称客户端的%s动作失败（审计长度不应成为业务写入的隐式约束）：%v", stage.name, err)
 		}
 	}
 }
@@ -587,6 +593,53 @@ func TestTokenEventFanOutTargetsEachEnabledTarget(t *testing.T) {
 	for _, entry := range rotated {
 		if entry.TargetID == "" {
 			t.Fatal("TargetID 不得为空：空值会让投递侧再枚举一次目标，造成重复投递")
+		}
+	}
+}
+
+// 凭据发行与兑换必须各有独立动作名，不能复用 client_create 与 client_rotate。
+//
+// 这条守护审计的追溯力：复用会让"发了张可入场的凭据"读起来像"建了个客户端"，
+// 让"客户端首次注册领取 token"读起来像"管理员主动轮换"。两者风险含义完全不同，
+// 而审计列表正是靠动作名回答"发生了什么"。
+func TestCredentialActionsAreDistinctFromClientActions(t *testing.T) {
+	store := openServerStore(t, t.TempDir()+"/jrps.db")
+	first, _ := seedTwoClients(t, store)
+
+	// seedTwoClients 已创建两个客户端 → 两条 client_create。
+	secret, err := issueCredential(t, store, first.ID)
+	if err != nil {
+		t.Fatalf("发行凭据失败：%v", err)
+	}
+	// 发行凭据必须记为 client_credential_issue，而不是 client_create。
+	if _, _, err := redeemCredential(t, store, secret); err != nil {
+		t.Fatalf("兑换失败：%v", err)
+	}
+	// 兑换必须记为 client_enroll，而不是 client_rotate。
+	if _, _, err := rotateToken(t, store, first.ID); err != nil {
+		t.Fatalf("轮换失败：%v", err)
+	}
+	if _, err := revokeToken(t, store, first.ID); err != nil {
+		t.Fatalf("吊销失败：%v", err)
+	}
+
+	events := readAuditEvents(t, store)
+	counts := map[string]int{}
+	for _, event := range events {
+		counts[event.Action]++
+	}
+
+	// 创建两条（两个客户端）、发行一条、兑换一条、轮换一条、吊销一条。
+	want := map[string]int{
+		ActionClientCreate:    2,
+		ActionCredentialIssue: 1,
+		ActionClientEnroll:    1,
+		ActionClientRotate:    1,
+		ActionClientRevoke:    1,
+	}
+	for action, expected := range want {
+		if counts[action] != expected {
+			t.Fatalf("动作 %s 应为 %d 条，实际 %d（全部动作：%v）", action, expected, counts[action], counts)
 		}
 	}
 }

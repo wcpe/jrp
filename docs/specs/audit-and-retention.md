@@ -179,7 +179,9 @@ FR-16 解决三件事：
 
 实机（需用户确认，随 FR-13 补验）：开启采集并发起请求、查看一次正文、删除该条采集记录，确认正文查看与删除在返回内容之前已留审计；把保留时间与总量分别设为极小值，确认两个限制各自独立触发清理、先到者生效，且正文分段被回收后相关审计记录仍在。
 
-实机（需用户确认，token 相关）：**已通过**。创建客户端、轮换 token 与吊销 token 各自产生审计事件（`client_create`、`client_rotate`、`client_revoke`），这是 `client_rotate` 与 `client_revoke` 两个登记已久的动作首次有了写入点；审计不含 token 明文或摘要。
+实机（需用户确认，token 相关）：**已通过**。创建客户端、发行凭据、客户端兑换、轮换 token 与吊销 token 各有独立的审计动作（`client_create`、`client_credential_issue`、`client_enroll`、`client_rotate`、`client_revoke`），其中 `client_rotate` 与 `client_revoke` 是登记已久后首次有了写入点；审计不含 token 明文或摘要。
+
+凭据发行与兑换单独成动作而非复用 `client_create` 与 `client_rotate`：动作名要能直接回答"发生了什么"，而"发了张可入场的凭据"与"建了个客户端"、"客户端首次注册领取 token"与"管理员主动轮换"在风险含义上完全不同，复用会让审计列表失去追溯力。
 
 实机（需用户确认，随 FR-10 补验）：修改代理并应用，确认该动作产生一条审计事件。
 

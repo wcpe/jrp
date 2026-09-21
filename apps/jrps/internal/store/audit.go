@@ -22,9 +22,16 @@ const (
 	ActionRevisionAppend = "revision_append"
 
 	// 客户端与凭据。
-	ActionClientCreate = "client_create"
-	ActionClientRotate = "client_rotate"
-	ActionClientRevoke = "client_revoke"
+	//
+	// 凭据的发行与兑换单独成动作，而不是复用 client_create 与 client_rotate：
+	// 审计的价值在于动作名直接回答"发生了什么"，而"发了张可入场的凭据"与
+	// "建了个客户端"、"客户端首次注册领取 token"与"管理员主动轮换"在风险含义上
+	// 完全不同。复用会让审计列表失去追溯力。
+	ActionClientCreate    = "client_create"
+	ActionClientRotate    = "client_rotate"
+	ActionClientRevoke    = "client_revoke"
+	ActionCredentialIssue = "client_credential_issue"
+	ActionClientEnroll    = "client_enroll"
 
 	// 认证会话。
 	ActionAdminInitialized  = "admin_initialized"
@@ -66,6 +73,7 @@ var auditActions = map[string]struct{}{
 	ActionApplyPrepare: {}, ActionApplyPublish: {}, ActionApplyFailure: {},
 	ActionRestoreApply: {}, ActionRevisionAppend: {},
 	ActionClientCreate: {}, ActionClientRotate: {}, ActionClientRevoke: {},
+	ActionCredentialIssue: {}, ActionClientEnroll: {},
 	ActionAdminInitialized: {}, ActionAdminLogin: {}, ActionAdminLogout: {},
 	ActionAdminLoginFailure: {},
 	ActionPolicyUpdate:      {}, ActionAuditCleanup: {}, ActionBodyCaptureCleanup: {},

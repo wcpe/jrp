@@ -75,7 +75,7 @@ func (tx *Tx) IssueEnrollmentCredential(clientID string) (string, error) {
 		return tx.writeAudit(AuditEvent{
 			ActorType:  ActorTypeAdmin,
 			ActorID:    "admin",
-			Action:     ActionClientCreate,
+			Action:     ActionCredentialIssue,
 			ObjectType: ObjectTypeToken,
 			ObjectID:   clientID,
 			Result:     AuditResultSuccess,
@@ -163,7 +163,7 @@ func (tx *Tx) RedeemEnrollmentCredential(secret string) (ClientView, string, err
 		return tx.writeAudit(AuditEvent{
 			ActorType:  ActorTypeClient,
 			ActorID:    client.ID,
-			Action:     ActionClientRotate,
+			Action:     ActionClientEnroll,
 			ObjectType: ObjectTypeToken,
 			ObjectID:   client.ID,
 			Result:     AuditResultSuccess,
