@@ -73,6 +73,13 @@ func (api *agentAPI) enroll(c *gin.Context) {
 	})
 	if err != nil {
 		if errors.Is(err, store.ErrCredentialRejected) {
+			// 留痕用独立事务：业务事务已因拒绝回滚，写在里面会一起被撤销。
+			// 对外仍返回同一响应，不因留痕结果而改变。
+			if recordErr := api.store.Transaction(c.Request.Context(), func(tx *store.Tx) error {
+				return tx.RecordDeniedEnrollment("凭据无效、已过期或已被使用")
+			}); recordErr != nil {
+				api.logError("记录被拒绝的 enrollment 失败", recordErr, c)
+			}
 			// 凭据无效、过期与已使用返回同一响应：区分它们会让攻击者据此
 			// 判断凭据是否曾经存在（FR-07 §3.4）。
 			writeProblem(c, http.StatusUnauthorized, codeUnauthenticated, "凭据无效", "enrollment 凭据无效、已过期或已被使用")

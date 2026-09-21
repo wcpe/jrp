@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // 轮换后旧 token 立即失效、新 token 可用，且不影响其他客户端。
@@ -50,12 +51,14 @@ func TestRevokeClientTokenIsPermanent(t *testing.T) {
 		t.Fatalf("吊销后鉴权应失败，实际 %v", err)
 	}
 
-	// 已吊销不可恢复：重新发行凭据也不能把状态翻回来。
-	if _, err := issueCredential(t, store, first.ID); err != nil {
-		t.Fatalf("发行凭据失败：%v", err)
+	// 已吊销不可恢复：发行凭据与轮换都直接被拒，不产出任何可兑换的凭据。
+	// 早先的实现允许发行"成功"，产出的却是一张永远换不到 token 的死凭据，
+	// 并在审计里留下误导性的成功记录。
+	if _, err := issueCredential(t, store, first.ID); !errors.Is(err, ErrClientRevoked) {
+		t.Fatalf("对已吊销客户端发行凭据应返回 ErrClientRevoked，实际 %v", err)
 	}
-	if _, _, err := redeemCredential(t, store, "不存在的凭据"); !errors.Is(err, ErrCredentialRejected) {
-		t.Fatalf("无效凭据应被拒，实际 %v", err)
+	if _, _, err := rotateToken(t, store, first.ID); !errors.Is(err, ErrClientRevoked) {
+		t.Fatalf("对已吊销客户端轮换应返回 ErrClientRevoked，实际 %v", err)
 	}
 
 	if _, err := authenticateClient(t, store, other.Token); err != nil {
@@ -640,6 +643,124 @@ func TestCredentialActionsAreDistinctFromClientActions(t *testing.T) {
 	for action, expected := range want {
 		if counts[action] != expected {
 			t.Fatalf("动作 %s 应为 %d 条，实际 %d（全部动作：%v）", action, expected, counts[action], counts)
+		}
+	}
+}
+
+// truncateAuditLabel 的边界必须被守住。
+//
+// 这条守护一个具体风险：若改按字节切片，多字节字符会被撕裂，而
+// utf8.RuneCountInString 对非法字节按 1 rune/字节计，长度校验不会拒绝——
+// 结果是乱码落库，正是该函数注释声称要避免的情况。
+func TestTruncateAuditLabelBoundaries(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		limit int
+	}{
+		{"空串", "", 0},
+		{"恰好等于上限", strings.Repeat("a", auditLabelLimit), auditLabelLimit},
+		{"上限加一", strings.Repeat("a", auditLabelLimit+1), auditLabelLimit},
+		{"多字节恰好等于上限", strings.Repeat("客", auditLabelLimit), auditLabelLimit},
+		{"多字节超限", strings.Repeat("客", auditLabelLimit+5), auditLabelLimit + 1},
+		{"四字节字符超限", strings.Repeat("𝄞", auditLabelLimit+3), auditLabelLimit + 1},
+	}
+	for _, item := range cases {
+		got := truncateAuditLabel(item.input)
+		if !utf8.ValidString(got) {
+			t.Fatalf("%s：截断后不是合法 UTF-8（按字节切片会撕裂多字节字符）", item.name)
+		}
+		if runes := utf8.RuneCountInString(got); runes > item.limit+1 {
+			t.Fatalf("%s：截断后 %d 个字符，超出上限 %d + 省略号", item.name, runes, item.limit)
+		}
+		if utf8.RuneCountInString(item.input) > auditLabelLimit && !strings.HasSuffix(got, "…") {
+			t.Fatalf("%s：超限截断应追加省略号，让读审计的人知道这里被截断过", item.name)
+		}
+		if utf8.RuneCountInString(item.input) <= auditLabelLimit && got != item.input {
+			t.Fatalf("%s：未超限不应改动原值，实际 %q", item.name, got)
+		}
+	}
+}
+
+// 名称恰好等于上限必须被接受（边界不能误伤）。
+func TestCreateClientAcceptsNameAtLimit(t *testing.T) {
+	store := openServerStore(t, t.TempDir()+"/jrps.db")
+	token, _ := NewClientToken()
+
+	err := store.Transaction(context.Background(), func(tx *Tx) error {
+		_, err := tx.CreateClient(ClientInput{
+			ID: "cli_at_limit", Name: strings.Repeat("客", maxClientNameLength), Token: token,
+		})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("恰好等于上限的名称应被接受，实际 %v", err)
+	}
+}
+
+// 已吊销客户端的凭据发行必须被拒，而不是产出一张永远换不到 token 的死凭据。
+//
+// 实机复现过该缺陷：发行返回 201 并写一条"成功发行"审计，而该凭据兑换必然 401。
+func TestIssueCredentialRejectsRevokedClient(t *testing.T) {
+	store := openServerStore(t, t.TempDir()+"/jrps.db")
+	first, _ := seedTwoClients(t, store)
+	if _, err := revokeToken(t, store, first.ID); err != nil {
+		t.Fatalf("吊销失败：%v", err)
+	}
+
+	if _, err := issueCredential(t, store, first.ID); !errors.Is(err, ErrClientRevoked) {
+		t.Fatalf("对已吊销客户端发行凭据应返回 ErrClientRevoked，实际 %v", err)
+	}
+}
+
+// 拒绝留痕方法本身必须可写且不改写业务状态。
+//
+// 注意分层：留痕由 HTTP 层在业务事务回滚之后用独立事务调用——写在业务事务里
+// 会随回滚一起被撤销（实测过：denied 计数为 0）。因此这里直接验证留痕方法，
+// 端到端的留痕效果由 HTTP 层用例覆盖。
+func TestDeniedRecordingWritesAudit(t *testing.T) {
+	store := openServerStore(t, t.TempDir()+"/jrps.db")
+	first, _ := seedTwoClients(t, store)
+
+	err := store.Transaction(context.Background(), func(tx *Tx) error {
+		if err := tx.RecordDeniedEnrollment("凭据不存在"); err != nil {
+			return err
+		}
+		if err := tx.RecordDeniedTokenAction(ActionClientRotate, first.ID, "客户端已吊销"); err != nil {
+			return err
+		}
+		return tx.RecordDeniedTokenAction(ActionCredentialIssue, "cli_missing", "客户端不存在")
+	})
+	if err != nil {
+		t.Fatalf("留痕写入失败：%v", err)
+	}
+
+	events := readAuditEvents(t, store)
+	denied := 0
+	for _, event := range events {
+		if event.Result == AuditResultDenied {
+			denied++
+			if strings.Contains(event.Context, "凭据不存在") && event.ObjectID != "unknown" {
+				t.Fatalf("enrollment 拒绝的留痕不应回显凭据信息，实际 %q", event.ObjectID)
+			}
+		}
+	}
+	if denied != 3 {
+		t.Fatalf("三条拒绝都应留痕，实际 %d 条 denied（全部：%+v）", denied, events)
+	}
+}
+
+// DenialReason 必须把拒绝错误映射为可公开的原因类别。
+func TestDenialReasonMapping(t *testing.T) {
+	cases := map[error]string{
+		ErrClientRevoked:      "客户端已吊销",
+		ErrClientNotFound:     "客户端不存在",
+		ErrCredentialRejected: "凭据无效、已过期或已被使用",
+		errors.New("其他错误"):    "",
+	}
+	for err, want := range cases {
+		if got := DenialReason(err); got != want {
+			t.Fatalf("%v 应映射为 %q，实际 %q", err, want, got)
 		}
 	}
 }

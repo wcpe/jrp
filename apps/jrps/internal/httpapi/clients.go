@@ -230,6 +230,11 @@ func (api *clientAPI) issueCredential(c *gin.Context) {
 		return err
 	})
 	if err != nil {
+		api.recordDenial(c, err, clientID)
+		if errors.Is(err, store.ErrClientRevoked) {
+			writeProblem(c, http.StatusConflict, codeConflict, "客户端已吊销", "客户端已吊销，无法发行凭据；如需恢复请新建客户端")
+			return
+		}
 		if errors.Is(err, store.ErrClientNotFound) {
 			writeProblem(c, http.StatusNotFound, codeNotFound, "客户端不存在", "请求的客户端不存在")
 			return
@@ -245,6 +250,13 @@ func (api *clientAPI) issueCredential(c *gin.Context) {
 //
 // 客户端不存在返回 404；其余按内部错误处理。错误说明不回显 token 值。
 func (api *clientAPI) writeTokenActionError(c *gin.Context, message string, err error) {
+	api.recordDenial(c, err, c.Param("clientId"))
+	if errors.Is(err, store.ErrClientRevoked) {
+		// 409 而不是 404：客户端确实存在且可读，只是处于不可操作的终态。
+		// 报 404 会把管理员引向"ID 写错了"，而真实原因是状态问题。
+		writeProblem(c, http.StatusConflict, codeConflict, "客户端已吊销", "客户端已吊销，token 动作不可用；如需恢复请新建客户端")
+		return
+	}
 	if errors.Is(err, store.ErrClientNotFound) {
 		writeProblem(c, http.StatusNotFound, codeNotFound, "客户端不存在", "请求的客户端不存在")
 		return
@@ -260,6 +272,30 @@ func (api *clientAPI) logError(message string, err error, c *gin.Context) {
 		return
 	}
 	api.logger.Error(message, "错误", err, "请求标识", requestID(c))
+}
+
+// recordDenial 为被拒绝的 token 动作补写审计留痕。
+//
+// 必须用独立事务：业务事务已因拒绝而回滚，留痕写在里面会一起被撤销。
+// 只在能识别原因时写（DenialReason 返回空串表示这不是"被拒绝"而是内部错误）。
+// 留痕失败只记日志，不改变对外响应——把 401/404 变成 500 反而给了探测信号。
+func (api *clientAPI) recordDenial(c *gin.Context, err error, clientID string) {
+	reason := store.DenialReason(err)
+	if reason == "" {
+		return
+	}
+	action := store.ActionClientRotate
+	if c.Param("action") == "/enrollment-credentials" {
+		action = store.ActionCredentialIssue
+	} else if c.Param("action") == "/tokens:revoke" {
+		action = store.ActionClientRevoke
+	}
+	recordErr := api.store.Transaction(c.Request.Context(), func(tx *store.Tx) error {
+		return tx.RecordDeniedTokenAction(action, clientID, reason)
+	})
+	if recordErr != nil {
+		api.logError("记录被拒绝的 token 动作失败", recordErr, c)
+	}
 }
 
 // nameViolationDetail 提取名称校验失败的中文说明。

@@ -25,6 +25,11 @@ var ErrCredentialRejected = errors.New("enrollment 凭据无效或已失效")
 // ErrClientNotFound 表示客户端不存在。
 var ErrClientNotFound = errors.New("客户端不存在")
 
+// ErrClientRevoked 表示客户端已被吊销，其 token 生命周期动作不再可用。
+//
+// 吊销是终态：不提供 un-revoke，也不能靠重新发行凭据绕过（FR-07 §2）。
+var ErrClientRevoked = errors.New("客户端已吊销")
+
 // issance 分隔线：token 生命周期实现。
 
 // NewCredentialSecret 生成一个凭据明文；与客户端 token 同强度。
@@ -59,6 +64,11 @@ func (tx *Tx) IssueEnrollmentCredential(clientID string) (string, error) {
 				return ErrClientNotFound
 			}
 			return fmt.Errorf("读取客户端失败：%w", translateSQLError(err))
+		}
+		// 已吊销是终态：给它发凭据只会产出一张永远无法兑换的死凭据，
+		// 并在审计里留下一条"成功发行"的误导记录。恢复路径是新建客户端。
+		if client.EnrollmentState == EnrollmentStateRevoked {
+			return ErrClientRevoked
 		}
 		now := time.Now().UTC()
 		credential := EnrollmentCredential{
@@ -195,7 +205,7 @@ func (tx *Tx) RotateClientToken(clientID string) (ClientView, string, error) {
 			return fmt.Errorf("读取客户端失败：%w", translateSQLError(err))
 		}
 		if client.EnrollmentState == EnrollmentStateRevoked {
-			return ErrClientNotFound
+			return ErrClientRevoked
 		}
 		issued, err := NewClientToken()
 		if err != nil {
@@ -297,6 +307,58 @@ func viewOfClient(client Client) ClientView {
 		ConnectionState: client.ConnectionState,
 		DesiredRevision: client.DesiredRevision,
 		ActiveRevision:  client.ActiveRevision,
+	}
+}
+
+// RecordDeniedEnrollment 记录一次被拒绝的 enrollment 兑换。
+//
+// 必须在业务事务之外用独立事务调用：拒绝路径会让业务事务回滚，若把留痕写在
+// 同一个事务里，它会连同业务一起被撤销——实测确认过这一点（denied 计数为 0）。
+// 既有做法同样如此：登录失败的审计由 HTTP 层单独写入（见 RecordLoginFailure）。
+//
+// 只记原因类别，不记凭据值；对外语义不变，仍由调用方返回统一的拒绝响应。
+func (tx *Tx) RecordDeniedEnrollment(reason string) error {
+	return tx.writeAudit(AuditEvent{
+		ActorType:  ActorTypeClient,
+		ActorID:    "unknown",
+		Action:     ActionClientEnroll,
+		ObjectType: ObjectTypeToken,
+		ObjectID:   "unknown",
+		Result:     AuditResultDenied,
+		Context:    fmt.Sprintf("enrollment 兑换被拒绝：%s", reason),
+	})
+}
+
+// RecordDeniedTokenAction 记录一次被拒绝的 token 生命周期动作。
+//
+// 与 RecordDeniedEnrollment 同理：由调用方在业务事务之外单独调用。
+func (tx *Tx) RecordDeniedTokenAction(action, clientID, reason string) error {
+	// 客户端标识来自路由参数，截断后再嵌入，避免超长值撑破审计上下文上限。
+	label := truncateAuditLabel(clientID)
+	return tx.writeAudit(AuditEvent{
+		ActorType:  ActorTypeAdmin,
+		ActorID:    "admin",
+		Action:     action,
+		ObjectType: ObjectTypeToken,
+		ObjectID:   label,
+		Result:     AuditResultDenied,
+		Context:    fmt.Sprintf("token 动作被拒绝（%s）：%s", action, reason),
+	})
+}
+
+// DenialReason 把拒绝错误映射为可公开的原因类别；无法识别时返回空串。
+//
+// 供 HTTP 层在业务事务回滚之后补写留痕：此时只剩错误本身，需要它还原原因。
+func DenialReason(err error) string {
+	switch {
+	case errors.Is(err, ErrClientRevoked):
+		return "客户端已吊销"
+	case errors.Is(err, ErrClientNotFound):
+		return "客户端不存在"
+	case errors.Is(err, ErrCredentialRejected):
+		return "凭据无效、已过期或已被使用"
+	default:
+		return ""
 	}
 }
 

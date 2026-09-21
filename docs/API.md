@@ -111,13 +111,13 @@ P1 不提供 `/node`、`/cluster`、节点注册、调度或分布式 RPC 端点
 
 ### 4.3 客户端
 
-- `GET /api/v1/clients`：分页查询客户端、连接状态和 revision 摘要。需管理员会话。
+- `GET /api/v1/clients`：列出客户端、连接状态和 revision 摘要。需管理员会话。**P1 不分页**（单管理员场景下客户端数量可控），因此不提供 `limit`/`cursor`，响应只有 `items`——与 §1.5 的通用分页约定此处不适用。
 - `POST /api/v1/clients`：创建客户端。需会话与 CSRF，成功返回 201。客户端标识由服务端生成；响应同时返回**一次**独立 token 明文与**一次** enrollment 凭据明文，此后不可再取。
 - `GET /api/v1/clients/{clientId}`：读取单个客户端详情。需会话；只返回掩码与元数据。
 - `PATCH /api/v1/clients/{clientId}`：修改允许的管理元数据。（待交付）
-- `POST /api/v1/clients/{clientId}/tokens:rotate`：轮换独立 token。需会话与 CSRF；响应返回**一次**新 token 明文，旧 token 立即失效。
+- `POST /api/v1/clients/{clientId}/tokens:rotate`：轮换独立 token。需会话与 CSRF；响应返回**一次**新 token 明文，旧 token 立即失效。客户端已吊销时返回 **409**（客户端存在且可读，只是处于不可操作的终态；报 404 会把管理员引向"ID 写错了"）。
 - `POST /api/v1/clients/{clientId}/tokens:revoke`：吊销 token 并使后续鉴权失败。需会话与 CSRF；吊销不可恢复，且同事务作废该客户端所有未使用的 enrollment 凭据。
-- `POST /api/v1/clients/{clientId}/enrollment-credentials`：重新发行一次性 enrollment 凭据，成功返回 201。需会话与 CSRF。
+- `POST /api/v1/clients/{clientId}/enrollment-credentials`：重新发行一次性 enrollment 凭据，成功返回 201。需会话与 CSRF。**客户端已吊销时返回 409**：向终态客户端发行凭据只会产出一张永远无法兑换的死凭据。
 
 客户端响应字段：`id`、`name`、`maskedToken`（`****` 加摘要前缀）、`enrollmentState`、`connectionState`、`desiredRevision`、`activeRevision`。创建与轮换响应额外含 `token`，创建响应额外含 `enrollmentCredential`。
 
@@ -205,12 +205,13 @@ P1 不提供 `/node`、`/cluster`、节点注册、调度或分布式 RPC 端点
 
 - **方法/路径**：`POST /agent/v1/enrollments`
 - **认证**：不需要客户端 token——enrollment 凭据本身就是入场券。这也是 `/agent/v1` 下唯一无需 token 的端点。
-- **请求**：enrollment 凭据、客户端生成的身份材料、版本与平台摘要。
+- **请求**：enrollment 凭据、版本与平台摘要。客户端标识由服务端在创建时生成，不由客户端提交（避免伪造他人标识）。
 - **响应**：客户端 ID、独立 token（**明文只此一次**）、管理 WSS 地址、服务端证书指纹信息和当前 desired revision 摘要。
-- **错误**：凭据无效/过期、客户端已绑定、版本不受支持、速率受限。
+- **错误**：凭据无效/过期/已使用、客户端已吊销、版本不受支持、速率受限。
+  - 被拒绝的兑换写入审计（结果记为 `denied`），审计只记原因类别、不回显凭据值。
   - 凭据无效、已过期与已被使用返回**完全相同**的 401 问题详情，不区分原因——区分它们会让攻击者据此判断凭据是否曾经存在。并发兑换同一凭据只有一个成功，由存储层的条件更新保证。
   - 已吊销客户端的凭据一律被拒：吊销会作废该客户端所有未使用的凭据，否则它们就是一条绕过吊销的路径。
-- **交付状态**：凭据的发行与兑换已交付（FR-07）；本端点的响应中「管理 WSS 地址、证书指纹、desired revision 摘要」三项取决于 FR-08 与 FR-26，随对应 FR 补齐。
+- **交付状态**：凭据的发行与兑换已交付（FR-07）；本端点的响应中「管理 WSS 地址、证书指纹、desired revision 摘要」三项取决于 FR-08 与 FR-26，**enrollment 限流与「客户端已绑定」拒绝**随 FR-08 补齐。
 
 ### 5.2 Desired state
 

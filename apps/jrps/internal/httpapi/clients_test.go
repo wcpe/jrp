@@ -226,3 +226,95 @@ func assertTokenAccepted(t *testing.T, database *store.Store, token string) {
 		t.Fatalf("token 应可用但鉴权失败：%v", err)
 	}
 }
+
+// 读取不存在的客户端必须返回 404 而不是 500。
+//
+// store 层已有哨兵用例，但那条只保证 tx.Client 返回哨兵错误；这一条保证 HTTP 层
+// 真的把它映射成了 404。删掉 show 里的 404 分支，本用例会失败。
+func TestClientShowMissingReturnsNotFound(t *testing.T) {
+	router, _ := newNotificationRouter(t, &stubTestNotifier{})
+
+	recorder := doClientRequest(t, router, http.MethodGet, "/api/v1/clients/cli_missing", "", false)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("不存在的客户端应返回 404，实际 %d：%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "客户端不存在") {
+		t.Fatalf("应给中文说明：%s", recorder.Body.String())
+	}
+}
+
+// 名称超长必须返回 400 与中文说明，而不是 500。
+func TestClientCreateRejectsOverlongNameOverHTTP(t *testing.T) {
+	router, _ := newNotificationRouter(t, &stubTestNotifier{})
+	body := `{"name":"` + strings.Repeat("客", 200) + `"}`
+
+	recorder := doClientRequest(t, router, http.MethodPost, "/api/v1/clients", body, true)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("超长名称应返回 400，实际 %d：%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "名称超出长度上限") {
+		t.Fatalf("应给中文说明：%s", recorder.Body.String())
+	}
+}
+
+// 已吊销客户端的 token 动作必须返回 409 而不是 404：客户端确实存在且可读，
+// 报 404 会把管理员引向"ID 写错了"，而真实原因是状态问题。
+func TestRevokedClientTokenActionsReturnConflict(t *testing.T) {
+	router, _ := newNotificationRouter(t, &stubTestNotifier{})
+	clientID, _ := createClient(t, router, "客户端甲")
+	if recorder := doClientRequest(t, router, http.MethodPost,
+		"/api/v1/clients/"+clientID+"/tokens:revoke", "", true); recorder.Code != http.StatusOK {
+		t.Fatalf("吊销失败：%d %s", recorder.Code, recorder.Body.String())
+	}
+
+	for _, path := range []string{
+		"/api/v1/clients/" + clientID + "/tokens:rotate",
+		"/api/v1/clients/" + clientID + "/enrollment-credentials",
+	} {
+		recorder := doClientRequest(t, router, http.MethodPost, path, "", true)
+		if recorder.Code != http.StatusConflict {
+			t.Fatalf("%s 应返回 409，实际 %d：%s", path, recorder.Code, recorder.Body.String())
+		}
+	}
+
+	// 详情仍应可读：与 404 的语义区别正在于此。
+	if recorder := doClientRequest(t, router, http.MethodGet, "/api/v1/clients/"+clientID, "", false); recorder.Code != http.StatusOK {
+		t.Fatalf("已吊销客户端的详情应可读，实际 %d", recorder.Code)
+	}
+}
+
+// 拒绝路径必须在 HTTP 层留下审计（端到端）。
+//
+// 留痕在业务事务之外用独立事务写入，因此这条必须走 HTTP 层才能验证——
+// 直接调 store 层看不到（业务事务回滚会撤销同事务内的留痕）。
+func TestDeniedEnrollmentIsAuditedOverHTTP(t *testing.T) {
+	router, database := newNotificationRouter(t, &stubTestNotifier{})
+
+	for index := 0; index < 3; index++ {
+		recorder := doEnroll(t, router, "完全不存在的凭据")
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("无效凭据应返回 401，实际 %d", recorder.Code)
+		}
+	}
+
+	var page store.AuditPage
+	if err := database.View(t.Context(), func(tx *store.Tx) error {
+		var err error
+		page, err = tx.QueryAuditEvents(store.AuditQuery{})
+		return err
+	}); err != nil {
+		t.Fatalf("读取审计失败：%v", err)
+	}
+	denied := 0
+	for _, event := range page.Items {
+		if event.Result == store.AuditResultDenied {
+			denied++
+			if strings.Contains(event.Context, "完全不存在的凭据") {
+				t.Fatal("审计不得回显被拒绝的凭据值")
+			}
+		}
+	}
+	if denied != 3 {
+		t.Fatalf("三次被拒绝的兑换都应留痕，实际 %d 条", denied)
+	}
+}

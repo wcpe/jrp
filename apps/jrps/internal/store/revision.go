@@ -111,7 +111,7 @@ func (tx *Tx) SaveProxy(proxy Proxy, actor Actor, origin string) (uint64, error)
 			Content:       proxySnapshotContent(proxy),
 			Actor:         actor,
 			Origin:        origin,
-			ChangeSummary: fmt.Sprintf("代理 %s（%s）发生变更", proxy.Name, proxy.Type),
+			ChangeSummary: fmt.Sprintf("代理 %s（%s）发生变更", truncateAuditLabel(proxy.Name), proxy.Type),
 		}); err != nil {
 			return err
 		}
@@ -127,7 +127,7 @@ func (tx *Tx) SaveProxy(proxy Proxy, actor Actor, origin string) (uint64, error)
 			ObjectType:      "proxy",
 			ObjectID:        proxy.ID,
 			Result:          AuditResultSuccess,
-			Context:         fmt.Sprintf("代理 %s 变更已生成版本 %d", proxy.Name, revision),
+			Context:         fmt.Sprintf("代理 %s 变更已生成版本 %d", truncateAuditLabel(proxy.Name), revision),
 			DesiredRevision: revision,
 		})
 	})
@@ -149,7 +149,7 @@ func (tx *Tx) DeleteProxy(proxy Proxy, actor Actor) (uint64, error) {
 			Content:       proxySnapshotContent(proxy),
 			Actor:         actor,
 			Origin:        OriginProxyDelete,
-			ChangeSummary: fmt.Sprintf("删除代理 %s", proxy.Name),
+			ChangeSummary: fmt.Sprintf("删除代理 %s", truncateAuditLabel(proxy.Name)),
 		}); err != nil {
 			return err
 		}
@@ -165,7 +165,7 @@ func (tx *Tx) DeleteProxy(proxy Proxy, actor Actor) (uint64, error) {
 			ObjectType:      "proxy",
 			ObjectID:        proxy.ID,
 			Result:          AuditResultSuccess,
-			Context:         fmt.Sprintf("代理 %s 已删除并生成版本 %d", proxy.Name, revision),
+			Context:         fmt.Sprintf("代理 %s 已删除并生成版本 %d", truncateAuditLabel(proxy.Name), revision),
 			DesiredRevision: revision,
 		})
 	})
