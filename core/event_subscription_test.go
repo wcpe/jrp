@@ -64,9 +64,9 @@ const resyncDrainTimeout = 5 * time.Second
 
 // 断言消息由多个方向共用，集中定义避免文案漂移。
 var (
-	engineStopEventMissing = errors.New("Engine 停止后未收到 EngineStopped 事件")
-	engineStopEventWrong   = errors.New("收到非 EngineStopped 的其他事件")
-	engineStopErrMissing   = errors.New("EngineStopped 事件应携带 Err() 返回的最终错误")
+	errEngineStopEventMissing = errors.New("engine stopped 后未收到 EngineStopped 事件")
+	errEngineStopEventWrong   = errors.New("收到非 EngineStopped 的其他事件")
+	errEngineStopErrMissing   = errors.New("EngineStopped 事件应携带 Err() 返回的最终错误")
 )
 
 // captureStdout 截获进程标准输出并执行 fn，返回期间直写的全部内容。
@@ -730,7 +730,7 @@ func TestEventEngineStoppedOnShutdownAndNotDelayed(t *testing.T) {
 		}
 	}
 	if stoppedServerAt < 0 {
-		t.Fatalf("服务端 %s（共 %d 个事件）", engineStopEventMissing.Error(), len(serverSeen))
+		t.Fatalf("服务端 %s（共 %d 个事件）", errEngineStopEventMissing.Error(), len(serverSeen))
 	}
 	if stoppedServerAt != len(serverSeen)-1 {
 		t.Fatalf("服务端 EngineStopped 之后仍有事件（位置 %d，共 %d 个）：关闭顺序违反先通知后关通道",
@@ -751,21 +751,21 @@ func TestEventEngineStoppedOnShutdownAndNotDelayed(t *testing.T) {
 	// Err() 的最终错误（规格 §5 错误路径第五条）。
 	clientSeen := waitForEvent(t, clientSub.Events(), isEventStopped)
 	if len(clientSeen) == 0 {
-		t.Fatal("客户端 " + engineStopEventMissing.Error())
+		t.Fatal("客户端 " + errEngineStopEventMissing.Error())
 	}
 	stoppedClient, ok := clientSeen[len(clientSeen)-1].(core.EngineStopped)
 	if !ok {
-		t.Fatalf("客户端 %s：%T", engineStopEventWrong.Error(), clientSeen[len(clientSeen)-1])
+		t.Fatalf("客户端 %s：%T", errEngineStopEventWrong.Error(), clientSeen[len(clientSeen)-1])
 	}
 	clientFinal := clientEngine.Err()
 	if clientFinal == nil {
 		t.Fatal("客户端异常停止后 Err() 为 nil，无法验证 EngineStopped 携带最终错误")
 	}
 	if stoppedClient.Err == nil {
-		t.Fatalf("%s：事件未携带错误", engineStopErrMissing.Error())
+		t.Fatalf("%s：事件未携带错误", errEngineStopErrMissing.Error())
 	}
 	if !errors.Is(stoppedClient.Err, clientFinal) && stoppedClient.Err.Error() != clientFinal.Error() {
-		t.Fatalf("%s：事件错误 %v 与 Err() %v 不一致", engineStopErrMissing.Error(),
+		t.Fatalf("%s：事件错误 %v 与 Err() %v 不一致", errEngineStopErrMissing.Error(),
 			stoppedClient.Err, clientFinal)
 	}
 

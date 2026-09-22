@@ -99,9 +99,8 @@ type Subscription struct {
 	// events 是宿主读取通道，也是订阅的全部缓冲。
 	events chan Event
 
-	mu         sync.Mutex
-	closed     bool // 订阅已关闭：不再接收新事件
-	pumpClosed bool // 供出通道已关闭
+	mu     sync.Mutex
+	closed bool // 订阅已关闭：不再接收新事件
 	// droppedSinceResync 是本窗口内丢弃的常规级事件数；ResyncRequired 发布后清零。
 	droppedSinceResync uint64
 	// resyncPending 表示本窗口已发布过 ResyncRequired：宿主消费前不再重复发布。
@@ -207,10 +206,6 @@ func (sub *Subscription) publishResyncLocked() {
 	default:
 	}
 }
-
-// wake 唤醒泵 goroutine 处理新事件或关闭。单层缓冲下无泵，保留空实现以兼容
-// 既有调用点（Close 的异步排空即为收口）。
-func (sub *Subscription) wake() {}
 
 // shutdownPump 在引擎停止路径关闭订阅（供出通道随之关闭）。
 func (sub *Subscription) shutdownPump() {
