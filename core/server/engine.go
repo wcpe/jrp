@@ -427,6 +427,12 @@ func entryBindAddr(config core.ServerConfig, port int) netip.AddrPort {
 // 复用条件是「入口标识与绑定地址都未变」：标识由配置层保证唯一，地址相等说明
 // 仍是同一个监听套接字。此外要求该监听器支持免关闭交接——否则只能"关闭再重建"，
 // 那会让端口在切换窗口内消失，宁可新建失败也不要静默降级。
+//
+// 地址比较在**通配语义**下进行，不做逐字节字符串比对：net.Listen("tcp", "0.0.0.0:p")
+// 的 Addr() 报告 "[::]:p"（Go 监听通配地址时内核按双栈处理），逐字节比较会把
+// 这一对等表达误判为"地址变了"而放弃复用，让 wildcard 配置在换代时全部 EADDRINUSE。
+// 判定规则：新旧地址的端口相同，且各自的主机部分至少一个是通配（unspecified），
+// 或主机部分逐字节相等。
 func reusableStreamEntry(previous *generation, name string, address netip.AddrPort) *transport.Listener {
 	if previous == nil {
 		return nil
@@ -435,10 +441,22 @@ func reusableStreamEntry(previous *generation, name string, address netip.AddrPo
 	if listener == nil || listener.Addr() == nil {
 		return nil
 	}
-	if listener.Addr().String() != address.String() || !listener.Handoverable() {
+	old, err := netip.ParseAddrPort(listener.Addr().String())
+	if err != nil || old.Port() != address.Port() || !addrOverlap(old.Addr(), address.Addr()) {
 		return nil
 	}
 	return listener
+}
+
+// addrOverlap 判断两个监听主机地址在通配语义下是否指向同一组接口。
+func addrOverlap(old, next netip.Addr) bool {
+	if !old.IsValid() || !next.IsValid() {
+		return false
+	}
+	if old.IsUnspecified() || next.IsUnspecified() {
+		return true
+	}
+	return old == next
 }
 
 // takeUDPEntry 取一个 UDP 入口：标识、绑定地址与会话参数都未变时接管上一代的入口。
@@ -452,14 +470,16 @@ func (engine *Engine) takeUDPEntry(
 ) (*proxy.UDPProxy, bool, error) {
 	address := entryBindAddr(config, binding.RemotePort)
 	if previous != nil {
-		if entry := previous.udpEntries[binding.Name]; entry != nil && entry.Addr() != nil &&
-			entry.Addr().String() == address.String() {
-			if !udpParamsMatch(previous.config, config) {
-				return nil, false, fmt.Errorf(
-					"UDP 代理 %s 的会话参数已变更但端口 %d 未变：当前版本不支持复用带参数的入口，请一并更换该代理的端口",
-					binding.Name, binding.RemotePort)
+		if entry := previous.udpEntries[binding.Name]; entry != nil && entry.Addr() != nil {
+			if old, err := netip.ParseAddrPort(entry.Addr().String()); err == nil &&
+				old.Port() == address.Port() && addrOverlap(old.Addr(), address.Addr()) {
+				if !udpParamsMatch(previous.config, config) {
+					return nil, false, fmt.Errorf(
+						"UDP 代理 %s 的会话参数已变更但端口 %d 未变：当前版本不支持复用带参数的入口，请一并更换该代理的端口",
+						binding.Name, binding.RemotePort)
+				}
+				return entry, true, nil
 			}
-			return entry, true, nil
 		}
 	}
 	entry, err := engine.openUDPEntry(config, binding.Name, binding.RemotePort)
