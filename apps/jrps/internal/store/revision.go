@@ -544,4 +544,3 @@ func auditResultFor(succeeded bool) string {
 	}
 	return AuditResultFailure
 }
-

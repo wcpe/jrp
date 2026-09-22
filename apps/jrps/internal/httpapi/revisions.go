@@ -208,7 +208,7 @@ func (api *revisionsAPI) logError(message string, err error, c *gin.Context) {
 // applyAcceptedResponse 是受理与 restore 的响应体。
 type applyAcceptedResponse struct {
 	Revision uint64 `json:"revision"`
-}// parseRevisionID 已由 revisionAction 的切分逻辑取代；保留占位注释说明历史。
+} // parseRevisionID 已由 revisionAction 的切分逻辑取代；保留占位注释说明历史。
 // （无独立实现：切分与解析统一在 revisionAction 内完成。）
 
 // versionSummaries 转换版本列表（不含内容本体，内容经版本号检索）。

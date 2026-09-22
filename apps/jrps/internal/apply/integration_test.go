@@ -56,12 +56,12 @@ func startLocalEchoServer(t *testing.T) (netip.AddrPort, func()) {
 
 // integrationEnv 组装真实引擎与编排服务的完整环境。
 type integrationEnv struct {
-	service      *Service
-	database     *store.Store
-	engine       *server.Engine
-	clientID     string
-	token        string
-	controlPort  int
+	service     *Service
+	database    *store.Store
+	engine      *server.Engine
+	clientID    string
+	token       string
+	controlPort int
 }
 
 // newIntegrationEnv 启动真实服务端引擎 + 编排服务 + store，并完成启动恢复。
@@ -149,8 +149,8 @@ func (env *integrationEnv) buildClientConfig(t *testing.T, target netip.AddrPort
 		}),
 		core.WithClientAuth(core.TokenAuth{Token: env.token}),
 		core.WithTCPProxy(core.TCPProxy{Name: "svc-echo", LocalAddr: target, RemotePort: guestPort}),
-		core.WithHeartbeat(200 * time.Millisecond),
-		core.WithTimeout(2 * time.Second),
+		core.WithHeartbeat(200*time.Millisecond),
+		core.WithTimeout(2*time.Second),
 	)
 	if err != nil {
 		t.Fatalf("构造客户端配置失败：%v", err)

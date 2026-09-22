@@ -287,8 +287,8 @@ func (engine *blockingEngine) Apply(_ context.Context, _ server.Deployment) (cor
 	return core.ApplyResult{Stage: core.StageDrained}, nil
 }
 
-func (engine *blockingEngine) ActiveRevision() uint64     { return 0 }
-func (engine *blockingEngine) LastGoodRevision() uint64   { return 0 }
+func (engine *blockingEngine) ActiveRevision() uint64   { return 0 }
+func (engine *blockingEngine) LastGoodRevision() uint64 { return 0 }
 
 func (engine *blockingEngine) run(service *Service, revision uint64, actor store.Actor) error {
 	return service.ApplyDesired(context.Background(), revision, actor, "req-1")

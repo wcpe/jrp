@@ -242,9 +242,9 @@ func (service *Service) recordCoreResult(ctx context.Context, revision uint64, a
 
 // phaseStep 是重建阶段序列时的一步：阶段名与它是否被 Core 视为已通过。
 type phaseStep struct {
-	phase    string
+	phase     string
 	storeName string
-	passed   bool
+	passed    bool
 }
 
 // reconstructPhases 按固定阶段序重建完整的阶段结果。
