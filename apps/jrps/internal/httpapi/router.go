@@ -66,6 +66,7 @@ func NewRouter(options RouterOptions) *gin.Engine {
 func registerAPI(router *gin.Engine, options RouterOptions) {
 	session := newSessionAPI(options)
 	audit := newAuditAPI(options)
+	logs := newLogsAPI(options)
 	policy := newPolicyAPI(options)
 	notification := newNotificationAPI(options)
 	delivery := newDeliveryAPI(options)
@@ -95,6 +96,9 @@ func registerAPI(router *gin.Engine, options RouterOptions) {
 	// 日志查询本身属 FR-12（未交付）；留痕随之落地，此处先提供查询能力。
 	// P1 不提供审计导出与删除接口——审计不可被管理员经 API 抹除（§3.6）。
 	api.GET("/audit-events", session.authenticate(false), audit.list)
+
+	// 日志查询（FR-12 规格 §3.5）：会话保护、脱敏输出、查看动作写审计。
+	api.GET("/logs", session.authenticate(false), logs.list)
 
 	// 保留策略：读取需会话，修改额外要求 CSRF；变更写入审计（FR-16 §3.4）。
 	api.GET("/capture-policy", session.authenticate(false), policy.show)

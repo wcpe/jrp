@@ -41,6 +41,8 @@ type Store struct {
 	path          string
 	role          string
 	schemaVersion uint64
+	// logs 是运行日志通道的提交口；Open 后可用，Close 时停止。
+	logs *LogSubmitter
 }
 
 // Open 打开本进程独占的数据库，执行事务化迁移并校验数据库归属。
@@ -80,7 +82,47 @@ func Open(cfg Config) (*Store, error) {
 		store.closeQuietly()
 		return nil, err
 	}
+
+	// 运行日志通道（FR-12）：批量落库由提交口内部循环完成，落库失败按降级
+	// 计数暴露而不阻塞生产。通道随 Store 生命周期收尾。
+	logs, logsErr := NewLogSubmitter(LogSubmitterConfig{}, func(events []LogEvent) error {
+		return store.db.Transaction(func(tx *gorm.DB) error {
+			for _, event := range events {
+				if err := tx.Create(&event).Error; err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	})
+	if logsErr != nil {
+		store.closeQuietly()
+		return nil, fmt.Errorf("建立日志通道失败：%w", logsErr)
+	}
+	store.logs = logs
 	return store, nil
+}
+
+// SubmitLogEvent 提交一条运行日志（FR-12 规格 §3.2）。
+//
+// 提交永远不阻塞：缓冲满时按等级降级并计数。
+func (store *Store) SubmitLogEvent(event LogEvent) bool {
+	return store.logs.SubmitLogEvent(event)
+}
+
+// LogDropped 返回运行日志通道累计丢弃的低等级事件数。
+func (store *Store) LogDropped() uint64 {
+	return store.logs.LogDropped()
+}
+
+// FlushLogEvents 等待日志通道内的缓冲全部落库。
+func (store *Store) FlushLogEvents() {
+	store.logs.FlushLogEvents()
+}
+
+// LogChannelCapacity 返回日志通道的缓冲容量（供测试构造降级前提）。
+func (store *Store) LogChannelCapacity() int {
+	return DefaultLogBufferSize
 }
 
 // openDatabase 建立独占连接；被第二个实例占用时返回中文错误。
@@ -109,8 +151,16 @@ func openDatabase(cfg Config) (*gorm.DB, *sql.DB, error) {
 }
 
 // Close 释放数据库连接与独占锁。
+//
+// 运行日志通道先于数据库关闭：停止接收、刷写剩余事件后再断开连接。
 func (s *Store) Close() error {
-	if s == nil || s.sqlDB == nil {
+	if s == nil {
+		return nil
+	}
+	if s.logs != nil {
+		s.logs.Close()
+	}
+	if s.sqlDB == nil {
 		return nil
 	}
 	err := s.sqlDB.Close()

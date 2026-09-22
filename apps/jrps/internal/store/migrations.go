@@ -50,6 +50,7 @@ func applyInitialSchema(tx *gorm.DB) error {
 		&RevisionState{},
 		&ApplyResult{},
 		&AuditEvent{},
+		&LogEvent{},
 		&NotificationTarget{},
 		&NotificationOutbox{},
 		&RequestRecord{},

@@ -44,6 +44,9 @@ const (
 	ActionAuditCleanup       = "audit_cleanup"
 	ActionBodyCaptureCleanup = "body_capture_cleanup"
 
+	// 日志查看（FR-12 规格 §3.5）：安全敏感读取，查询动作本身留痕。
+	ActionLogView = "log_view"
+
 	// 通知目标管理（FR-15 §3.6）：增删改与测试通知都必须留痕。
 	ActionNotificationTargetCreate = "notification_target_create"
 	ActionNotificationTargetUpdate = "notification_target_update"
@@ -65,6 +68,7 @@ const (
 	ObjectTypeRetentionPolicy = "retention_policy"
 	ObjectTypeSession         = "session"
 	ObjectTypeAdminCredential = "admin_credential"
+	ObjectTypeLog             = "log"
 )
 
 // auditActions 是允许写入的动作全集。
@@ -80,6 +84,7 @@ var auditActions = map[string]struct{}{
 	ActionNotificationTargetCreate: {}, ActionNotificationTargetUpdate: {},
 	ActionNotificationTargetDelete: {}, ActionNotificationTargetTest: {},
 	ActionNotificationDiscard: {},
+	ActionLogView:             {},
 }
 
 // objectTypes 是允许写入的对象类型全集。
@@ -87,6 +92,7 @@ var objectTypes = map[string]struct{}{
 	ObjectTypeClient: {}, ObjectTypeProxy: {}, ObjectTypeConfigRevision: {},
 	ObjectTypeToken: {}, ObjectTypeNotificationMsg: {}, ObjectTypeCaptureRecord: {},
 	ObjectTypeRetentionPolicy: {}, ObjectTypeSession: {}, ObjectTypeAdminCredential: {},
+	ObjectTypeLog: {},
 }
 
 // auditResults 是允许的结果全集：失败与被拒绝同样要记录，不得跳过。
