@@ -74,11 +74,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	defer func() { _ = database.Close() }()
 	logger.Info("配置数据库已就绪", "路径", database.Path(), "架构版本", database.SchemaVersion())
 
-	// 恢复流程以 SQLite 中的 desired 为输入重建应用状态；此处尚无 Core 门面，保持 active 为空。
-	if err := database.Recover(context.Background(), nil, store.ActorAdmin("server")); err != nil {
-		logger.Error("配置恢复失败，拒绝启动", "错误", err)
-		return 1
-	}
+	// 启动前恢复已完成（assembleApplyService）：run() 中不再重复调用。
 	return serve(*listen, *tlsCert, *tlsKey, database, logger)
 }
 
@@ -130,6 +126,22 @@ func serve(listen, tlsCert, tlsKey string, database *store.Store, logger *slog.L
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// 数据面引擎装配（FR-10）：控制监听失败或引擎启动失败都按致命错误处理，
+	// 不降级为"只有管理面没有数据面"的半可用状态——后者让管理员误以为服务正常。
+	engine, err := startEngine(ctx, logger)
+	if err != nil {
+		logger.Error("数据面引擎启动失败，拒绝启动", "错误", err)
+		return 1
+	}
+	defer shutdownEngine(engine, logger)
+
+	// 启动恢复：以 desired 为输入走一次完整四阶段，重建 active 与 last-good。
+	applyService, err := assembleApplyService(context.Background(), database, engine, logger)
+	if err != nil {
+		logger.Error("配置恢复失败，拒绝启动", "错误", err)
+		return 1
+	}
+
 	loop, err := startOutboxLoop(ctx, database, logger)
 	if err != nil {
 		logger.Error("启动通知发送循环失败，拒绝启动", "错误", err)
@@ -143,6 +155,7 @@ func serve(listen, tlsCert, tlsKey string, database *store.Store, logger *slog.L
 			Logger: logger,
 			// 测试通知与业务通知共用同一套渠道实现，保证测通即可用。
 			TestNotifications: testNotifier{store: database, sender: notify.NewSender()},
+			ApplyService:      applyService,
 		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		WriteTimeout:      30 * time.Second,

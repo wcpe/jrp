@@ -40,6 +40,12 @@ const (
 	EventTypeClientTokenRotated = "client_token_rotated"
 	// EventTypeClientTokenRevoked 是客户端 token 被吊销。
 	EventTypeClientTokenRevoked = "client_token_revoked"
+	// EventTypeConfigApplyFailed 是一次配置应用失败（FR-10/FR-15 交点）。
+	//
+	// 事件发给全部启用目标且不排除任何目标：被失败的是配置版本而非通知目标，
+	// 不存在自我指涉。每次失败的 Apply 只写一条（失败即流程终止，编排层保证
+	// 不会出现同轮多阶段失败），载荷只含 revision、阶段与脱敏错误摘要。
+	EventTypeConfigApplyFailed = "config_apply_failed"
 )
 
 // NewOutboxEventID 生成不可猜测的 outbox 事件标识。

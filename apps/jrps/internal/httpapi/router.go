@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/wcpe/jrp/apps/jrps/internal/apply"
 	"github.com/wcpe/jrp/apps/jrps/internal/buildinfo"
 	"github.com/wcpe/jrp/apps/jrps/internal/store"
 	"github.com/wcpe/jrp/apps/jrps/internal/webui"
@@ -31,6 +32,8 @@ type RouterOptions struct {
 	Logger *slog.Logger
 	// TestNotifications 执行测试通知投递；为空时测试通知端点返回 503。
 	TestNotifications TestNotificationSender
+	// ApplyService 是配置应用编排服务（FR-10）；为空时应用动作返回 503。
+	ApplyService *apply.Service
 }
 
 type statusResponse struct {
@@ -72,6 +75,7 @@ func registerAPI(router *gin.Engine, options RouterOptions) {
 	delivery := newDeliveryAPI(options)
 	clients := newClientAPI(options)
 	agents := newAgentAPI(options)
+	revisions := newRevisionsAPI(options)
 	guard := requireInitialized(options.Store)
 	router.Use(func(context *gin.Context) {
 		if strings.HasPrefix(context.Request.URL.Path, "/api") {
@@ -130,6 +134,12 @@ func registerAPI(router *gin.Engine, options RouterOptions) {
 	// （FR-15 §3.3“测试通知入口与发送结果查询”、§5“失败次数、脱敏摘要与
 	// 停止时间可被运维查询”）。只读，不要求 CSRF。
 	api.GET("/notification-deliveries", session.authenticate(false), delivery.list)
+
+	// 配置版本与应用（FR-10）：读取需会话；应用与恢复是变更动作，额外要求
+	// CSRF 并在 store 层写入审计。子动作走 catch-all 的原因与通知端点相同：
+	// gin 不允许同一路径段混用静态段与通配符。
+	api.GET("/config-revisions", session.authenticate(false), revisions.list)
+	api.POST("/config-revisions/*revision", session.authenticate(true), revisions.revisionAction)
 }
 
 func statusHandler(context *gin.Context) {

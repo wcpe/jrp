@@ -158,8 +158,10 @@ type RevisionState struct {
 
 func (RevisionState) TableName() string { return "revision_state" }
 
-// 配置应用的四个阶段，与服务端、客户端共用的阶段命名一致。
+// 配置应用的阶段命名，与服务端、客户端共用的阶段语义一致（FR-10 规格 §3.2）。
+// validate 是快照结构校验阶段，发生在 Core 之前；四阶段在 Core 内执行。
 const (
+	PhaseValidate    = "validate"
 	PhasePrepare     = "prepare"
 	PhaseHealthCheck = "health_check"
 	PhasePublish     = "publish"
