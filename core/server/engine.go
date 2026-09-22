@@ -109,8 +109,6 @@ type Engine struct {
 	logger       *slog.Logger
 	dialer       transport.Dialer
 	drainTimeout time.Duration
-	// initialListener 是构造时注入的监听器，供首次应用（Start）使用。
-	initialListener *transport.Listener
 
 	mu    sync.RWMutex
 	state engineState

@@ -258,10 +258,9 @@ func countEntries(gen *generation) int {
 
 // release 释放 prepare 阶段新建、但 publish 之前失败的资源。
 //
-// 宿主注入的监听器所有权尚未转移（转移发生在 publish），因此这里不关闭
-// engine.initialListener；Engine 自行创建的入口归 Core 所有，必须释放。
-// 从上一代接管的入口（reused）同样不释放：所有权要到 publish 成功才转移，
-// 此刻它们仍归上一代，关闭会把正在服务的入口一并关掉。
+// Engine 自行创建的入口归 Core 所有，必须释放。从上一代接管的入口（reused）
+// 同样不释放：所有权要到 publish 成功才转移，此刻它们仍归上一代，关闭会把正在
+// 服务的入口一并关掉。
 func (gen *generation) release() {
 	for name, guestListener := range gen.guestLns {
 		if gen.reused[name] {
