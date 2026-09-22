@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wcpe/jrp/core"
@@ -138,7 +139,12 @@ type Engine struct {
 	// workConns 是引擎唯一的配对中心。工作连接是客户端拨入的长连接，与某代
 	// 监听器无关：新代访客要与已拨入的工作连接配对，broker 若按代切分就会是空的。
 	// idle 上限取初始配置，Apply 不重建它（重建会丢掉已拨入的待命连接）。
-	workConns *workBroker
+	//
+	// 原子指针而非锁保护字段：读取方（控制连接、访客洪水、宿主观测轮询）遍布
+	// 多个已持锁或高频路径，取锁会引入 engine.mu 与 broker.mu 的交错等待
+	// （-race 与 TestPendingGuestsAreBounded 均已实锤）；指针交换本身是原子的，
+	// 旧 broker 由在途调用安全地用到结束。
+	workConns atomic.Pointer[workBroker]
 
 	// controlListener 是控制入口，跨代复用：同一监听器同时服务旧代与新一代
 	// 的客户端登录。Accept 循环与它的等待组归 Engine 而不是某一代，否则 drain
@@ -226,7 +232,7 @@ func (engine *Engine) Start(ctx context.Context) error {
 	// 代先于资源构造：UDP 工作连接工厂要登记到本代，若等资源建好再建代，
 	// 工厂就无处归属。
 	// broker 只建一次：跨代共享，不随换代重建。
-	engine.workConns = newWorkBroker(engine.config.IdleWorkConnLimit())
+	engine.workConns.Store(newWorkBroker(engine.config.IdleWorkConnLimit()))
 	gen := newGeneration(engine, core.SnapshotRevisionUnknown, engine.config)
 
 	gen.publishRegistry()
@@ -542,8 +548,8 @@ func (engine *Engine) Shutdown(ctx context.Context) error {
 		engine.stopOnce.Do(func() {
 			active.stop(true)
 			// 终停时一次清理暂存：它们不承载用户数据，不进 drain 等待。
-			if engine.workConns != nil {
-				engine.workConns.closeStaged()
+			if broker := engine.workConns.Load(); broker != nil {
+				broker.closeStaged()
 			}
 			engine.mu.Lock()
 			for conn := range engine.controlConns {
@@ -634,7 +640,7 @@ func (engine *Engine) GuestAddr(name string) net.Addr {
 // broker 跨代共享，计数自然跨代累计——这正是运维口径里累计的含义。
 func (engine *Engine) RejectedGuests() int64 {
 	engine.mu.Lock()
-	broker := engine.workConns
+	broker := engine.activeBroker()
 	engine.mu.Unlock()
 	if broker == nil {
 		return 0
@@ -1044,7 +1050,7 @@ func (engine *Engine) serveWorkDeclaration(gen *generation, raw *transport.Conn,
 		// 逐个 untrack 必须在锁外进行（dropGuests 返回后）：untrack 取 Engine 锁，
 		// 在 broker 锁内回调会与 Shutdown 构成 ABBA。漏掉这一步会让已关闭的连接
 		// 永久留在活动集合里，引擎长跑时单调增长。
-		if dropped := engine.workConns.dropGuests(declaration.proxy); len(dropped) > 0 {
+		if dropped := engine.activeBroker().dropGuests(declaration.proxy); len(dropped) > 0 {
 			for _, conn := range dropped {
 				gen.untrack(conn)
 			}
@@ -1054,7 +1060,7 @@ func (engine *Engine) serveWorkDeclaration(gen *generation, raw *transport.Conn,
 		return
 	}
 	// park 只做配对决策，登记与桥接在 broker 锁外完成（见 pairing 的说明）。
-	accepted, pair := engine.workConns.park(declaration.proxy, raw)
+	accepted, pair := engine.activeBroker().park(declaration.proxy, raw)
 	if !accepted {
 		_ = raw.Close()
 		return
@@ -1232,7 +1238,7 @@ func (engine *Engine) serveHTTPGuest(gen *generation, port int, listener *transp
 // 记账处理不同，本函数不擅自统一）。
 func (engine *Engine) pairGuest(gen *generation, name string, guest *transport.Conn, pending []byte) parkOutcome {
 	for attempt := 0; attempt < maxPairRetries; attempt++ {
-		outcome, pair := engine.workConns.parkGuest(name, guest, pending)
+		outcome, pair := engine.activeBroker().parkGuest(name, guest, pending)
 		if outcome != parkPaired {
 			return outcome
 		}
@@ -1271,7 +1277,7 @@ func (engine *Engine) handleGuest(gen *generation, name string, guest *transport
 		gen.untrack(guest)
 		_ = guest.Close()
 		engine.log().Warn("该代理的等待访客已达上限，拒绝新访客",
-			"proxy", name, "累计拒绝", engine.workConns.RejectedGuests())
+			"proxy", name, "累计拒绝", engine.activeBroker().RejectedGuests())
 	}
 }
 
@@ -1395,7 +1401,7 @@ func (engine *Engine) openUDPEntry(config core.ServerConfig, name string, remote
 // broker 跨代共享，因此工厂与具体某一代无关：交接后的入口继续用同一工厂取连接。
 func (engine *Engine) udpWorkFactory(name string) func() (net.Conn, bool) {
 	return func() (net.Conn, bool) {
-		work := engine.workConns.takeStaged(name)
+		work := engine.activeBroker().takeStaged(name)
 		if work == nil {
 			return nil, false
 		}
@@ -1471,7 +1477,7 @@ func (engine *Engine) bridgeHTTPGuest(gen *generation, proxyName string, guest *
 		gen.untrack(guest)
 		_ = guest.Close()
 		engine.log().Warn("该代理的等待访客已达上限，拒绝新访客",
-			"proxy", proxyName, "累计拒绝", engine.workConns.RejectedGuests())
+			"proxy", proxyName, "累计拒绝", engine.activeBroker().RejectedGuests())
 	}
 }
 

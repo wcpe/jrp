@@ -201,7 +201,9 @@ func (engine *Engine) apply(
 func (engine *Engine) prepareGeneration(
 	ctx context.Context, gen *generation, deployment Deployment, previous *generation,
 ) error {
-	engine.workConns = newWorkBroker(deployment.Config.IdleWorkConnLimit())
+	// 配对中心随快照换代：指针原子替换，读取方经 activeBroker 无锁取引用，
+	// 旧 broker 由在途调用安全地用到结束。
+	engine.workConns.Store(newWorkBroker(deployment.Config.IdleWorkConnLimit()))
 
 	if err := engine.openGuestEntries(gen, deployment.Config, previous); err != nil {
 		return err

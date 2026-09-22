@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wcpe/jrp/core/internal/transport"
@@ -54,6 +55,15 @@ const (
 	parkCapacityFull
 )
 
+// activeBroker 返回当前配对中心的快照。
+//
+// broker 在 Apply 的 prepare 阶段被替换：读取方（控制连接与访客 goroutine）
+// 必须经由本方法取一次引用后使用，不得直接读字段——否则与换代路径构成数据
+// 竞争（-race 已在 FR-27 并发用例中实锤）。
+func (engine *Engine) activeBroker() *workBroker {
+	return engine.workConns.Load()
+}
+
 // workBroker 按代理名管理访客与工作连接的双向暂存配对。
 //
 // 配对语义：访客与工作连接到达顺序不确定，任一方先到都暂存，另一方到达时
@@ -68,7 +78,13 @@ type workBroker struct {
 	closed bool
 
 	// rejectedGuests 是累计因超出暂存上限被拒绝的访客数。
-	rejectedGuests int64
+	//
+	// 原子计数而非锁内字段：拒绝发生在 parkGuest（持 broker.mu）内，而计数被
+	// 引擎外的观测方高频轮询。若轮询经由 activeBroker（engine.mu）取 broker
+	// 再取 broker.mu，与 handleGuest 的「engine.mu（untrack）→ broker.mu」
+	// 形成交错等待，高洪水下会把两条路径都钉死（实测 TestPendingGuestsAreBounded
+	// 挂死）。原子读让观测方完全绕开两把锁。
+	rejectedGuests atomic.Int64
 }
 
 // newWorkBroker 建立空的配对中心。
@@ -180,7 +196,7 @@ func (broker *workBroker) parkGuest(proxyName string, guest *transport.Conn, pen
 		return parkPaired, pairing{guest: guest, work: work, pending: pending}
 	}
 	if len(broker.guests[proxyName]) >= maxPendingGuest {
-		broker.rejectedGuests++
+		broker.rejectedGuests.Add(1)
 		return parkCapacityFull, pairing{}
 	}
 	broker.guests[proxyName] = append(broker.guests[proxyName], stagedGuest{conn: guest, pending: pending})
@@ -192,9 +208,7 @@ func (broker *workBroker) parkGuest(proxyName string, guest *transport.Conn, pen
 // 该计数是运维可观测入口：拒绝必须是可见事件，否则"访客连不上"会被误判为
 // 客户端问题而无法定位到服务端的容量拒绝。
 func (broker *workBroker) RejectedGuests() int64 {
-	broker.mu.Lock()
-	defer broker.mu.Unlock()
-	return broker.rejectedGuests
+	return broker.rejectedGuests.Load()
 }
 
 // dropGuests 关闭并清空指定代理的全部暂存访客，返回被关闭的连接。

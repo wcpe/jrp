@@ -61,9 +61,10 @@ func TestPendingGuestsAreBounded(t *testing.T) {
 	}
 
 	// 暂存队列不得超过上限。
-	engine.workConns.mu.Lock()
-	queued := len(engine.workConns.guests["repro-proxy"])
-	engine.workConns.mu.Unlock()
+	broker := engine.workConns.Load()
+	broker.mu.Lock()
+	queued := len(broker.guests["repro-proxy"])
+	broker.mu.Unlock()
 	if queued > maxPendingGuest {
 		t.Fatalf("暂存队列不得超过上限 %d，实际 %d", maxPendingGuest, queued)
 	}
@@ -107,9 +108,10 @@ func TestRejectedGuestIsClosed(t *testing.T) {
 	// 等待队列真正填满再拨下一个，避免与服务端处理竞态。
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		engine.workConns.mu.Lock()
-		queued := len(engine.workConns.guests["repro-proxy"])
-		engine.workConns.mu.Unlock()
+		broker := engine.workConns.Load()
+		broker.mu.Lock()
+		queued := len(broker.guests["repro-proxy"])
+		broker.mu.Unlock()
 		if queued >= maxPendingGuest {
 			break
 		}
@@ -171,9 +173,10 @@ func TestDroppedGuestsAreUntracked(t *testing.T) {
 	// 等待访客进入暂存队列并完成记账。
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		engine.workConns.mu.Lock()
-		queued := len(engine.workConns.guests["repro-proxy"])
-		engine.workConns.mu.Unlock()
+		broker := engine.workConns.Load()
+		broker.mu.Lock()
+		queued := len(broker.guests["repro-proxy"])
+		broker.mu.Unlock()
 		if queued >= 4 {
 			break
 		}
@@ -186,7 +189,7 @@ func TestDroppedGuestsAreUntracked(t *testing.T) {
 		t.Fatalf("暂存访客应已登记活动记账，实际 %d 条", before)
 	}
 
-	dropped := engine.workConns.dropGuests("repro-proxy")
+	dropped := engine.activeBroker().dropGuests("repro-proxy")
 	if len(dropped) != 4 {
 		t.Fatalf("应释放 4 条暂存访客，实际 %d 条", len(dropped))
 	}
@@ -239,9 +242,10 @@ func TestUnauthorizedTargetPathUntracksGuests(t *testing.T) {
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		engine.workConns.mu.Lock()
-		queued := len(engine.workConns.guests["repro-proxy"])
-		engine.workConns.mu.Unlock()
+		broker := engine.workConns.Load()
+		broker.mu.Lock()
+		queued := len(broker.guests["repro-proxy"])
+		broker.mu.Unlock()
 		if queued >= 3 {
 			break
 		}
@@ -284,9 +288,10 @@ func assertGuestDropUntracks(t *testing.T, engine *Engine, controlAddr string) {
 	// 等待访客被释放（队列清空）后检查记账。
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		engine.workConns.mu.Lock()
-		queued := len(engine.workConns.guests["repro-proxy"])
-		engine.workConns.mu.Unlock()
+		broker := engine.workConns.Load()
+		broker.mu.Lock()
+		queued := len(broker.guests["repro-proxy"])
+		broker.mu.Unlock()
 		if queued == 0 {
 			break
 		}
