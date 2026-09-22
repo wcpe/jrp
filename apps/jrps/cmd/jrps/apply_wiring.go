@@ -106,8 +106,13 @@ func startEngine(ctx context.Context, logger *slog.Logger) (*server.Engine, erro
 // 恢复以 SQLite 中的 desired 为输入重新走完整四阶段：publish 成功后 active
 // 落库记录推进，运行态由 Core 内存持有（ADR-0012）。desired 尚无版本时恢复
 // 直接跳过，不产生任何应用记录。
+//
+// 同时启动 FR-12 的事件适配器：订阅 Core 事件通道并把事件映射为运行日志，
+// 溢出时按 ResyncRequired 记录 WARN。适配器随根 ctx 取消退出（与引擎、HTTP
+// 服务同一信号源），不额外占用优雅关闭时序。
 func assembleApplyService(ctx context.Context, database *store.Store, engine *server.Engine, logger *slog.Logger) (*apply.Service, error) {
 	service := apply.New(database, storeCredentials{store: database}, engine, logger)
+	apply.StartEventAdapter(ctx, engine, database, logger)
 	if err := database.Recover(ctx, service.RecoverApplier(store.ActorAdmin("server")), store.ActorAdmin("server")); err != nil {
 		return nil, err
 	}
