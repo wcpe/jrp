@@ -227,13 +227,27 @@ func TestIntegrationApplyKeepsLongConnectionAlive(t *testing.T) {
 	}
 
 	// 入口交接后新访客仍可连同一个地址。
-	newGuest, err := net.Dial("tcp", guestAddress.String())
-	if err != nil {
-		t.Fatalf("切换后新访客连接失败：%v", err)
+	//
+	// 用带重试的回显而非单次尝试：Apply 收敛返回时新代的接收循环可能刚启动，
+	// Linux CI 高负载下首个连接偶发读超时（Core 场景测试同一模式）。
+	newGuestDeadline := time.Now().Add(10 * time.Second)
+	var echoErr error
+	for time.Now().Before(newGuestDeadline) {
+		newGuest, dialErr := net.Dial("tcp", guestAddress.String())
+		if dialErr != nil {
+			echoErr = dialErr
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		echoErr = echoOnce(newGuest, []byte("换代后新流"))
+		_ = newGuest.Close()
+		if echoErr == nil {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	defer newGuest.Close()
-	if err := echoOnce(newGuest, []byte("换代后新流")); err != nil {
-		t.Fatalf("切换后新访客回显失败：%v", err)
+	if echoErr != nil {
+		t.Fatalf("切换后新访客回显失败：%v", echoErr)
 	}
 
 	// active 推进到新 revision。
