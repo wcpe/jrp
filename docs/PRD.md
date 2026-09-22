@@ -70,7 +70,7 @@ frp 以配置文件为中心，适合直接部署，但个人与小团队在多�
 | FR-23 | 建立中心控制面与多数据节点拓扑、调度和故障转移 | P3 | 计划 |
 | FR-24 | 在分布式需求成立后评估 HA、RBAC、OIDC、外部数据库与对象存储 | P3 | 计划 |
 | FR-25 | 提供可嵌入其他 Go 应用的 ServerEngine/ClientEngine，并以 TCP、wire v1、TCP 代理形成首个真实垂直切片 | P1 | 已交付@0.1.0 |
-| FR-26 | 支持基于完整不可变快照和 revision 的 Apply，复用未变化的访客入口并交接所有权，完成 prepare、publish、drain 与无中断切换 | P1 | 开发中 |
+| FR-26 | 支持基于完整不可变快照和 revision 的 Apply，复用未变化的访客入口并交接所有权，完成 prepare、publish、drain 与无中断切换 | P1 | 已交付@0.3.0 |
 | FR-27 | 提供有界类型化事件订阅与只读状态快照，使嵌入宿主可实时观测并在丢事件后重建状态 | P1 | 计划 |
 | FR-28 | 为 Core 建立独立 SemVer、外部模块消费验证和公共 API 兼容政策 | P1 | 计划 |
 | FR-29 | 建立独立 `platform/service` module 和 jrps/jrpc 一致的系统服务安装、卸载、启停、重启、状态 CLI | P1 | 计划 |
@@ -137,7 +137,7 @@ frp 以配置文件为中心，适合直接部署，但个人与小团队在多�
 |---|---|---|---|---|---|
 | S1 | FR-32、FR-04、FR-09 | 3 | 无 | 已交付@0.1.0 | 配置构建、wire 编解码、SQLite 持久化 |
 | S2 | FR-25、FR-05a、FR-06a、FR-02、FR-15、FR-16 | 6 | S1 | 已交付@0.2.0 | Engine 门面与首个垂直切片、TCP 传输、四种代理、认证、通知、审计；六项全部交付，FR-15 与 FR-16 各有跨阶段补验项待对应 FR 交付后执行 |
-| S3 | FR-26、FR-27、FR-03、FR-06b、FR-07、FR-10、FR-13、FR-12 | 8 | S2 | 计划 | Apply 与事件订阅、日志、官方 frpc 接入、STCP/XTCP、token、无中断热更、正文采集 |
+| S3 | FR-26、FR-27、FR-03、FR-06b、FR-07、FR-10、FR-13、FR-12 | 8 | S2 | 进行中 | Apply 与事件订阅、日志、官方 frpc 接入、STCP/XTCP、token、无中断热更、正文采集；FR-26 已交付@0.3.0，宿主注入网络资源拆为独立后续需求 |
 | S4 | FR-08、FR-11、FR-28、FR-14 | 4 | S3 | 计划 | enrollment 与配置下发、Web 管理台、Core 版本政策、监控 |
 | S5 | FR-29、FR-30、FR-31、FR-17 | 4 | S4 | 计划 | 系统服务 module、Linux systemd、Windows SCM、三平台构建 |
 | 后置 | FR-05b、FR-05c | 2 | 依赖批准 | 计划 | WebSocket/WSS 与 KCP/QUIC 传输，第三方依赖获批后启动 |
