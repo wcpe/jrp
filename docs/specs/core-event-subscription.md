@@ -1,6 +1,6 @@
 # 功能规格：有界类型化事件订阅与只读状态快照
 
-> 状态：草拟 · 关联 PRD：FR-27 · 分支：feature/core-event-subscription
+> 状态：开发中 · 关联 PRD：FR-27 · 分支：feature/core-event-subscription
 
 ## 1. 背景与目标
 
@@ -126,14 +126,14 @@ type Event interface {
 
 ## 4. 任务拆分
 
-- [ ] 先写失败测试：编写「慢订阅者不降低代理吞吐」的基准/超时用例，以及「缓冲溢出后收到 ResyncRequired 且 State 能重建一致视图」的用例；补充快照深复制无别名、多订阅者并发关闭、Engine Shutdown 时通道关闭与不等待慢消费者三组失败测试（初始为红）
-- [ ] 在根包 `core` 定义事件接口、类型枚举、等级枚举与首版事件结构体，保证字段脱敏
-- [ ] 实现订阅入口 `Subscribe`、`Events`、`Close` 与有界缓冲
-- [ ] 实现按等级的溢出降级、丢弃计数与 `ResyncRequired` 单次发布语义，并为重同步事件预留缓冲位
-- [ ] 实现 `State()` 只读快照与深复制，覆盖 revision、客户端、代理与连接摘要
-- [ ] 在 FR-25 的 Engine 与 FR-26 的 Apply 关键路径上接入事件发布，确保不阻塞数据面
-- [ ] 实现订阅在 Engine Shutdown 时的关闭顺序，保证不等待慢消费者
-- [ ] 运行 `task test:core`、`task lint:go`、`go test -race ./...` 与依赖门检查
+- [x] 先写失败测试：编写「慢订阅者不降低代理吞吐」的基准/超时用例，以及「缓冲溢出后收到 ResyncRequired 且 State 能重建一致视图」的用例；补充快照深复制无别名、多订阅者并发关闭、Engine Shutdown 时通道关闭与不等待慢消费者三组失败测试（初始为红）
+- [x] 在根包 `core` 定义事件接口、类型枚举、等级枚举与首版事件结构体，保证字段脱敏
+- [x] 实现订阅入口 `Subscribe`、`Events`、`Close` 与有界缓冲
+- [x] 实现按等级的溢出降级、丢弃计数与 `ResyncRequired` 单次发布语义，并为重同步事件预留缓冲位
+- [x] 实现 `State()` 只读快照与深复制，覆盖 revision、客户端、代理与连接摘要
+- [x] 在 FR-25 的 Engine 与 FR-26 的 Apply 关键路径上接入事件发布，确保不阻塞数据面
+- [x] 实现订阅在 Engine Shutdown 时的关闭顺序，保证不等待慢消费者
+- [x] 运行 `task test:core`、`task lint:go`、`go test -race ./...` 与依赖门检查
 - [ ] 同步 CHANGELOG 与受影响长期文档；PRD 中 FR-27 状态在全部验收通过后变更
 
 ## 5. 验收标准
