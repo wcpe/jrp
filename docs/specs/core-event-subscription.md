@@ -1,6 +1,6 @@
 # 功能规格：有界类型化事件订阅与只读状态快照
 
-> 状态：开发中 · 关联 PRD：FR-27 · 分支：feature/core-event-subscription
+> 状态：已交付 · 关联 PRD：FR-27 · 分支：feature/core-event-subscription
 
 ## 1. 背景与目标
 
@@ -134,7 +134,7 @@ type Event interface {
 - [x] 在 FR-25 的 Engine 与 FR-26 的 Apply 关键路径上接入事件发布，确保不阻塞数据面
 - [x] 实现订阅在 Engine Shutdown 时的关闭顺序，保证不等待慢消费者
 - [x] 运行 `task test:core`、`task lint:go`、`go test -race ./...` 与依赖门检查
-- [ ] 同步 CHANGELOG 与受影响长期文档；PRD 中 FR-27 状态在全部验收通过后变更
+- [x] 同步 CHANGELOG 与受影响长期文档；PRD 中 FR-27 状态在全部验收通过后变更。（CHANGELOG 补登记；PRD FR-27 标记已交付。两条边界按 §6 处理：「慢消费者不降吞吐」的容差数值随 FR-14 压测定稿后补齐、不作为门禁；「SSE 背压不回传 Core」的集成验证随 FR-11 的 `/api/v1/events` 端点交付时执行——SSE 端点属外壳适配器范围，不在本功能）
 
 ## 5. 验收标准
 
