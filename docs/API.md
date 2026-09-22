@@ -140,7 +140,7 @@ P1 不提供 `/node`、`/cluster`、节点注册、调度或分布式 RPC 端点
 ### 4.5 状态、日志与指标
 
 - `GET /api/v1/status`：服务、客户端、代理、连接与容量摘要。
-- `GET /api/v1/logs`：按时间、等级、组件和关联 ID 过滤脱敏日志。
+- `GET /api/v1/logs`：按时间（`from`/`to`，RFC 3339）、等级（`level`，四级枚举）、组件（`component`）、事件名（`event`）与关联 ID（`clientId`/`proxyName`/`requestId`）过滤脱敏日志；`limit` 与 `cursor` 分页。未认证返回 401，非法参数返回 400 问题详情；查看动作写入审计（`log_view`，只含条件摘要与条数）。响应项字段：`id`、`occurredAt`（UTC RFC 3339）、`level`、`component`、`event`、`message`、`clientId`、`proxyName`、`requestId`、`revision`（可选字段为空省略）。请求日志随 FR-13 采集适配层接入（采集关闭时该通道为空）。
 - `GET /api/v1/metrics`：供 Web 使用的结构化指标摘要；监控抓取格式另由实现 spec 明确。
 - `GET /api/v1/events`：SSE 实时事件。
 
