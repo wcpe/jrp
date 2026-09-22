@@ -107,8 +107,18 @@ func (tx *Tx) SaveProxy(proxy Proxy, actor Actor, origin string) (uint64, error)
 		if err := tx.db.Save(&proxy).Error; err != nil {
 			return fmt.Errorf("写入代理记录失败：%w", translateSQLError(err))
 		}
+		// desired 是全量文档：单代理写入后必须从全量表重算内容，保证
+		// ConfigRevision.Content 与代理表永远一致（FR-10 §3.1 适配器输入）。
+		document, err := tx.DesiredDocument()
+		if err != nil {
+			return err
+		}
+		content, err := MarshalDesiredDocument(document)
+		if err != nil {
+			return err
+		}
 		if err := tx.appendRevision(RevisionInput{
-			Content:       proxySnapshotContent(proxy),
+			Content:       content,
 			Actor:         actor,
 			Origin:        origin,
 			ChangeSummary: fmt.Sprintf("代理 %s（%s）发生变更", truncateAuditLabel(proxy.Name), proxy.Type),
@@ -145,8 +155,17 @@ func (tx *Tx) DeleteProxy(proxy Proxy, actor Actor) (uint64, error) {
 		if err := tx.db.Save(&proxy).Error; err != nil {
 			return fmt.Errorf("标记代理删除失败：%w", translateSQLError(err))
 		}
+		// 同 SaveProxy：删除后从全量表重算 desired 文档，墓碑保留在内容里。
+		document, err := tx.DesiredDocument()
+		if err != nil {
+			return err
+		}
+		content, err := MarshalDesiredDocument(document)
+		if err != nil {
+			return err
+		}
 		if err := tx.appendRevision(RevisionInput{
-			Content:       proxySnapshotContent(proxy),
+			Content:       content,
 			Actor:         actor,
 			Origin:        OriginProxyDelete,
 			ChangeSummary: fmt.Sprintf("删除代理 %s", truncateAuditLabel(proxy.Name)),
@@ -323,11 +342,14 @@ func (tx *Tx) nextRevision() (uint64, error) {
 }
 
 // Revision 读取单个历史版本内容，只读不改。
+//
+// 不存在时返回 ErrNoRevision：调用方据此把"版本不存在"映射为 404，
+// 而不是误报为服务内部错误。
 func (tx *Tx) Revision(revision uint64) (ConfigRevision, error) {
 	var record ConfigRevision
 	err := tx.db.First(&record, "revision = ?", revision).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return ConfigRevision{}, fmt.Errorf("配置版本 %d 不存在", revision)
+		return ConfigRevision{}, fmt.Errorf("%w：%d", ErrNoRevision, revision)
 	}
 	if err != nil {
 		return ConfigRevision{}, fmt.Errorf("读取配置版本失败：%w", translateSQLError(err))
@@ -346,6 +368,22 @@ func (tx *Tx) LatestRevision() (ConfigRevision, error) {
 		return ConfigRevision{}, fmt.Errorf("读取最新配置版本失败：%w", translateSQLError(err))
 	}
 	return record, nil
+}
+
+// RecentRevisions 按版本号倒序返回最近 limit 个版本（不含内容本体之外的字段裁剪由调用方决定）。
+//
+// 用于管理端点的版本列表；limit 非正时按 1 处理。
+func (tx *Tx) RecentRevisions(limit int) ([]ConfigRevision, error) {
+	if limit <= 0 {
+		limit = 1
+	}
+	var records []ConfigRevision
+	err := tx.db.Select("revision", "creator", "origin", "change_summary", "created_at").
+		Order("revision DESC").Limit(limit).Find(&records).Error
+	if err != nil {
+		return nil, fmt.Errorf("读取配置版本列表失败：%w", translateSQLError(err))
+	}
+	return records, nil
 }
 
 // RevisionState 读取三个 revision 的当前落库取值。
@@ -507,12 +545,3 @@ func auditResultFor(succeeded bool) string {
 	return AuditResultFailure
 }
 
-// proxySnapshotContent 生成代理的不可变内容快照。
-func proxySnapshotContent(proxy Proxy) string {
-	return fmt.Sprintf(
-		`{"id":%q,"clientId":%q,"name":%q,"type":%q,"localPort":%d,"remotePort":%d,`+
-			`"target":%q,"transport":%q,"captureEnabled":%t,"deleted":%t}`,
-		proxy.ID, proxy.ClientID, proxy.Name, proxy.Type, proxy.LocalPort, proxy.RemotePort,
-		proxy.Target, proxy.Transport, proxy.CaptureEnabled, proxy.Deleted,
-	)
-}
