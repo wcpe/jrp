@@ -26,6 +26,15 @@ const (
 	publishTimeout     = 10 * time.Second
 )
 
+// 组件与事件名：运行日志（FR-12）中配置应用编排的统一标识。
+const (
+	logComponentApply          = "apply"
+	logEventApplyPhaseComplete = "apply-phase-complete"
+	logEventApplyPhaseFailed   = "apply-phase-failed"
+	logEventApplySuccess       = "apply-success"
+	logEventApplyFailed        = "apply-failed"
+)
+
 // ErrApplyInProgress 表示外壳层已有一个应用流程在进行（规格 §3.3 的 409 语义）。
 //
 // 排队与 latest-wins 是宿主策略：P1 单管理员场景选择直接 409，不实现等待队列。
@@ -202,13 +211,22 @@ func (service *Service) recordValidateFailure(ctx context.Context, revision uint
 	if err != nil {
 		service.logger.Error("记录 validate 失败结果出错", "版本", revision, "错误", err)
 	}
+	service.submitPhaseLog(revision, requestID, store.PhaseOutcome{
+		Phase:       store.PhaseValidate,
+		Succeeded:   false,
+		ErrorDetail: detail,
+	})
 	return fmt.Errorf("%w：%w", ErrInvalidDesired, cause)
 }
 
-// recordCoreResult 把 Core 返回的阶段结果逐条落库。
+// recordCoreResult 把 Core 返回的阶段结果逐条落库并提交运行日志。
 //
 // Core 只报告终止阶段；编排器按固定阶段序重建"已成功阶段 + 终止阶段"。
 // publish 成功后无论 drain 是否完整，active 都已推进（Core 承诺切换不可撤销）。
+//
+// 运行日志（FR-12 规格 §3.7）：每个阶段一条 INFO/ERROR 日志，携带 revision、
+// 阶段与 request ID；等级按规格 §3.3——publish 失败为 ERROR，其余失败为 WARN，
+// 成功为 INFO。
 func (service *Service) recordCoreResult(ctx context.Context, revision uint64, actor store.Actor, requestID string, result core.ApplyResult, applyErr error) {
 	phases := reconstructPhases(result, applyErr)
 	for _, phase := range phases {
@@ -226,10 +244,13 @@ func (service *Service) recordCoreResult(ctx context.Context, revision uint64, a
 		if err != nil {
 			service.logger.Error("记录应用结果出错", "版本", revision, "阶段", phase.Phase, "错误", err)
 		}
+		service.submitPhaseLog(revision, requestID, phase)
 	}
 	if applyErr != nil {
 		service.logger.Warn("配置应用失败",
 			"版本", revision, "请求ID", requestID, "错误", applyErr)
+		service.submitApplyLog(revision, requestID, logEventApplyFailed, slog.LevelWarn,
+			fmt.Sprintf("配置应用在 %s 阶段失败", safeDetail(applyErr)))
 		return
 	}
 	service.logger.Info("配置应用完成",
@@ -238,6 +259,61 @@ func (service *Service) recordCoreResult(ctx context.Context, revision uint64, a
 		"变更数", result.Changed,
 		"排空数", result.Drained,
 		"排空未完成", result.DrainIncomplete)
+	summary := fmt.Sprintf("配置应用完成，变更 %d 项，排空 %d 项", result.Changed, result.Drained)
+	if result.DrainIncomplete {
+		summary += "（排空未在上限内完成，旧连接已强制释放）"
+	}
+	service.submitApplyLog(revision, requestID, logEventApplySuccess, slog.LevelInfo, summary)
+}
+
+// submitPhaseLog 为单个阶段提交一条运行日志（FR-12 规格 §3.3/§5）。
+//
+// 等级规则：publish 失败为 ERROR（需要管理员介入），其余失败为 WARN，
+// 成功为 INFO。内容为中文摘要，不含凭证或正文。
+func (service *Service) submitPhaseLog(revision uint64, requestID string, phase store.PhaseOutcome) {
+	event := logEventApplyPhaseComplete
+	level := slog.LevelInfo
+	message := fmt.Sprintf("阶段 %s 完成", phase.Phase)
+	if !phase.Succeeded {
+		event = logEventApplyPhaseFailed
+		if phase.Phase == store.PhasePublish {
+			level = slog.LevelError
+		} else {
+			level = slog.LevelWarn
+		}
+		message = fmt.Sprintf("阶段 %s 失败：%s", phase.Phase, phase.ErrorDetail)
+	}
+	service.submitApplyLog(revision, requestID, event, level, message)
+}
+
+// submitApplyLog 向运行日志通道提交一条配置应用日志。
+//
+// 提交永远不阻塞（FR-12 §3.2）：缓冲满时低等级事件被丢弃并计数，这是通道
+// 的降级语义而非错误。
+func (service *Service) submitApplyLog(revision uint64, requestID, event string, level slog.Level, message string) {
+	service.store.SubmitLogEvent(store.LogEvent{
+		OccurredAt: time.Now().UTC(),
+		Level:      logLevelName(level),
+		Component:  logComponentApply,
+		Event:      event,
+		Message:    message,
+		RequestID:  requestID,
+		Revision:   revision,
+	})
+}
+
+// logLevelName 把 slog 等级映射为日志通道的四级枚举取值。
+func logLevelName(level slog.Level) string {
+	switch {
+	case level >= slog.LevelError:
+		return "ERROR"
+	case level >= slog.LevelWarn:
+		return "WARN"
+	case level >= slog.LevelInfo:
+		return "INFO"
+	default:
+		return "DEBUG"
+	}
 }
 
 // phaseStep 是重建阶段序列时的一步：阶段名与它是否被 Core 视为已通过。

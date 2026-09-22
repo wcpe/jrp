@@ -3,6 +3,7 @@ package apply
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"testing"
@@ -111,6 +112,46 @@ func assertPhases(t *testing.T, database *store.Store, revision uint64, wantPhas
 	}
 }
 
+// assertApplyLogEvents 断言运行日志通道落库的事件集合与等级（FR-12 接线验收）。
+//
+// want 映射事件名 → 期望等级；只断言出现的键，多余事件不判失败——
+// 日志通道是累计的，同一数据库上多次应用的日志会累积。
+func assertApplyLogEvents(t *testing.T, database *store.Store, want map[string]string, revision uint64) {
+	t.Helper()
+	database.FlushLogEvents()
+	var events []store.LogEvent
+	cursor := ""
+	for {
+		var page store.LogPage
+		if err := database.View(context.Background(), func(tx *store.Tx) error {
+			var err error
+			// 用 requestID 定位本次应用的日志（Revision 列不是查询过滤项）。
+			page, err = tx.QueryLogEvents(store.LogQuery{
+				RequestID: fmt.Sprintf("req-%d", revision),
+				Limit:     100,
+				Cursor:    cursor,
+			})
+			return err
+		}); err != nil {
+			t.Fatalf("读取运行日志失败：%v", err)
+		}
+		events = append(events, page.Items...)
+		if page.NextCursor == "" {
+			break
+		}
+		cursor = page.NextCursor
+	}
+	got := make(map[string]string, len(events))
+	for _, event := range events {
+		got[event.Event] = event.Level
+	}
+	for event, level := range want {
+		if got[event] != level {
+			t.Fatalf("运行日志 %s 等级不符：落库 %q，期望 %q（全部：%v）", event, got[event], level, got)
+		}
+	}
+}
+
 // 正常路径：四阶段全部成功落库，active 与 last-good 推进到新 revision。
 func TestApplyDesiredSuccess(t *testing.T) {
 	engine := &stubEngine{result: core.ApplyResult{Revision: 1, Stage: core.StageDrained}}
@@ -127,6 +168,10 @@ func TestApplyDesiredSuccess(t *testing.T) {
 		store.PhasePublish:     true,
 		store.PhaseDrain:       true,
 	})
+	assertApplyLogEvents(t, database, map[string]string{
+		"apply-phase-complete": "INFO",
+		"apply-success":        "INFO",
+	}, revision)
 	var state store.RevisionState
 	if err := database.View(context.Background(), func(tx *store.Tx) error {
 		var err error
@@ -165,7 +210,7 @@ func TestApplyDesiredInvalidContent(t *testing.T) {
 	service := New(database, testCredentials(), engine, slog.New(slog.DiscardHandler))
 	revision := latestRevision(t, database)
 
-	err = service.ApplyDesired(context.Background(), revision, store.ActorAdmin("admin"), "req-1")
+	err = service.ApplyDesired(context.Background(), revision, store.ActorAdmin("admin"), fmt.Sprintf("req-%d", revision))
 	if !errors.Is(err, ErrInvalidDesired) {
 		t.Fatalf("应返回 ErrInvalidDesired，实际：%v", err)
 	}
@@ -175,6 +220,10 @@ func TestApplyDesiredInvalidContent(t *testing.T) {
 	assertPhases(t, database, revision, map[string]bool{
 		store.PhaseValidate: false,
 	})
+	// validate 失败同样要产生 WARN 运行日志（FR-12 §3.3）。
+	assertApplyLogEvents(t, database, map[string]string{
+		"apply-phase-failed": "WARN",
+	}, revision)
 }
 
 // prepare 失败：validate/prepare 落库，失败阶段之后的阶段不落库，active 与 last-good 不变。
@@ -183,13 +232,17 @@ func TestApplyDesiredPrepareFailureKeepsActive(t *testing.T) {
 	service, database := newTestService(t, engine, testCredentials())
 	revision := latestRevision(t, database)
 
-	if err := service.ApplyDesired(context.Background(), revision, store.ActorAdmin("admin"), "req-1"); err == nil {
+	if err := service.ApplyDesired(context.Background(), revision, store.ActorAdmin("admin"), fmt.Sprintf("req-%d", revision)); err == nil {
 		t.Fatalf("prepare 失败时应用应返回错误")
 	}
 	assertPhases(t, database, revision, map[string]bool{
 		store.PhaseValidate: true,
 		store.PhasePrepare:  false,
 	})
+	// prepare 失败产生 WARN 日志（publish 失败才是 ERROR）。
+	assertApplyLogEvents(t, database, map[string]string{
+		"apply-phase-failed": "WARN",
+	}, revision)
 	var state store.RevisionState
 	if err := database.View(context.Background(), func(tx *store.Tx) error {
 		var err error
@@ -210,7 +263,7 @@ func TestApplyDesiredHealthCheckFailure(t *testing.T) {
 	service, database := newTestService(t, engine, testCredentials())
 	revision := latestRevision(t, database)
 
-	if err := service.ApplyDesired(context.Background(), revision, store.ActorAdmin("admin"), "req-1"); err == nil {
+	if err := service.ApplyDesired(context.Background(), revision, store.ActorAdmin("admin"), fmt.Sprintf("req-%d", revision)); err == nil {
 		t.Fatalf("health-check 失败时应用应返回错误")
 	}
 	assertPhases(t, database, revision, map[string]bool{
