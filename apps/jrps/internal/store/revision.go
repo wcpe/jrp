@@ -263,6 +263,10 @@ type ApplyResultInput struct {
 //
 // 只有 publish 成功才推进 active 与 last-good 的落库记录：这两列保存的是 Apply 结果记录，
 // 运行态仍归 Core 内存（ADR-0012），因此 publish 未成功时此处不得推进。
+//
+// 失败通知（FR-15 §6.1 的 FR-10 写入点）：应用失败时在同一业务事务内为全部启用
+// 通知目标各写一条 outbox 待发送记录，载荷只含 revision、阶段与脱敏错误摘要
+// （规格 §3.5 白名单）。成功的应用不发通知——通知是给管理员"出事了"的信号。
 func (tx *Tx) RecordApplyResult(input ApplyResultInput) error {
 	scope := input.Scope
 	if scope == "" {
@@ -285,7 +289,7 @@ func (tx *Tx) RecordApplyResult(input ApplyResultInput) error {
 				return err
 			}
 		}
-		return tx.writeAudit(AuditEvent{
+		if err := tx.writeAudit(AuditEvent{
 			ActorType:       input.Actor.Type,
 			ActorID:         input.Actor.ID,
 			Action:          applyActionFor(input),
@@ -295,8 +299,25 @@ func (tx *Tx) RecordApplyResult(input ApplyResultInput) error {
 			Context:         input.ErrorDetail,
 			RequestID:       input.RequestID,
 			DesiredRevision: input.Revision,
-		})
+		}); err != nil {
+			return err
+		}
+		if !input.Succeeded {
+			return tx.broadcastApplyFailure(input)
+		}
+		return nil
 	})
+}
+
+// broadcastApplyFailure 为一次失败的应用广播 outbox 通知。
+//
+// 载荷按 FR-15 §3.5 白名单构造：事件类型、revision、阶段、结果类别与脱敏错误
+// 摘要；不含凭证、正文或堆栈。与业务写入同一事务：业务回滚则通知不留下。
+func (tx *Tx) broadcastApplyFailure(input ApplyResultInput) error {
+	payload := fmt.Sprintf("配置应用失败：版本 %d 在 %s 阶段失败（%s）",
+		input.Revision, input.Phase, input.ErrorDetail)
+	_, err := tx.BroadcastOutbox(EventTypeConfigApplyFailed, payload, "")
+	return err
 }
 
 // advanceActive 在 publish 成功后推进 active 与 last-good 的落库记录。
