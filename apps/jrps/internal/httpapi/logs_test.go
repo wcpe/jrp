@@ -146,8 +146,6 @@ func TestLogRedactionHelpers(t *testing.T) {
 	const password = "admin-password-plaintext"
 	const cookieValue = "session-cookie-value-xyz"
 	const authorization = "Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature"
-	const body = "request-body-原文-不得出现"
-
 	// token：只允许摘要前缀，完整值禁止。
 	masked := RedactToken(token)
 	if strings.Contains(masked, token) || strings.Contains(masked, "abcdef0123456789") {

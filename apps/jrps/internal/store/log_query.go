@@ -82,19 +82,6 @@ func (tx *Tx) QueryLogEvents(query LogQuery) (LogPage, error) {
 	return page, nil
 }
 
-// appendLogEvent 在事务内写入一条日志。
-//
-// 只经 SubmitLogEvent 的批量路径调用：时间由写入点统一打点，等级在入队时
-// 已校验，此处不再重复校验以保持批处理路径的轻量。
-func (tx *Tx) appendLogEvent(event LogEvent) error {
-	return tx.db.Create(&event).Error
-}
-
-// flushLogEvents 供测试与关闭路径触发一次同步刷写；生产路径由批处理循环定时刷写。
-func (tx *Tx) flushLogEvents() error {
-	return nil
-}
-
 // logEventOccurredAtNow 以当前时间补齐事件时间戳（提交入口使用）。
 func logEventOccurredAtNow(event *LogEvent) {
 	if event.OccurredAt.IsZero() {
