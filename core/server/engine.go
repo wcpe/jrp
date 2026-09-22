@@ -147,6 +147,11 @@ type Engine struct {
 	controlWG       sync.WaitGroup
 
 	heartbeat time.Duration
+
+	// events 是事件中枢：承载订阅登记与事件发布（FR-27）。
+	events *core.EventHub
+	// controlClients 记录控制连接的客户端标识：登录成功时登记，供状态快照聚合。
+	controlClients map[*transport.Conn]string
 }
 
 // engineState 是 Engine 的内部状态，切换只在持锁下进行。
@@ -181,13 +186,15 @@ func WithLogger(logger *slog.Logger) Option {
 // config 是首次应用（Start）使用的配置；后续通过 Apply 提交新 revision 替换它。
 func New(config core.ServerConfig, options ...Option) *Engine {
 	engine := &Engine{
-		config:       config,
-		done:         make(chan struct{}),
-		registry:     &proxy.RegistryView{},
-		controlConns: make(map[*transport.Conn]struct{}),
-		heartbeat:    config.Heartbeat(),
-		dialer:       transport.Dialer{Timeout: config.Timeout()},
-		drainTimeout: config.DrainTimeout(),
+		config:         config,
+		done:           make(chan struct{}),
+		registry:       &proxy.RegistryView{},
+		controlConns:   make(map[*transport.Conn]struct{}),
+		heartbeat:      config.Heartbeat(),
+		dialer:         transport.Dialer{Timeout: config.Timeout()},
+		drainTimeout:   config.DrainTimeout(),
+		events:         core.NewEventHub(),
+		controlClients: make(map[*transport.Conn]string),
 	}
 	for _, option := range options {
 		option(engine)
@@ -557,6 +564,7 @@ func (engine *Engine) Shutdown(ctx context.Context) error {
 
 // closeDone 标记完全停止并关闭 Done 通道；重复调用安全。
 func (engine *Engine) closeDone() {
+	engine.events.PublishStop(engine.finalErr)
 	engine.mu.Lock()
 	engine.state = stateStopped
 	engine.finalErr = nil
@@ -690,11 +698,19 @@ func (engine *Engine) trackControl(conn *transport.Conn) {
 	engine.controlConns[conn] = struct{}{}
 }
 
-// untrackControl 移除一条控制连接。
+// untrackControl 移除一条控制连接及其客户端标识。
 func (engine *Engine) untrackControl(conn *transport.Conn) {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	delete(engine.controlConns, conn)
+	delete(engine.controlClients, conn)
+}
+
+// trackControlClient 登记控制连接的客户端标识（登录成功后调用）。
+func (engine *Engine) trackControlClient(conn *transport.Conn, clientID string) {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	engine.controlClients[conn] = clientID
 }
 
 // untrack 移除一条活动连接。
@@ -917,11 +933,20 @@ func (engine *Engine) handleControl(gen *generation, raw *transport.Conn) {
 	switch first.Type.Name {
 	case "login":
 		err := gen.handleLogin(raw, first.Payload)
-		first.Release()
 		if err != nil {
+			first.Release()
 			engine.failAbnormal(gen, err)
 			return
 		}
+		var request loginPayload
+		_ = json.Unmarshal(first.Payload, &request)
+		first.Release()
+		engine.trackControlClient(raw, request.ClientID)
+		engine.events.Publish(core.ClientConnected{
+			ClientID:   request.ClientID,
+			RemoteAddr: raw.RemoteAddr().String(),
+			EventMeta:  core.NewEventMeta(),
+		})
 		engine.serveControlLoop(gen, raw, guard)
 	case "new-work-conn":
 		engine.serveWorkDeclaration(gen, raw, first.Payload)
@@ -1250,8 +1275,57 @@ func (engine *Engine) handleGuest(gen *generation, name string, guest *transport
 	}
 }
 
-// publishRegistry 从配置快照构造代理注册表并原子发布。
+// proxySummaries 返回本代代理摘要列表（深复制，规格 §3.5）。
 //
+// 来源是本代配置快照的绑定集合：代理名、类型与运行状态。HTTP 多代理共享同一
+// 入口端口，各自仍按代理名出一行摘要。
+func (gen *generation) proxySummaries() []core.ProxySummary {
+	bindings := gen.config.AllBindings()
+	summaries := make([]core.ProxySummary, 0, len(bindings))
+	for _, binding := range bindings {
+		summaries = append(summaries, core.ProxySummary{
+			Name:   binding.ProxyName(),
+			Kind:   string(binding.Type()),
+			Status: "running",
+		})
+	}
+	return summaries
+}
+
+// activeClientSummaries 返回已登记控制连接的客户端摘要（深复制，规格 §3.5）。
+//
+// 同一客户端标识的多条控制连接只记一次；代理数取该客户端在当前代的绑定数。
+// 引擎锁由调用方持有。
+func (engine *Engine) activeClientSummaries() []core.ClientSummary {
+	identifiers := make(map[string]bool, len(engine.controlClients))
+	order := make([]string, 0, len(engine.controlClients))
+	for _, id := range engine.controlClients {
+		if id == "" || identifiers[id] {
+			continue
+		}
+		identifiers[id] = true
+		order = append(order, id)
+	}
+	summaries := make([]core.ClientSummary, 0, len(order))
+	for _, id := range order {
+		proxyCount := 0
+		if engine.active != nil {
+			for _, binding := range engine.active.config.AllBindings() {
+				if binding.OwnerClientID() == id {
+					proxyCount++
+				}
+			}
+		}
+		summaries = append(summaries, core.ClientSummary{
+			ID:         id,
+			Connected:  true,
+			ProxyCount: proxyCount,
+		})
+	}
+	return summaries
+}
+
+// publishRegistry 从配置快照构造代理注册表并原子发布。//
 // 注册表只承载「目标地址是否允许」与「入口归属」两类运行期判定依据；字段、
 // 权限、冲突与 P1 范围四级校验已在配置层完成，此处不复检（FR-06a §3.2）。
 func (gen *generation) publishRegistry() {

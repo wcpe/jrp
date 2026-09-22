@@ -118,6 +118,8 @@ type Engine struct {
 	controlWG sync.WaitGroup
 	// active 是当前生效的代；首次应用之前为 nil。
 	active *generation
+	// doneClosed 防止停止事件重复发布：closeDone 与 failAbnormal 都可能到达。
+	doneClosed bool
 	// lastGood 是最近一次成功 publish 的 revision。
 	lastGood uint64
 	// applying 表示有一次配置应用正在进行，用于单飞约束。
@@ -127,6 +129,8 @@ type Engine struct {
 	// targetLn 是历史遗留字段：当前实现不使用本地目标监听器（转发直接拨号目标），
 	// 保留以免改动既有装配面。
 	targetLn map[string]net.Listener
+	// events 是事件中枢：承载订阅登记与事件发布（FR-27）。
+	events *core.EventHub
 }
 
 // engineState 是 Engine 的内部状态，切换只在持锁下进行。
@@ -164,6 +168,7 @@ func New(config core.ClientConfig, options ...Option) *Engine {
 		targetLn:     make(map[string]net.Listener),
 		dialer:       transport.Dialer{Timeout: config.Timeout()},
 		drainTimeout: config.DrainTimeout(),
+		events:       core.NewEventHub(),
 	}
 	for _, option := range options {
 		option(engine)
@@ -365,6 +370,15 @@ func (engine *Engine) waitDrained(ctx context.Context) error {
 // closeDone 在完全停止后关闭 Done 通道；重复调用安全。
 func (engine *Engine) closeDone() {
 	engine.mu.Lock()
+	already := engine.doneClosed
+	engine.doneClosed = true
+	final := engine.finalErr
+	engine.mu.Unlock()
+	if !already {
+		// 停止事件先于通道关闭发布（规格 §3.6：先通知后关通道）。
+		engine.events.PublishStop(final)
+	}
+	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	select {
 	case <-engine.done:
@@ -432,6 +446,26 @@ func (engine *Engine) closeConns() {
 	}
 }
 
+// closeIdleWorkConns 关闭本代所有尚未收到下行字节的工作连接。
+//
+// 下行字节判据（协议层成立）：工作连接的下行即访客数据；客户端声明连接后，
+// 服务端在配对访客前不会写任何字节。因此 Received()==0 的连接必然未承载访客
+// 数据，drain 时可立即关闭——新代会重新补充待命连接，而承载访客数据的桥接
+// （Received()>0）继续到自然结束，两个承诺同时成立。
+func (gen *generation) closeIdleWorkConns() {
+	gen.engine.mu.Lock()
+	candidates := make([]*transport.Conn, 0, len(gen.conns))
+	for conn := range gen.conns {
+		candidates = append(candidates, conn)
+	}
+	gen.engine.mu.Unlock()
+	for _, conn := range candidates {
+		if conn.Received() == 0 {
+			_ = conn.Close()
+		}
+	}
+}
+
 // closeConns 强制关闭本代的全部活动连接。
 func (gen *generation) closeConns() {
 	gen.engine.mu.Lock()
@@ -458,6 +492,9 @@ func (gen *generation) stop(final bool) {
 		gen.engine.mu.Unlock()
 		close(gen.stopCh)
 	})
+	// 未承载访客数据的待命连接立即关闭：drain 与终停都适用，新代会重新补充。
+	// 承载访客数据的桥接收 Received()>0 保护，不在此列。
+	gen.closeIdleWorkConns()
 	if final {
 		gen.cancel()
 	}
@@ -515,6 +552,18 @@ func countProxies(gen *generation) int {
 	return len(gen.config.AllProxies())
 }
 
+// connTotal 返回当前活动连接总数：控制会话与当前代的工作连接。
+func (engine *Engine) connTotal() int {
+	total := 0
+	if engine.control != nil {
+		total++
+	}
+	if engine.active != nil {
+		total += len(engine.active.conns)
+	}
+	return total
+}
+
 // activeGeneration 返回当前生效的代；首次应用之前为 nil。
 //
 // 生产路径读 engine.active 时也持同一把锁；这里供包内测试观察代内状态，
@@ -534,13 +583,35 @@ func (gen *generation) isStopping() bool {
 	return gen.stopping
 }
 
-// connCount 返回本代已登记的活动连接数。
+// proxySummaries 返回本代代理摘要列表（规格 §3.5）。
 //
-// 供包内测试等待维持循环真正建起桥接，避免切换用例跑在"还没有在途流"的窗口里。
-func (gen *generation) connCount() int {
+// 来源是本代配置快照的代理声明：代理名、类型与运行状态。客户端侧的代理
+// 在声明后即由维持循环服务，状态恒为 running。
+func (gen *generation) proxySummaries() []core.ProxySummary {
+	proxies := gen.config.AllProxies()
+	summaries := make([]core.ProxySummary, 0, len(proxies))
+	for _, item := range proxies {
+		summaries = append(summaries, core.ProxySummary{
+			Name:   item.ProxyName(),
+			Kind:   string(item.Type()),
+			Status: "running",
+		})
+	}
+	return summaries
+}
+
+// trackedConns 返回本代已登记活动连接的快照。
+//
+// 供包内测试等待维持循环真正建起承载访客数据的桥接（Received()>0），避免切换
+// 用例跑在"只有待命连接"的窗口里。
+func (gen *generation) trackedConns() []*transport.Conn {
 	gen.engine.mu.Lock()
 	defer gen.engine.mu.Unlock()
-	return len(gen.conns)
+	conns := make([]*transport.Conn, 0, len(gen.conns))
+	for conn := range gen.conns {
+		conns = append(conns, conn)
+	}
+	return conns
 }
 
 // clientLogin 是 wire v1 登录载荷的最小形态。
@@ -703,12 +774,22 @@ func (engine *Engine) failAbnormal(err error) {
 	if engine.finalErr == nil {
 		engine.finalErr = err
 	}
+	shouldPublish := !engine.doneClosed
+	engine.doneClosed = true
+	closeDone := engine.done == nil
+	if closeDone {
+		engine.done = make(chan struct{})
+	}
 	select {
 	case <-engine.done:
 	default:
 		close(engine.done)
 	}
 	engine.mu.Unlock()
+	if shouldPublish {
+		// 异常停止同样先发事件再关订阅通道（规格 §5 错误路径第五条）。
+		engine.events.PublishStop(err)
+	}
 }
 
 // maintainWorkConns 为本代的每个代理维持待命工作连接。
@@ -777,6 +858,15 @@ func (engine *Engine) serveOneWorkConn(gen *generation, proxy core.ClientProxy) 
 		}
 		return
 	}
+	// 停止复查：拨号期间本代可能已被停（drain/Shutdown）。此时连接尚未登记，
+	// closeStandby 的清理覆盖不到它，直接关闭并返回，否则它会作为"漏网待命"
+	// 桥接挂进旧代等待组，让 drain 永远等不满。
+	select {
+	case <-gen.stopCh:
+		_ = work.Close()
+		return
+	default:
+	}
 	auth := gen.config.Auth()
 	if err := declareWorkConn(work, gen.config.ClientID(), auth.Token, proxy.ProxyName(), proxy.ProxyLocalAddr()); err != nil {
 		_ = work.Close()
@@ -794,6 +884,9 @@ func (engine *Engine) serveOneWorkConn(gen *generation, proxy core.ClientProxy) 
 // UDP 代理的本地目标是数据报语义，因此按会话形态转发而非字节流桥接
 // （规格 §3.4：不得用 TCP 的关闭语义推断 UDP 状态）。
 // 本地目标的拨号同样带配置超时，禁止无超时拨号。
+//
+// 桥接期间下行字节计数持续累加：drain 旧代时以 Received()==0 识别未承载
+// 访客数据的待命连接（见 closeIdleWorkConns），活动桥接受该判据保护。
 func (engine *Engine) serveWorkConn(gen *generation, work *transport.Conn, proxy core.ClientProxy) {
 	if proxy.Type() == core.ProxyTypeUDP {
 		engine.serveUDPWorkConn(gen, work, proxy.ProxyLocalAddr())

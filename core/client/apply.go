@@ -56,6 +56,10 @@ func (engine *Engine) Apply(ctx context.Context, deployment Deployment) (core.Ap
 	}
 
 	result, err := engine.apply(ctx, deployment, previous)
+
+	// Apply 结果事件在返回前发布（FR-27）：无论成败都发，错误摘要即返回的
+	// 原错误（ApplyError 文本由阶段与下层原因组成，不含凭据，规格 §3.7）。
+	engine.publishApply(result, err)
 	release()
 	return result, err
 }

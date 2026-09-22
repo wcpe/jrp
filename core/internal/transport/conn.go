@@ -3,6 +3,7 @@ package transport
 import (
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -31,6 +32,13 @@ type Conn struct {
 
 	closeOnce sync.Once
 	closeErr  error
+
+	// received 记录本连接收到的下行字节数（原子累加）。
+	//
+	// 工作连接的下行字节即访客数据：声明后的待命连接在服务端配对之前不会有
+	// 任何下行字节，因此「received == 0」是"未承载访客数据"的协议层判据，
+	// 供客户端换代排水区分待命桥接与活动桥接。
+	received atomic.Int64
 }
 
 // wrapConn 把一条标准库连接封装为带用途标记的连接句柄。
@@ -69,6 +77,24 @@ func (conn *Conn) String() string {
 		return string(conn.purpose) + "://" + conn.RemoteAddr().String()
 	}
 	return string(conn.purpose) + "://" + conn.RemoteAddr().String() + "[" + conn.proxy + "]"
+}
+
+// Received 返回本连接累计收到的下行字节数。
+//
+// 原子读取，可在桥接运行期间调用；判据语义见字段注释。
+func (conn *Conn) Received() int64 {
+	return conn.received.Load()
+}
+
+// Read 覆盖内嵌的 net.Conn.Read：读取后累加下行字节计数。
+//
+// 读错误时也按实际读到的字节数累加（读到的数据仍有效），错误本身交给调用方。
+func (conn *Conn) Read(buffer []byte) (int, error) {
+	read, err := conn.Conn.Read(buffer)
+	if read > 0 {
+		conn.received.Add(int64(read))
+	}
+	return read, err
 }
 
 // CloseWrite 半关闭连接的写方向，是上层表达「已写完」的唯一入口。

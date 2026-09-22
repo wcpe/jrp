@@ -55,6 +55,8 @@ func (engine *Engine) Apply(ctx context.Context, deployment Deployment) (core.Ap
 	}
 
 	result, err := engine.apply(ctx, deployment, previous)
+	// Apply 结果事件在返回前发布（FR-27）：无论成败都发。
+	engine.publishApply(result, err)
 	release()
 	return result, err
 }

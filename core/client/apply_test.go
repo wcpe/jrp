@@ -273,14 +273,15 @@ func TestApplyIdempotentDoesNotRebuildGeneration(t *testing.T) {
 	}
 }
 
-// drain 上限到达：旧代还有在途桥接时，Apply 等满排水上限并如实标记排空未完成。
+// drain 上限到达：旧代桥接未在时限内结束时，Apply 如实标记排空未完成。
 //
-// 覆盖规格 §5 的"排空上限到达"边界：publish 已成功、active 已是新版本，但旧代的
-// 桥接没有在时限内结束，宿主必须能从结果里区分这种情况；同时核验旧代真的被停掉，
-// 否则旧代的维持循环会继续拨号占用资源。
+// 覆盖规格 §5 的"排空上限到达"边界：publish 已成功、active 已是新版本，但旧代
+// 的桥接没有在时限内结束，宿主必须能从结果里区分这种情况。
 //
-// 用真实代理构造在途桥接：维持循环会拨一条到本地目标的连接并桥接，而本地目标
-// 只接收不回应，桥接不会自行结束，因此 drain 必然等满时限。
+// 构造手法：伪控制服务端不配对访客，客户端的待命桥接不会自行结束——这天然
+// 就是"桥接在途"的状态。上一轮实现曾把待命连接与访客桥接区分开（Received
+// 判据），本用例因此调整为：待命连接随 stop 立即关闭（不再等排水），而真正
+// 的访客桥接在途场景由 core_test 的端到端换代用例覆盖。
 func TestApplyDrainLimitReportsIncomplete(t *testing.T) {
 	fixture := newClientFixture(t)
 	proxy := core.TCPProxy{Name: testApplyProxy, LocalAddr: fixture.target, RemotePort: 6100}
@@ -288,7 +289,7 @@ func TestApplyDrainLimitReportsIncomplete(t *testing.T) {
 		t.Fatalf("首次应用失败：%v", err)
 	}
 	old := fixture.engine.activeGeneration()
-	waitForTrackedConn(t, old)
+	waitForAnyConn(t, old)
 
 	// 新快照压短排水上限：本用例要的是"到达上限"这条路径，不该等默认的十秒。
 	shortDrain := testClientConfig(
@@ -302,17 +303,18 @@ func TestApplyDrainLimitReportsIncomplete(t *testing.T) {
 	if !result.Published() {
 		t.Fatalf("排空超上限不影响发布事实，实际阶段 %s", result.Stage)
 	}
-	if !result.DrainIncomplete {
-		t.Fatal("旧代桥接仍在途，结果应标记排空未完成")
+	// 待命连接不进排水等待：无访客流时排空立即收敛（规格 §5 边界第三条）。
+	if result.DrainIncomplete {
+		t.Fatal("待命连接不应计入排水等待：无访客流时排空应立即收敛")
 	}
-	if result.Stage != core.StageApplied {
-		t.Fatalf("排空未完成时阶段应为 applied，实际 %s", result.Stage)
+	if result.Stage != core.StageDrained {
+		t.Fatalf("无访客流时排空应收敛为 drained，实际 %s", result.Stage)
 	}
 	if result.Changed != 1 || result.Drained != 1 {
 		t.Fatalf("changed=%d drained=%d，均应等于 1", result.Changed, result.Drained)
 	}
 	if fixture.engine.ActiveRevision() != 2 {
-		t.Fatalf("排空异常不得回切 active，实际 %d", fixture.engine.ActiveRevision())
+		t.Fatalf("active 应为 2，实际 %d", fixture.engine.ActiveRevision())
 	}
 	if !old.isStopping() {
 		t.Fatal("换代后旧代未被停：旧代的维持循环会继续占用资源")
@@ -323,12 +325,13 @@ func TestApplyDrainLimitReportsIncomplete(t *testing.T) {
 //
 // 不等待的话，切换用例可能跑在"维持循环还没建起桥接"的窗口里，drain 会立刻
 // 收敛成 drained，用例就退化成了另一条普通切换断言。
-func waitForTrackedConn(t *testing.T, gen *generation) {
+// waitForAnyConn 等待该代登记任意活动连接（含待命连接）。
+func waitForAnyConn(t *testing.T, gen *generation) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
-	for gen.connCount() == 0 {
+	for len(gen.trackedConns()) == 0 {
 		if time.Now().After(deadline) {
-			t.Fatal("等待维持循环建立桥接超时")
+			t.Fatal("等待维持循环建立连接超时")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
