@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -155,14 +156,40 @@ func mustServerConfig(t *testing.T) core.ServerConfig {
 }
 
 // freeReproPort 申请一个空闲端口后立即释放，调用方随后绑定。
+// freeReproPort 从固定测试端口区间取号。
+//
+// 此前用 ":0 申请后立即释放"，释放到真正绑定之间存在窗口：并行运行的
+// 其他包（含各自引擎用例的出站临时端口分配）可能恰好占住该端口，CI 上
+// 偶发 bind: address already in use（Web 构建矩阵的 core/server 已实测）。
+// 改为从三平台动态端口范围之外的固定区间游标取号，与 core 根包测试的
+// freePort 助手同一策略，不依赖释放-重绑的时序。
+// 复用 core 根包的测试端口区间策略：20000–30000 落在三平台动态端口范围
+// 之外（Windows 1024–15000、Linux 32768–60999、macOS 49152–65535），
+// 与出站临时端口互不相撞。游标只增不减并加锁，保证并发取号不重复。
+var (
+	reproPortMutex  sync.Mutex
+	reproPortCursor = 20000
+)
+
+const reproPortRangeEnd = 30000
+
 func freeReproPort(t *testing.T) int {
 	t.Helper()
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("申请端口失败：%v", err)
+	reproPortMutex.Lock()
+	defer reproPortMutex.Unlock()
+	for {
+		candidate := reproPortCursor
+		reproPortCursor++
+		if reproPortCursor > reproPortRangeEnd {
+			reproPortCursor = 20000
+		}
+		probe, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(candidate)))
+		if err != nil {
+			continue
+		}
+		_ = probe.Close()
+		return candidate
 	}
-	defer probe.Close()
-	return probe.Addr().(*net.TCPAddr).Port
 }
 
 // mustServerConfigWithTarget 构造带本地目标的配置（B5 用）。
