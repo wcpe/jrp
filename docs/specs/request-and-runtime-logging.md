@@ -136,7 +136,7 @@ FR-12 解决三件事：
 - [ ] 实现请求日志字段模型与在采集开启条件下的生产路径，保证采集关闭时零输出（字段模型与查询已就绪；生成路径随 FR-13 采集适配层接线）
 - [x] 实现 `GET /api/v1/logs` 的会话保护、参数校验、游标分页与脱敏输出
 - [x] 实现日志查看的审计写入，验证审计内容不含被查日志的敏感字段
-- [ ] 实现事件通道溢出后以只读快照重建并记录 WARN 的降级路径
+- [x] 实现事件通道溢出后以只读快照重建并记录 WARN 的降级路径（随 FR-10 外壳装配交付事件适配器：订阅 Core 事件通道映射运行日志，收到 ResyncRequired 记录一条含丢弃计数的 WARN；重建视图由订阅方按 `State()` 快照执行，不逐条猜写缺失事件。见 `apps/jrps/internal/apply/events_adapter.go`）
 - [x] 运行 jrps、jrpc 测试、竞态检测与构建；同步 PRD、ARCHITECTURE、API、OPERATIONS、SECURITY、CHANGELOG 中受影响内容
 
 ## 5. 验收标准

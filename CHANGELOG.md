@@ -6,7 +6,9 @@
 
 ## 0.3.0 - 2026-09-22
 
-S3 首批 Core 侧交付：FR-26 配置热更（Apply 四阶段状态机、未变化入口复用与交接、双端无中断切换）通过全部自动化验收（三平台 CI、竞态、外部消费、静态分析）与跨 NAT 实机验收，标记为已交付@0.3.0。实机验收暴露并修复通配地址复用判定缺陷（fda7110）；排空恒等满上限的缺陷同批修复。
+S3 首批 Core 侧交付：FR-26 配置热更（Apply 四阶段状态机、未变化入口复用与交接、双端无中断切换）通过全部自动化验收（三平台 CI、竞态、外部消费、静态分析）与跨 NAT 实机验收，标记为已交付@0.3.0。实机验收暴露并修复通配地址复用判定缺陷（fda7110）；排空恒等满上限的缺陷同批修复。FR-27 事件订阅同批交付并标记为已交付@0.3.0（自动化验收全绿；SSE 集成验证随 FR-11，吞吐容差量化随 FR-14）。
+
+FR-10 零中断配置应用（jrps 外壳侧编排）、FR-12 运行日志与事件适配器、FR-15 配置应用失败通知写入点随后在 main 交付：详见下方条目。FR-10 保持「开发中」（jrpc 侧随 FR-08）；FR-12 保持「开发中」（请求日志随 FR-13，双平台实机待执行）。
 
 ## 0.2.0 - 2026-09-20
 
@@ -120,6 +122,7 @@ S2 切片交付：FR-05a TCP 传输、FR-06a 四种代理、FR-02 单管理员�
 - 交付 FR-27 有界类型化事件订阅与只读状态快照（Core 侧）：根包 `core` 提供 Event 信封与首版事件集合（ClientConnected、ProxyStatusChanged、ApplyResultEvent、EngineStopped、ResyncRequired）、`Subscribe/Events/Close` 有界缓冲订阅与按等级溢出降级（诊断级丢弃、常规级丢弃计数、关键级挤占保留并预留重同步位）、`State()` 深复制只读快照。慢消费者不阻塞数据面：Shutdown 不等慢订阅者，缓冲溢出走 ResyncRequired 重建语义而非阻塞或无界堆积。SSE 管理端点（`/api/v1/events`）属 FR-11 适配器范围，集成时验证背压不回传 Core。
 - 交付 FR-10 零中断配置应用（jrps 外壳侧编排）：desired 文档模型（schema v1，含控制监听与全量代理；`SaveProxy`/`DeleteProxy` 在同一事务内重算全量内容追加版本，墓碑标记保留删除语义）、`internal/apply` 编排服务（desired → Core 快照的适配器、单飞互斥取"进行中 409"分支、按固定阶段序重建"已成功阶段 + 终止阶段"并逐阶段落库，publish 成功才推进 active 与 last-good）、`GET /api/v1/config-revisions`（状态 + 版本列表 + 按 revision 查应用结果）与 `POST …:apply`（202 异步受理）/`:restore`（201 创建新 desired）端点、main 装配（数据面引擎启动 + 启动恢复以 desired 走完整四阶段 + 优雅关闭）。集成测试覆盖"长连接跨应用存活与换代后新访客可达"与"prepare 失败保 active/last-good"，`-race` 全绿。jrpc 侧编排随 FR-08、实机验收随 FR-11；数据面凭证边界（摘要真源 vs 明文登录）按规格 §6 已定项以占位集合 + `CredentialProvider` 接口位处理。
 - 补 `Revision` 不存在时返回 `ErrNoRevision` 哨兵错误：此前只有普通错误文本，HTTP 层无法把"版本不存在"与内部错误区分开（FR-10 restore 端点 404 语义依赖此判定）。
+- 交付 FR-12 事件适配器：订阅 FR-27 事件通道把 Core 事件映射为运行日志——ClientConnected → INFO（含客户端标识）、ApplyResultEvent 成功 INFO/失败 WARN（含 revision）、EngineStopped 正常 INFO/异常 ERROR、ResyncRequired → WARN 一条记录溢出与丢弃数（不逐条猜写缺失事件）。消费经有界提交口不阻塞数据面；「事件通道溢出→快照重建+WARN」降级路径随此交付（规格 §3.7）。
 - 交付 `GET /api/v1/logs` 日志查询：管理员会话保护（未认证 401）、时间/等级/组件/关联 ID 过滤与游标分页、非法参数 400 中文问题详情；日志查看动作按 FR-16 口径写审计（新增 `log_view` 动作与 `log` 对象类型，上下文只含条件摘要与条数）。请求日志的生成路径随 FR-13 采集适配层接线，本批先落地字段模型与"采集关闭零输出"查询就绪态。
 - 交付 FR-26 配置热更（Core 侧）：新增 `core/server` 与 `core/client` 的 `Apply` 公共 API，按 `validate → prepare → health-check → atomic publish → drain` 应用完整不可变快照与 revision。运行资源按「代」隔离，drain 只等待旧代的活动流，新代连接与旧代在途流可并存；单飞约束、`ctx` 取消保留旧版本、过期 revision 拒绝与幂等 revision 均按确定语义实现，publish 之前的任何失败都释放本次新建资源并完整保留旧 active 与 last-good。
 - FR-26 入口复用与所有权交接：标识与绑定地址都未变的访客入口由 prepare **接管上一代的同一个监听套接字**，不再关闭再重建。此前任何保持端口不变的 revision（新增代理、改目标、改令牌）都会在 prepare 阶段以 `bind: address already in use` 失败——即热更最常见的用法完全不可用。流入口交接用"提前唤醒 Accept"停掉旧代的接收循环而不关闭套接字，内核 backlog 承接交接窗口内的连接；UDP 入口改用「停止接收但不回收会话」的挂起语义，套接字随入口归新代、已有会话继续服务到自然结束。
