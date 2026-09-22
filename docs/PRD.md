@@ -54,7 +54,7 @@ frp 以配置文件为中心，适合直接部署，但个人与小团队在多�
 | FR-07 | 每个客户端使用独立 token，支持创建、轮换、吊销和审计 | P1 | 开发中 |
 | FR-08 | jrpc 通过独立 HTTPS/WSS 管理通道 enrollment 并接收版本化 desired state | P1 | 计划 |
 | FR-09 | jrps 与 jrpc 分别以 SQLite 保存配置、revision 与必要运行元数据 | P1 | 已交付@0.1.0 |
-| FR-10 | 配置按 prepare、health-check、atomic publish、drain 无中断应用，失败保留 last-good | P1 | 计划 |
+| FR-10 | 配置按 prepare、health-check、atomic publish、drain 无中断应用，失败保留 last-good | P1 | 开发中 |
 | FR-11 | 提供单管理员 React Web 管理客户端、代理、配置版本、采集与通知 | P1 | 计划 |
 | FR-12 | 记录请求与运行日志，并对敏感凭证和正文实施脱敏与访问控制 | P1 | 计划 |
 | FR-13 | 仅对明文 HTTP 按代理开启正文采集，元数据存 SQLite、正文存压缩分段文件 | P1 | 计划 |
@@ -146,6 +146,7 @@ frp 以配置文件为中心，适合直接部署，但个人与小团队在多�
 - FR-05b 与 FR-05c 已登记但处于依赖待批准状态，不计入 S1~S5 的完成度口径。
 - S2 六项全部交付：FR-25（@0.1.0）与 FR-05a、FR-06a、FR-02、FR-15、FR-16（@0.2.0）。FR-15 与 FR-16 的实机条款均按分批口径执行，S2 批次已通过；各自剩余的跨阶段补验项（FR-15 需 FR-07/FR-10，FR-16 需 FR-07/FR-10/FR-11/FR-13）随对应 FR 交付后一并验收，不阻塞 S3 启动。
 - FR-12 依赖 FR-27 提供的有界事件通道，故与 FR-27 同属 S3；其日志等级、脱敏矩阵与查询接口本身不依赖 FR-27。
+- FR-10 的 **jrps 侧编排已交付**：desired 文档模型（schema v1，`SaveProxy`/`DeleteProxy` 全量重算内容）、`internal/apply` 编排服务（快照转换、单飞互斥、阶段结果重建与落库）、`GET /api/v1/config-revisions` 与 `POST …:apply`/`:restore` 端点、main 装配（引擎启动 + 启动恢复 + 优雅关闭）。集成测试覆盖长连接跨应用存活与 prepare 失败保状态，`-race` 全绿。两个跨阶段余项：**jrpc 侧编排随 FR-08**（依赖 desired state 下发通道）；**实机验收随 FR-11**（代理编辑是"改配置→应用"的常规写入端）。凭证边界：jrps 只存 token 摘要而 Core wire v1 登录按明文比对，快照暂用派生占位凭证，真实数据面鉴权随 FR-03 交付（详见规格 §6 已定项）。
 - FR-16 分四批验收，S2 批次已通过实机：审计模型与封闭枚举、`GET /api/v1/audit-events` 查询（过滤与游标分页）、`GET/PUT /api/v1/capture-policy` 策略对象。实机验证了策略默认值读取、越界值一次给全违规项、缺 CSRF 返回 403、变更可读回且留下含前后值的中文审计，并对 41 条审计逐条核对——管理员口令、通知密钥、SMTP 授权码、会话令牌与 CSRF token 六类敏感值均未出现，六项字段无缺失。
   - token 相关审计：**已通过**。创建客户端、发行凭据、兑换、轮换与吊销各有独立审计动作，`client_rotate` 与 `client_revoke` 首次有了写入点；被拒绝的动作同样留痕。审计不含 token 明文，只含 8 位摘要前缀（规格允许的合规写法）。
   - 随 FR-10 补验：修改代理并应用产生的审计事件。

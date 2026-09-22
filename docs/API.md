@@ -131,11 +131,14 @@ P1 不提供 `/node`、`/cluster`、节点注册、调度或分布式 RPC 端点
 - `POST /api/v1/proxies`：创建代理并生成新的 desired revision。
 - `PATCH /api/v1/proxies/{proxyId}`：修改代理并生成新的 desired revision。
 - `DELETE /api/v1/proxies/{proxyId}`：删除代理并生成新的 desired revision。
-- `GET /api/v1/config-revisions`：查询 desired、active、last-good 与应用结果。
-- `POST /api/v1/config-revisions/{revision}:apply`：触发 prepare、health-check、publish、drain。
-- `POST /api/v1/config-revisions/{revision}:restore`：以历史内容创建新的 desired revision，不直接修改历史版本。
+- `GET /api/v1/config-revisions`：查询 desired、active、last-good 与版本列表（最近 20 个，含 `revision`、`creator`、`origin`、`changeSummary`、`createdAt`；不含内容本体）。需管理员会话。
+- `GET /api/v1/config-revisions?revision={n}`：查询指定版本的应用结果（`results`，逐阶段 `phase`/`succeeded`/`errorDetail`/`occurredAt`）。`revision` 非法返回 400。
+- `POST /api/v1/config-revisions/{revision}:apply`：触发 prepare、health-check、publish、drain。需管理员会话与 CSRF。受理返回 202（`{"revision":n}`），应用在后台异步执行，最终结果经 `?revision={n}` 查询观察；引擎未装配返回 503。并发与过期的同步 409 语义见实现说明。
+- `POST /api/v1/config-revisions/{revision}:restore`：以历史内容创建新的 desired revision（201 返回新版本号），不直接修改历史版本；写入 `restore_apply` 审计。版本不存在返回 404。需管理员会话与 CSRF。
 
 应用请求成功受理可返回 202，最终结果通过资源状态和 SSE 事件观察。冲突使用 409，语义无效使用 422。
+
+> 实现说明（FR-10 jrps 批次）：代理 CRUD 端点（`/api/v1/proxies`）随 FR-11 交付，本批 `/api/v1/config-revisions` 三个端点先行为可用。`:apply` 的过期检查在后台执行（与读取 desired 同一临界区），受理响应恒为 202，过期与并发失败经日志与应用结果观察；严格的同步 409 需编排层预检接口，随 FR-11 统一收紧。`:apply` 与 `:restore` 的注册形态受 gin 限制，由 catch-all 捕获后切分，对外 URL 与契约逐字一致。
 
 ### 4.5 状态、日志与指标
 

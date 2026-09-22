@@ -1,6 +1,6 @@
 # 功能规格：无中断配置应用
 
-> 状态：草拟 · 关联 PRD：FR-10 · 分支：feature/zero-interruption-config-apply
+> 状态：开发中（jrps 侧已交付，jrpc 侧随 FR-08） · 关联 PRD：FR-10 · 分支：feature/zero-interruption-config-apply
 
 ## 1. 背景与目标
 
@@ -108,18 +108,21 @@ drain（旧资源不再接新流量，已有流跑到自然结束或排空上限
 
 ## 4. 任务拆分
 
-- [ ] 先写失败测试：prepare 失败、health-check 失败、drain 超时三类场景下 active 与 last-good 应保持不变的断言；已建立的长连接在配置变更期间不得断开。
-- [ ] 定义 revision 应用的结果模型与阶段枚举，落实三个 revision 的独立推进规则。
-- [ ] 实现 prepare：构造新资源且不触碰 active。
-- [ ] 实现 health-check：端口绑定、依赖可达与快照校验。
-- [ ] 实现 atomic publish：一次性指针切换，过程中不出现半更新观察。
-- [ ] 实现 drain：停接新流量、已有流自然结束、排空上限与强制释放。
-- [ ] 实现 publish 后异常不回切的约束与告警审计路径。
-- [ ] 实现并发互斥、等待队列、409 冲突与幂等键。
-- [ ] 实现 restore：以历史内容创建新 desired revision 并复用同一状态机。
-- [ ] 明确引导参数重启清单，并禁止任何以重启冒充热更的路径。
-- [ ] 在 jrpc 侧接入同一阶段编排并回报 apply result。
-- [ ] 运行 jrps、jrpc 测试、竞态检测与构建；同步 PRD、ARCHITECTURE、API、OPERATIONS、SECURITY、CHANGELOG 中受影响内容。
+四阶段状态机本体由 Core 承担（FR-26 已交付：core/server 与 core/client 的 Apply），本清单的外壳侧任务按 jrps 批次执行：
+
+- [x] 先写失败测试：prepare 失败、health-check 失败、drain 超时三类场景下 active 与 last-good 应保持不变的断言；已建立的长连接在配置变更期间不得断开。（jrps 侧：`internal/apply` 单飞/stale/阶段重建用例 + 真实引擎集成用例；Core 内核用例随 FR-26 交付）
+- [x] 定义 revision 应用的结果模型与阶段枚举，落实三个 revision 的独立推进规则。（store 的 `ApplyResult`/`RevisionState` 与 `RecordApplyResult` 随 FR-09 既有模型落地；编排层按固定阶段序重建"已成功阶段 + 终止阶段"）
+- [x] 实现 prepare：构造新资源且不触碰 active。（Core Apply，FR-26）
+- [x] 实现 health-check：端口绑定、依赖可达与快照校验。（Core Apply，FR-26；外壳侧快照转换失败按 validate 阶段失败落库）
+- [x] 实现 atomic publish：一次性指针切换，过程中不出现半更新观察。（Core Apply，FR-26）
+- [x] 实现 drain：停接新流量、已有流自然结束、排空上限与强制释放。（Core Apply，FR-26）
+- [x] 实现 publish 后异常不回切的约束与告警审计路径。（Core Apply，FR-26；drain 未完成在结果里标记 `DrainIncomplete`）
+- [x] 实现并发互斥、等待队列、409 冲突与幂等键。（P1 取"进行中直接 409"分支，不实现等待队列；幂等键暂以进程内受理记录 + Core 同 revision 幂等兜底，持久化幂等键随 FR-11 Web 管理台再评估）
+- [x] 实现 restore：以历史内容创建新 desired revision 并复用同一状态机。（store `RestoreRevision` 已有；jrps 侧 `:restore` 端点已接线，应用路径与普通 desired 一致）
+- [x] 明确引导参数重启清单，并禁止任何以重启冒充热更的路径。（重启清单登记于 OPERATIONS；控制监听端口是 desired 的一部分，属可热更项）
+- [ ] 在 jrpc 侧接入同一阶段编排并回报 apply result。**随 FR-08 交付**（依赖 desired state 下发通道与 `/agent/v1/apply-results` 回执端点）。
+- [x] 运行 jrps、jrpc 测试、竞态检测与构建；同步 PRD、ARCHITECTURE、API、OPERATIONS、SECURITY、CHANGELOG 中受影响内容。（jrpc 侧无行为变化，其测试与构建随本批 CI 覆盖）
+- [ ] 实机验收（分批）：管理 API 触发应用与 restore 的完整链路、长连接跨应用不中断。**随 FR-11 交付**——Web 管理台的代理编辑是"改配置→应用"的常规写入端，交付前 desired 版本只能由测试与后续 FR 写入，实机条款不具备触发条件。
 
 ## 5. 验收标准
 
@@ -138,6 +141,7 @@ drain（旧资源不再接新流量，已有流跑到自然结束或排空上限
 
 ## 6. 风险与待定
 
+- **已定（jrps 批次）**：凭证与数据面的边界——jrps 只存 token 摘要（FR-07），Core 的 wire v1 登录按明文比对（FR-25 最小实现），两者之间暂无可用桥。jrps 装配的快照使用由客户端标识派生的占位凭证集合（仅保留归属关系与通过构建器校验），真实数据面鉴权随 FR-03 兼容登录链交付，届时按 `apply.CredentialProvider` 接口位替换实现，编排层不变。此前提下本批交付的应用编排、状态推进、审计与查询语义均完整可用。
 - **风险**：drain 上限设置过短会切断正常长业务流，过长会长期占用资源。缓解方式是默认上限在此规格交付前定稿，管理员可在 Web 查看当前排空状态，超限释放必须留审计记录。
 - **风险**：health-check 无法覆盖所有运行期故障，例如依赖在 publish 后才不可达。该类故障归入 publish 后异常，只告警不回切，可能导致短时降级。
 - **风险**：端口冲突型 health-check 失败在并发应用时可能与其他进程竞争，需要确保释放顺序与重试提示明确。
