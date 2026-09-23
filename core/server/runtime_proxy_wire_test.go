@@ -51,10 +51,10 @@ func readLoginResponse(t *testing.T, raw net.Conn) {
 func encodeTestNewProxy(t *testing.T, name, proxyType string, remotePort int, target interface{ String() string }) []byte {
 	t.Helper()
 	body, err := json.Marshal(map[string]interface{}{
-		"proxyName":  name,
-		"proxyType":  proxyType,
-		"remotePort": remotePort,
-		"target":     target.String(),
+		"proxy_name":  name,
+		"proxy_type":  proxyType,
+		"remote_port": remotePort,
+		"target":      target.String(),
 	})
 	if err != nil {
 		t.Fatalf("编码注册失败：%v", err)
@@ -95,7 +95,7 @@ func readTestProxyResponse(t *testing.T, raw net.Conn, timeout time.Duration) er
 	if err := json.Unmarshal(frame.Payload, &response); err != nil {
 		t.Fatalf("解析注册响应失败：%v", err)
 	}
-	if !response.OK {
+	if response.Error != "" {
 		return errProxyRejected{message: response.Error}
 	}
 	return nil

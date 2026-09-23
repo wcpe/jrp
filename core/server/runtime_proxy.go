@@ -10,22 +10,28 @@ import (
 	"github.com/wcpe/jrp/core/internal/wire"
 )
 
-// proxyOperationResponse 是 new-proxy / close-proxy 的统一响应载荷。
+// proxyOperationResponse 是 new-proxy 的响应载荷（官方形状）。
+//
+// 官方对端以「error 为空」判定成功，并从此读取远端地址；该响应不用于
+// close-proxy——官方协议不为关闭定义响应消息。
 type proxyOperationResponse struct {
-	OK    bool   `json:"ok"`
-	Error string `json:"error,omitempty"`
+	ProxyName  string `json:"proxy_name,omitempty"`
+	RemoteAddr string `json:"remote_addr,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 // runtimeProxyRequest 是 new-proxy 的请求载荷（P1 字段子集）。
 //
-// 官方 frpc 的注册载荷包含大量额外字段（域名、插件、压缩、限速等）；解析
-// 容忍未知字段，P1 只表达四类代理必需的字段。未知字段被忽略而不是拒绝：
-// 拒绝会让携带可选字段的合法客户端无法注册。
+// 字段名取自官方兼容消息族；官方注册载荷还包含域名、插件、压缩、限速等字段，
+// 解析容忍未知字段——拒绝会让携带可选字段的合法客户端无法注册。
+//
+// 官方协议不携带本地目标地址：目标由客户端在其自身配置中决定，服务端不预知、
+// 因此运行时代理没有「目标允许集合」这一约束（该约束只适用于以 desired 快照
+// 声明的代理）。运行时代理的安全边界是 token 鉴权与会话归属校验。
 type runtimeProxyRequest struct {
-	ProxyName  string `json:"proxyName"`
-	ProxyType  string `json:"proxyType"`
-	RemotePort int    `json:"remotePort"`
-	Target     string `json:"target"`
+	ProxyName  string `json:"proxy_name"`
+	ProxyType  string `json:"proxy_type"`
+	RemotePort int    `json:"remote_port"`
 }
 
 // 稳定失败类别（FR-03 规格 §3.6）。
@@ -55,37 +61,32 @@ var runtimeProxyTypes = map[string]bool{
 func (engine *Engine) handleNewProxy(gen *generation, session sessionWriter, clientID string, payload []byte) {
 	var request runtimeProxyRequest
 	if err := json.Unmarshal(payload, &request); err != nil {
-		engine.writeProxyResponse(session, proxyOperationResponse{OK: false, Error: ErrProxyFieldInvalid.Error()})
+		engine.writeProxyResponse(session, proxyOperationResponse{Error: ErrProxyFieldInvalid.Error()})
 		return
 	}
 
 	// ── 第一段：字段完整性 ────────────────────────────────
-	if request.ProxyName == "" || request.RemotePort <= 0 || request.RemotePort > 65535 || request.Target == "" {
-		engine.writeProxyResponse(session, proxyOperationResponse{OK: false, Error: ErrProxyFieldInvalid.Error()})
-		return
-	}
-	target, parseErr := netip.ParseAddrPort(request.Target)
-	if parseErr != nil {
-		engine.writeProxyResponse(session, proxyOperationResponse{OK: false, Error: ErrProxyFieldInvalid.Error()})
+	if request.ProxyName == "" || request.RemotePort <= 0 || request.RemotePort > 65535 {
+		engine.writeProxyResponse(session, proxyOperationResponse{ProxyName: request.ProxyName, Error: ErrProxyFieldInvalid.Error()})
 		return
 	}
 
 	// ── 第二段：权限（P2 类型在此拒绝）────────────────────
 	if !runtimeProxyTypes[request.ProxyType] {
-		engine.writeProxyResponse(session, proxyOperationResponse{OK: false, Error: ErrProxyTypeUnsupported.Error()})
+		engine.writeProxyResponse(session, proxyOperationResponse{ProxyName: request.ProxyName, Error: ErrProxyTypeUnsupported.Error()})
 		return
 	}
 
 	// ── 第三段：冲突（名称与端口）─────────────────────────
 	if err := engine.checkRuntimeProxyConflicts(gen, clientID, request); err != nil {
-		engine.writeProxyResponse(session, proxyOperationResponse{OK: false, Error: err.Error()})
+		engine.writeProxyResponse(session, proxyOperationResponse{ProxyName: request.ProxyName, Error: err.Error()})
 		return
 	}
 
 	// ── 第四段：创建数据面资源 ────────────────────────────
 	entry, openErr := engine.listenGuest(gen.config, request.RemotePort)
 	if openErr != nil {
-		engine.writeProxyResponse(session, proxyOperationResponse{OK: false, Error: ErrProxyPortConflict.Error()})
+		engine.writeProxyResponse(session, proxyOperationResponse{ProxyName: request.ProxyName, Error: ErrProxyPortConflict.Error()})
 		return
 	}
 
@@ -99,7 +100,9 @@ func (engine *Engine) handleNewProxy(gen *generation, session sessionWriter, cli
 	merged[request.ProxyName] = &proxy.Binding{
 		Name:          request.ProxyName,
 		OwnerClientID: clientID,
-		Targets:       []netip.AddrPort{target},
+		// 官方协议不携带本地目标地址，服务端不预知目标：运行时代理的目标
+		// 不受服务端约束（快照声明的代理仍按 Targets 校验）。
+		UnrestrictedTargets: true,
 	}
 	gen.runtimeProxies[request.ProxyName] = &runtimeProxy{
 		name:      request.ProxyName,
@@ -116,7 +119,7 @@ func (engine *Engine) handleNewProxy(gen *generation, session sessionWriter, cli
 	gen.acceptWG.Add(1)
 	go engine.serveGuest(gen, request.ProxyName, entry)
 
-	engine.writeProxyResponse(session, proxyOperationResponse{OK: true})
+	engine.writeProxyResponse(session, proxyOperationResponse{ProxyName: request.ProxyName, RemoteAddr: entry.Addr().String()})
 	engine.log().Info("运行时代理已注册", "代理", request.ProxyName, "客户端", clientID, "入口", entry.Addr().String())
 }
 

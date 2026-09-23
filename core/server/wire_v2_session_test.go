@@ -149,14 +149,14 @@ func TestV2SessionLoginHeartbeatAndProxyRegistration(t *testing.T) {
 
 	remotePort := reserveTestPortForRuntime(t)
 	session.writeMessage(wire.MessageTypeNewProxy, map[string]any{
-		"proxyName":  "v2-proxy",
-		"proxyType":  "tcp",
-		"remotePort": remotePort,
-		"target":     target.String(),
+		"proxy_name":  "v2-proxy",
+		"proxy_type":  "tcp",
+		"remote_port": remotePort,
+		"target":      target.String(),
 	})
 	var response proxyOperationResponse
 	session.readMessage(wire.MessageTypeNewProxyResponse, &response)
-	if !response.OK {
+	if response.Error != "" {
 		t.Fatalf("v2 代理注册被拒：%s", response.Error)
 	}
 	if engine.GuestAddr("v2-proxy") == nil {
