@@ -308,3 +308,24 @@ func stageOr(err error, fallback Stage) Stage {
 	}
 	return fallback
 }
+
+// EnableV1Cipher 在 v1 连接上把消息读取切换到加密通道。
+//
+// 切换前提是登录握手已经完成（登录消息与其响应都是明文）；调用后读取器先消费
+// 对端的 16 字节 IV，再解密其后的所有消息。写侧由宿主在写出目标上套同一算法的
+// 加密写入器——两个方向的 IV 各自独立，不存在先后依赖。
+func (guard *ConnectionGuard) EnableV1Cipher(key []byte) error {
+	if err := guard.requireVersion(VersionV1); err != nil {
+		return err
+	}
+	guard.mu.Lock()
+	stream := guard.reader
+	guard.mu.Unlock()
+	if stream == nil {
+		return protocolError(CategoryTransportFailure, StageMessage, "v1 读取流尚未绑定，无法切换加密通道")
+	}
+	reader := NewV1Reader(NewV1CipherReader(stream, key), DefaultV1PayloadLimit)
+	reader.SetPool(guard.pool)
+	guard.bindReader(reader)
+	return nil
+}

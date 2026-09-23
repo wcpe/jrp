@@ -984,7 +984,7 @@ func (engine *Engine) handleControl(gen *generation, raw *transport.Conn) {
 	switch first.Type.Name {
 	case "login":
 		session := sessionWriter{conn: raw, version: version}
-		err := gen.handleLogin(session, first.Payload)
+		official, err := gen.handleLogin(session, first.Payload)
 		if err != nil {
 			first.Release()
 			engine.closeSession(raw, "登录被拒绝", nil)
@@ -993,6 +993,14 @@ func (engine *Engine) handleControl(gen *generation, raw *transport.Conn) {
 		var request loginPayload
 		_ = json.Unmarshal(first.Payload, &request)
 		first.Release()
+		// 官方形态客户端在登录响应之后切换加密通道（登录握手本身是明文）。
+		// 只对 v1 生效：v2 的加密由 AEAD 协商承担，不套这一层。
+		if official && version == wire.VersionV1 {
+			if cipherErr := gen.enableControlCipher(guard, &session, request.ClientID); cipherErr != nil {
+				engine.closeSession(raw, "控制通道加密切换失败", cipherErr)
+				return
+			}
+		}
 		// 会话登记与旧会话替换（FR-03 §3.4）：同一客户端的新会话接管，
 		// 旧会话转入退出——关闭其控制连接，由其 defer 完成会话资源清理。
 		// 运行时代理按连接归属清理，替换过程不会误伤新会话的注册。
@@ -1105,6 +1113,9 @@ func wireOptionsFromCompat() wire.Options {
 type sessionWriter struct {
 	conn    *transport.Conn
 	version wire.Version
+	// output 是消息写出目标；为空表示直接写连接。官方形态客户端在登录成功后
+	// 把出站字节流切换为加密写入器。
+	output io.Writer
 }
 
 // writeMessage 编码并写出单条消息帧。
@@ -1113,7 +1124,11 @@ func (writer sessionWriter) writeMessage(messageType wire.MessageType, body []by
 	if err != nil {
 		return err
 	}
-	_, err = writer.conn.Write(encoded)
+	target := writer.output
+	if target == nil {
+		target = writer.conn
+	}
+	_, err = target.Write(encoded)
 	return err
 }
 
@@ -1212,7 +1227,7 @@ func (engine *Engine) serveWorkDeclaration(gen *generation, raw *transport.Conn,
 		_ = raw.Close()
 		return
 	}
-	if !gen.credentialsMatch(declaration.clientID, declaration.token, declaration.timestamp) {
+	if matched, _ := gen.credentialsMatch(declaration.clientID, declaration.token, declaration.timestamp); !matched {
 		engine.log().Warn("工作连接的鉴权材料无效，已拒绝")
 		_ = raw.Close()
 		return
@@ -1269,9 +1284,9 @@ func (engine *Engine) serveWorkDeclaration(gen *generation, raw *transport.Conn,
 //     必须持有 token 明文才能复算比对（快照的 CompatToken 字段）。
 //
 // 任一条通过即通过；失败时不区分是哪条链的哪一环，避免泄漏校验进度。
-func (gen *generation) credentialsMatch(clientID, material string, timestamp int64) bool {
+func (gen *generation) credentialsMatch(clientID, material string, timestamp int64) (bool, bool) {
 	if clientID == "" || material == "" {
-		return false
+		return false, false
 	}
 	provided := DigestToken(material)
 	for _, credential := range gen.config.Credentials() {
@@ -1279,13 +1294,50 @@ func (gen *generation) credentialsMatch(clientID, material string, timestamp int
 			continue
 		}
 		if credential.Token != "" && digestEqual(provided, credential.Token) {
-			return true
+			return true, false
 		}
 		if credential.CompatToken != "" && digestEqual(officialPrivilegeKey(credential.CompatToken, timestamp), material) {
-			return true
+			return true, true
 		}
 	}
-	return false
+	return false, false
+}
+
+// compatToken 返回客户端配置的兼容明文材料。
+func (gen *generation) compatToken(clientID string) (string, bool) {
+	for _, credential := range gen.config.Credentials() {
+		if credential.ClientID == clientID && credential.CompatToken != "" {
+			return credential.CompatToken, true
+		}
+	}
+	return "", false
+}
+
+// enableControlCipher 在官方形态客户端登录成功后把控制通道切换为加密读写。
+//
+// 官方 frpc 的既定行为：登录握手是明文，其后所有消息走 AES-128-CFB 加密通道
+// （密钥由 token 明文经 PBKDF2(SHA-1, 盐 "frp", 64 次) 派生）；jrpc 走摘要链、
+// 不启用加密。读侧切换由守卫完成（先消费对端 IV），写侧把会话的输出目标替换为
+// 加密写入器（首次写入时发送本端 IV）。
+func (gen *generation) enableControlCipher(guard *wire.ConnectionGuard, session *sessionWriter, clientID string) error {
+	token, ok := gen.compatToken(clientID)
+	if !ok {
+		return errors.New("官方鉴权链通过但缺少兼容明文材料，无法建立加密通道")
+	}
+	key, err := wire.V1ControlCipherKey(token)
+	if err != nil {
+		return err
+	}
+	encrypted, err := wire.NewV1CipherWriter(session.conn, key)
+	if err != nil {
+		return err
+	}
+	if err := guard.EnableV1Cipher(key); err != nil {
+		return err
+	}
+	session.output = encrypted
+	gen.engine.log().Info("控制通道已切换加密（官方形态客户端）", "客户端", clientID)
+	return nil
 }
 
 // officialPrivilegeKey 复算官方 frpc 的鉴权材料：md5(token ∥ 十进制时间戳) 的十六进制。
@@ -1368,15 +1420,16 @@ type loginResponsePayload struct {
 // 校验链当前阶段：凭证摘要比较（FR-03 §3.4）。快照凭证持有摘要，请求明文
 // 在本地转摘要后恒定时间比较；客户端状态、时间窗口与重放边界由登录链
 // （loginChain）逐步接入。成功后由服务端分配运行 ID 并回写。
-func (gen *generation) handleLogin(session sessionWriter, payload []byte) error {
+func (gen *generation) handleLogin(session sessionWriter, payload []byte) (bool, error) {
 	var request loginPayload
 	if err := json.Unmarshal(payload, &request); err != nil {
 		_ = gen.writeLoginResponse(session, "", "登录载荷非法")
-		return err
+		return false, err
 	}
-	if !gen.credentialsMatch(request.ClientID, request.Token, request.Timestamp) {
+	matched, official := gen.credentialsMatch(request.ClientID, request.Token, request.Timestamp)
+	if !matched {
 		_ = gen.writeLoginResponse(session, "", "鉴权未通过")
-		return errors.New("服务端拒绝客户端登录")
+		return false, errors.New("服务端拒绝客户端登录")
 	}
 	runID := request.RunID
 	if runID == "" {
@@ -1384,9 +1437,9 @@ func (gen *generation) handleLogin(session sessionWriter, payload []byte) error 
 		runID = newSessionRunID()
 	}
 	if err := gen.writeLoginResponse(session, runID, ""); err != nil {
-		return err
+		return false, err
 	}
-	return nil
+	return official, nil
 }
 
 // newSessionRunID 生成一次控制会话的运行 ID。

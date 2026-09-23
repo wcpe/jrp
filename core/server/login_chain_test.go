@@ -11,10 +11,10 @@ func TestLoginChainRejectsTokenMismatch(t *testing.T) {
 	digest := DigestToken("real-secret")
 	gen := &generation{config: mustCredentialConfig(t, "c1", digest)}
 
-	if gen.credentialsMatch("c1", "wrong-secret", 0) {
+	if matched, _ := gen.credentialsMatch("c1", "wrong-secret", 0); matched {
 		t.Fatal("错误明文不应通过摘要比较")
 	}
-	if gen.credentialsMatch("c1", "", 0) {
+	if matched, _ := gen.credentialsMatch("c1", "", 0); matched {
 		t.Fatal("空 token 不应通过")
 	}
 }
@@ -24,7 +24,7 @@ func TestLoginChainAcceptsDigestMatch(t *testing.T) {
 	digest := DigestToken("real-secret")
 	gen := &generation{config: mustCredentialConfig(t, "c1", digest)}
 
-	if !gen.credentialsMatch("c1", "real-secret", 0) {
+	if matched, _ := gen.credentialsMatch("c1", "real-secret", 0); !matched {
 		t.Fatal("正确明文应通过摘要比较")
 	}
 }
@@ -38,13 +38,13 @@ func TestLoginChainAcceptsOfficialPrivilegeKey(t *testing.T) {
 	timestamp := time.Now().Unix()
 
 	official := officialPrivilegeKey("real-secret", timestamp)
-	if !gen.credentialsMatch("c1", official, timestamp) {
+	if matched, _ := gen.credentialsMatch("c1", official, timestamp); !matched {
 		t.Fatal("官方鉴权材料应通过兼容链")
 	}
-	if gen.credentialsMatch("c1", official, timestamp+1) {
+	if matched, _ := gen.credentialsMatch("c1", official, timestamp+1); matched {
 		t.Fatal("时间戳不匹配的官方材料不应通过")
 	}
-	if gen.credentialsMatch("c1", officialPrivilegeKey("other-secret", timestamp), timestamp) {
+	if matched, _ := gen.credentialsMatch("c1", officialPrivilegeKey("other-secret", timestamp), timestamp); matched {
 		t.Fatal("明文不匹配的官方材料不应通过")
 	}
 }
@@ -54,7 +54,7 @@ func TestLoginChainRejectsUnknownClient(t *testing.T) {
 	digest := DigestToken("real-secret")
 	gen := &generation{config: mustCredentialConfig(t, "c1", digest)}
 
-	if gen.credentialsMatch("ghost", DigestToken("real-secret"), 0) {
+	if matched, _ := gen.credentialsMatch("ghost", DigestToken("real-secret"), 0); matched {
 		t.Fatal("未知客户端不应通过")
 	}
 }
