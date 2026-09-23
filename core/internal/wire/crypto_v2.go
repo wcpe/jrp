@@ -202,23 +202,25 @@ func (reader *v2AEADReader) Read(target []byte) (int, error) {
 func (reader *v2AEADReader) readFrame() error {
 	if reader.nonce == nil {
 		nonce := make([]byte, reader.aead.NonceSize())
-		if _, err := io.ReadFull(reader.source, nonce); err != nil {
-			return err
+		if read, err := io.ReadFull(reader.source, nonce); err != nil {
+			// 已读字节数编入错误：0 表示对端一个字节都没发出，介于两者之间表示
+			// 流在流随机数中途结束——两种情况的排查方向完全不同。
+			return fmt.Errorf("读取 v2 流随机数失败（已读 %d/%d 字节）：%w", read, len(nonce), err)
 		}
 		reader.streamNonce = nonce
 		reader.nonce = append([]byte(nil), nonce...)
 	}
 	var header [v2FrameHeaderSize]byte
-	if _, err := io.ReadFull(reader.source, header[:]); err != nil {
-		return err
+	if read, err := io.ReadFull(reader.source, header[:]); err != nil {
+		return fmt.Errorf("读取 v2 帧头失败（已读 %d/%d 字节）：%w", read, len(header), err)
 	}
 	declared := int(binary.BigEndian.Uint32(header[:]))
 	if declared < reader.aead.Overhead() || declared > v2CipherMaxPayloadSize+reader.aead.Overhead() {
 		return fmt.Errorf("v2 帧密文长度非法：%d", declared)
 	}
 	ciphertext := make([]byte, declared)
-	if _, err := io.ReadFull(reader.source, ciphertext); err != nil {
-		return err
+	if read, err := io.ReadFull(reader.source, ciphertext); err != nil {
+		return fmt.Errorf("读取 v2 密文失败（已读 %d/%d 字节）：%w", read, len(ciphertext), err)
 	}
 	aad := make([]byte, 0, len(reader.streamNonce)+len(header))
 	aad = append(aad, reader.streamNonce...)
