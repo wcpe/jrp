@@ -26,7 +26,7 @@ func applySceneServerConfig(
 	options := []core.ServerOption{
 		core.WithListen(core.BindEndpoint{Address: control, Transport: core.TransportTCP}),
 		core.WithWire(core.WireV1),
-		core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: testClientToken}),
+		core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: server.DigestToken(testClientToken)}),
 		core.WithServerHeartbeat(200 * time.Millisecond),
 		core.WithServerTimeout(2 * time.Second),
 		core.WithServerDrainTimeout(3 * time.Second),
@@ -260,7 +260,7 @@ func TestApplyChangedUDPParamsOnSamePortRejected(t *testing.T) {
 			config, err := core.NewServerConfig(
 				core.WithListen(core.BindEndpoint{Address: control, Transport: core.TransportTCP}),
 				core.WithWire(core.WireV1),
-				core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: testClientToken}),
+				core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: server.DigestToken(testClientToken)}),
 				core.WithUDPProxyBinding(core.UDPProxyBinding{
 					Name: "udp-scene", ClientID: testClientID, RemotePort: udpPort,
 					AllowedTargets: []netip.AddrPort{target},
@@ -323,7 +323,7 @@ func TestApplyChangedUDPPortKeepsOldEntryServing(t *testing.T) {
 			config, err := core.NewServerConfig(
 				core.WithListen(core.BindEndpoint{Address: control, Transport: core.TransportTCP}),
 				core.WithWire(core.WireV1),
-				core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: testClientToken}),
+				core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: server.DigestToken(testClientToken)}),
 				core.WithUDPProxyBinding(core.UDPProxyBinding{
 					Name: "udp-scene", ClientID: testClientID, RemotePort: port,
 					AllowedTargets: []netip.AddrPort{target},

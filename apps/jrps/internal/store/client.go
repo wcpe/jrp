@@ -214,3 +214,20 @@ func (tx *Tx) Clients() ([]ClientView, error) {
 	}
 	return views, nil
 }
+
+// ActiveClientDigests 返回 enrollment 状态为 active 的客户端标识与其 token 完整摘要。
+//
+// 供数据面凭证装配（FR-03）：登录校验链把客户端声明的明文在服务端转摘要后与
+// 这里的摘要恒定时间比较。返回完整摘要而不是掩码视图——这是鉴权数据而非展示
+// 数据；不落日志、不进 API 响应、不进审计。
+func (tx *Tx) ActiveClientDigests() (map[string]string, error) {
+	var clients []Client
+	if err := tx.db.Find(&clients, "enrollment_state = ?", EnrollmentStateActive).Error; err != nil {
+		return nil, fmt.Errorf("读取 active 客户端失败：%w", translateSQLError(err))
+	}
+	digests := make(map[string]string, len(clients))
+	for _, client := range clients {
+		digests[client.ID] = client.TokenDigest
+	}
+	return digests, nil
+}

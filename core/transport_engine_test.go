@@ -69,7 +69,7 @@ func startPairWithDrainTimeout(
 	serverConfig, err := core.NewServerConfig(
 		core.WithListen(core.BindEndpoint{Address: control, Transport: core.TransportTCP}),
 		core.WithWire(core.WireV1),
-		core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: testClientToken}),
+		core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: server.DigestToken(testClientToken)}),
 		core.WithTCPProxyBinding(core.TCPProxyBinding{
 			Name:           testProxyName,
 			ClientID:       testClientID,
@@ -118,7 +118,7 @@ func TestDrainTimeoutComesFromConfig(t *testing.T) {
 	serverConfig, err := core.NewServerConfig(
 		core.WithListen(core.BindEndpoint{Address: mustAddrPort(t, "127.0.0.1:7000"), Transport: core.TransportTCP}),
 		core.WithWire(core.WireV1),
-		core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: testClientToken}),
+		core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: server.DigestToken(testClientToken)}),
 		core.WithTCPProxyBinding(core.TCPProxyBinding{
 			Name:           testProxyName,
 			ClientID:       testClientID,
@@ -211,7 +211,7 @@ func TestIdleWorkConnLimitFromConfig(t *testing.T) {
 	serverConfig, err := core.NewServerConfig(
 		core.WithListen(core.BindEndpoint{Address: control, Transport: core.TransportTCP}),
 		core.WithWire(core.WireV1),
-		core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: testClientToken}),
+		core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: server.DigestToken(testClientToken)}),
 		core.WithTCPProxyBinding(core.TCPProxyBinding{
 			Name:           testProxyName,
 			ClientID:       testClientID,
@@ -235,7 +235,7 @@ func TestIdleWorkConnLimitRejectsOutOfRange(t *testing.T) {
 		_, err := core.NewServerConfig(
 			core.WithListen(core.BindEndpoint{Address: control, Transport: core.TransportTCP}),
 			core.WithWire(core.WireV1),
-			core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: testClientToken}),
+			core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: server.DigestToken(testClientToken)}),
 			core.WithTCPProxyBinding(core.TCPProxyBinding{
 				Name:           testProxyName,
 				ClientID:       testClientID,
@@ -271,7 +271,7 @@ func TestGuestListenAddrFollowsConfig(t *testing.T) {
 	serverConfig, err := core.NewServerConfig(
 		core.WithListen(core.BindEndpoint{Address: control, Transport: core.TransportTCP}),
 		core.WithWire(core.WireV1),
-		core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: testClientToken}),
+		core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: server.DigestToken(testClientToken)}),
 		core.WithTCPProxyBinding(core.TCPProxyBinding{
 			Name:           testProxyName,
 			ClientID:       testClientID,

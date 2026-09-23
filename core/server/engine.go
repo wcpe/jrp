@@ -1075,8 +1075,14 @@ func (gen *generation) credentialsMatch(clientID, token string) bool {
 	if clientID == "" || token == "" {
 		return false
 	}
+	// 快照凭证集合持有摘要（SHA-256 hex）；请求携带的明文在本地转摘要后
+	// 恒定时间比较（FR-03 §3.4）。比较耗时差异不再随匹配进度变化。
+	provided := DigestToken(token)
 	for _, credential := range gen.config.Credentials() {
-		if credential.ClientID == clientID && credential.Token == token {
+		if credential.ClientID != clientID {
+			continue
+		}
+		if digestEqual(provided, credential.Token) {
 			return true
 		}
 	}
@@ -1131,20 +1137,17 @@ type loginResponsePayload struct {
 }
 
 // handleLogin 校验客户端凭证并回复登录结果。
+//
+// 校验链当前阶段：凭证摘要比较（FR-03 §3.4）。快照凭证持有摘要，请求明文
+// 在本地转摘要后恒定时间比较；客户端状态、时间窗口与重放边界由登录链
+// （loginChain）逐步接入。
 func (gen *generation) handleLogin(conn *transport.Conn, payload []byte) error {
 	var request loginPayload
 	if err := json.Unmarshal(payload, &request); err != nil {
 		_ = gen.writeLoginResponse(conn, false, "登录载荷非法")
 		return err
 	}
-	matched := false
-	for _, credential := range gen.config.Credentials() {
-		if credential.ClientID == request.ClientID && credential.Token == request.Token {
-			matched = true
-			break
-		}
-	}
-	if !matched {
+	if !gen.credentialsMatch(request.ClientID, request.Token) {
 		_ = gen.writeLoginResponse(conn, false, "鉴权未通过")
 		return errors.New("服务端拒绝客户端登录")
 	}

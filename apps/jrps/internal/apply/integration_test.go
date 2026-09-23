@@ -16,14 +16,18 @@ import (
 	"github.com/wcpe/jrp/core/server"
 )
 
-// 集成测试专用凭证 Provider：真实引擎需要与客户端配置一致的明文凭证。
+// 集成测试专用凭证 Provider：快照凭证承载摘要（FR-03 摘要鉴权语义），
+// 客户端继续以明文登录，由服务端摘要后恒定时间比较。
 type fixedCredentials struct {
 	clientID string
 	token    string
 }
 
 func (provider *fixedCredentials) DataPlaneCredentials(_ context.Context) ([]core.ClientCredential, error) {
-	return []core.ClientCredential{{ClientID: provider.clientID, Token: provider.token}}, nil
+	return []core.ClientCredential{{
+		ClientID: provider.clientID,
+		Token:    server.DigestToken(provider.token),
+	}}, nil
 }
 
 // startLocalEchoServer 启动本地回显服务，模拟被代理目标。
@@ -98,7 +102,7 @@ func newIntegrationEnv(t *testing.T) *integrationEnv {
 			Transport: core.TransportTCP,
 		}),
 		core.WithWire(core.WireV1),
-		core.WithClientCredential(core.ClientCredential{ClientID: clientID, Token: token}),
+		core.WithClientCredential(core.ClientCredential{ClientID: clientID, Token: server.DigestToken(token)}),
 	)
 	if err != nil {
 		t.Fatalf("构造初始配置失败：%v", err)

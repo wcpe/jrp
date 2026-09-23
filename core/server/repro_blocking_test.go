@@ -140,7 +140,7 @@ func mustServerConfig(t *testing.T) core.ServerConfig {
 	config, err := core.NewServerConfig(
 		core.WithListen(core.BindEndpoint{Address: listen, Transport: core.TransportTCP}),
 		core.WithWire(core.WireV1),
-		core.WithClientCredential(core.ClientCredential{ClientID: "repro", Token: "repro-token"}),
+		core.WithClientCredential(core.ClientCredential{ClientID: "repro", Token: DigestToken("repro-token")}),
 		core.WithTCPProxyBinding(core.TCPProxyBinding{
 			Name:       "repro-proxy",
 			ClientID:   "repro",
