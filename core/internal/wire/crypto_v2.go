@@ -232,7 +232,8 @@ func (reader *v2AEADReader) readFrame() error {
 	if err != nil {
 		// 流随机数是双方对齐状态的直接指纹：认证失败时带上它，便于与对端记录
 		// 的实际字节序列对照，判断是密钥不一致还是流位置漂移。
-		return fmt.Errorf("v2 帧认证失败（流随机数=%x 帧号=%d）：%w", reader.streamNonce, reader.frameCount, err)
+		return fmt.Errorf("v2 帧认证失败（流随机数=%x 帧号=%d 帧头=%x 声明长度=%d）：%w",
+			reader.streamNonce, reader.frameCount, header, declared, err)
 	}
 	incrementV2Nonce(reader.nonce)
 	reader.frameCount++
