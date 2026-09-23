@@ -52,40 +52,40 @@ var runtimeProxyTypes = map[string]bool{
 //
 // 运行时注册的代理是会话级的：不写 desired、不参与快照换代；控制会话结束时
 // 由代清理路径统一释放。关闭走 close-proxy 消息。
-func (engine *Engine) handleNewProxy(gen *generation, conn *transport.Conn, clientID string, payload []byte) {
+func (engine *Engine) handleNewProxy(gen *generation, session sessionWriter, clientID string, payload []byte) {
 	var request runtimeProxyRequest
 	if err := json.Unmarshal(payload, &request); err != nil {
-		engine.writeProxyResponse(conn, proxyOperationResponse{OK: false, Error: ErrProxyFieldInvalid.Error()})
+		engine.writeProxyResponse(session, proxyOperationResponse{OK: false, Error: ErrProxyFieldInvalid.Error()})
 		return
 	}
 
 	// ── 第一段：字段完整性 ────────────────────────────────
 	if request.ProxyName == "" || request.RemotePort <= 0 || request.RemotePort > 65535 || request.Target == "" {
-		engine.writeProxyResponse(conn, proxyOperationResponse{OK: false, Error: ErrProxyFieldInvalid.Error()})
+		engine.writeProxyResponse(session, proxyOperationResponse{OK: false, Error: ErrProxyFieldInvalid.Error()})
 		return
 	}
 	target, parseErr := netip.ParseAddrPort(request.Target)
 	if parseErr != nil {
-		engine.writeProxyResponse(conn, proxyOperationResponse{OK: false, Error: ErrProxyFieldInvalid.Error()})
+		engine.writeProxyResponse(session, proxyOperationResponse{OK: false, Error: ErrProxyFieldInvalid.Error()})
 		return
 	}
 
 	// ── 第二段：权限（P2 类型在此拒绝）────────────────────
 	if !runtimeProxyTypes[request.ProxyType] {
-		engine.writeProxyResponse(conn, proxyOperationResponse{OK: false, Error: ErrProxyTypeUnsupported.Error()})
+		engine.writeProxyResponse(session, proxyOperationResponse{OK: false, Error: ErrProxyTypeUnsupported.Error()})
 		return
 	}
 
 	// ── 第三段：冲突（名称与端口）─────────────────────────
 	if err := engine.checkRuntimeProxyConflicts(gen, clientID, request); err != nil {
-		engine.writeProxyResponse(conn, proxyOperationResponse{OK: false, Error: err.Error()})
+		engine.writeProxyResponse(session, proxyOperationResponse{OK: false, Error: err.Error()})
 		return
 	}
 
 	// ── 第四段：创建数据面资源 ────────────────────────────
 	entry, openErr := engine.listenGuest(gen.config, request.RemotePort)
 	if openErr != nil {
-		engine.writeProxyResponse(conn, proxyOperationResponse{OK: false, Error: ErrProxyPortConflict.Error()})
+		engine.writeProxyResponse(session, proxyOperationResponse{OK: false, Error: ErrProxyPortConflict.Error()})
 		return
 	}
 
@@ -104,7 +104,7 @@ func (engine *Engine) handleNewProxy(gen *generation, conn *transport.Conn, clie
 	gen.runtimeProxies[request.ProxyName] = &runtimeProxy{
 		name:      request.ProxyName,
 		clientID:  clientID,
-		ownerConn: conn,
+		ownerConn: session.conn,
 		listener:  entry,
 	}
 	gen.guestLns[request.ProxyName] = entry
@@ -116,19 +116,19 @@ func (engine *Engine) handleNewProxy(gen *generation, conn *transport.Conn, clie
 	gen.acceptWG.Add(1)
 	go engine.serveGuest(gen, request.ProxyName, entry)
 
-	engine.writeProxyResponse(conn, proxyOperationResponse{OK: true})
+	engine.writeProxyResponse(session, proxyOperationResponse{OK: true})
 	engine.log().Info("运行时代理已注册", "代理", request.ProxyName, "客户端", clientID, "入口", entry.Addr().String())
 }
 
 // handleCloseProxy 处理 close-proxy 消息：停止入口接收并清理登记。
 //
 // 活动连接按代排水语义自然结束；只允许代理属主关闭自己的代理。
-func (engine *Engine) handleCloseProxy(gen *generation, conn *transport.Conn, clientID string, payload []byte) {
+func (engine *Engine) handleCloseProxy(gen *generation, session sessionWriter, clientID string, payload []byte) {
 	var request struct {
 		ProxyName string `json:"proxyName"`
 	}
 	if err := json.Unmarshal(payload, &request); err != nil || request.ProxyName == "" {
-		engine.writeProxyResponse(conn, proxyOperationResponse{OK: false, Error: ErrProxyFieldInvalid.Error()})
+		engine.writeProxyResponse(session, proxyOperationResponse{OK: false, Error: ErrProxyFieldInvalid.Error()})
 		return
 	}
 
@@ -136,7 +136,7 @@ func (engine *Engine) handleCloseProxy(gen *generation, conn *transport.Conn, cl
 	proxyEntry, ok := gen.runtimeProxies[request.ProxyName]
 	if !ok || proxyEntry.clientID != clientID {
 		engine.mu.Unlock()
-		engine.writeProxyResponse(conn, proxyOperationResponse{OK: false, Error: ErrProxyNameConflict.Error()})
+		engine.writeProxyResponse(session, proxyOperationResponse{OK: false, Error: ErrProxyNameConflict.Error()})
 		return
 	}
 	listener := proxyEntry.listener
@@ -156,7 +156,7 @@ func (engine *Engine) handleCloseProxy(gen *generation, conn *transport.Conn, cl
 	// 停止接收：与 stopAccepting 同一语义，但不走代的整体排水。
 	_ = listener.Release()
 
-	engine.writeProxyResponse(conn, proxyOperationResponse{OK: true})
+	engine.writeProxyResponse(session, proxyOperationResponse{OK: true})
 	engine.log().Info("运行时代理已关闭", "代理", request.ProxyName, "客户端", clientID)
 }
 
@@ -177,16 +177,15 @@ func (engine *Engine) checkRuntimeProxyConflicts(gen *generation, clientID strin
 }
 
 // writeProxyResponse 写出代理操作响应帧。
-func (engine *Engine) writeProxyResponse(conn *transport.Conn, response proxyOperationResponse) {
+//
+// 写入失败被有意忽略：响应写不出去意味着会话即将被读取路径判定为失败并关闭，
+// 这里不再叠加一次会话关闭动作。编码错误同理，只可能是内部缺陷而非对端输入。
+func (engine *Engine) writeProxyResponse(session sessionWriter, response proxyOperationResponse) {
 	body, err := json.Marshal(response)
 	if err != nil {
 		return
 	}
-	frame, frameErr := wire.EncodeV1Frame(wire.Frame{Type: wire.MessageTypeNewProxyResponse, Payload: body})
-	if frameErr != nil {
-		return
-	}
-	_, _ = conn.Write(frame)
+	_ = session.writeMessage(wire.MessageTypeNewProxyResponse, body)
 }
 
 // runtimeProxy 是一条运行时注册代理的会话级登记。

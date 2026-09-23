@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/wcpe/jrp/core"
+	"github.com/wcpe/jrp/core/compat"
 	"github.com/wcpe/jrp/core/internal/proxy"
 	"github.com/wcpe/jrp/core/internal/transport"
 	"github.com/wcpe/jrp/core/internal/wire"
@@ -808,16 +809,26 @@ func (gen *generation) stopAccepting() {
 	for name := range gen.donated {
 		donated[name] = true
 	}
+	// 入口表是可变的：会话结束时运行时代理的清理持同一把锁增删这些条目。
+	// 必须先在锁内拷快照，否则下面的遍历会与并发的删除竞争。
+	guestListeners := make(map[string]*transport.Listener, len(gen.guestLns))
+	for name, guestListener := range gen.guestLns {
+		guestListeners[name] = guestListener
+	}
+	udpEntries := make(map[string]*proxy.UDPProxy, len(gen.udpEntries))
+	for name, entry := range gen.udpEntries {
+		udpEntries[name] = entry
+	}
 	gen.engine.mu.Unlock()
 
-	for name, guestListener := range gen.guestLns {
+	for name, guestListener := range guestListeners {
 		if donated[name] {
 			_ = guestListener.SetAcceptDeadline(time.Now())
 			continue
 		}
 		_ = guestListener.Release()
 	}
-	for name, entry := range gen.udpEntries {
+	for name, entry := range udpEntries {
 		if donated[name] {
 			// UDP 入口没有 Accept 循环，用 Suspend 停掉本代的接收而不回收会话。
 			entry.Suspend()
@@ -831,7 +842,7 @@ func (gen *generation) stopAccepting() {
 	// 交接完成：清掉为唤醒 Accept 设下的截止时间，否则后继代的 Accept 会永远
 	// 立即超时，入口看起来"在监听却收不到连接"。
 	for name := range donated {
-		if guestListener := gen.guestLns[name]; guestListener != nil {
+		if guestListener := guestListeners[name]; guestListener != nil {
 			_ = guestListener.SetAcceptDeadline(time.Time{})
 		}
 	}
@@ -946,18 +957,19 @@ func (engine *Engine) handleControl(gen *generation, raw *transport.Conn) {
 	engine.trackControl(raw)
 	defer engine.untrackControl(raw)
 
-	guard := wire.NewConnectionGuard(raw, nil, wire.Options{
-		MaxWireVersion: wire.VersionV1,
-		V2Enabled:      false,
-	})
+	guard := wire.NewConnectionGuard(raw, nil, wireOptionsFromCompat())
 	version, err := guard.DetectVersion(raw)
 	if err != nil {
 		engine.closeSession(raw, "版本检测失败", err)
 		return
 	}
-	if version != wire.VersionV1 {
-		engine.closeSession(raw, "wire 版本不被接受", nil)
-		return
+	// v2 连接先完成协商（hello 往返）再进入消息阶段（FR-03 §3.4/§4.2）：
+	// 协商失败必须失败，不静默降级到 v1。
+	if version == wire.VersionV2 {
+		if negErr := engine.completeV2Negotiation(raw, guard); negErr != nil {
+			engine.closeSession(raw, "v2 协商失败", negErr)
+			return
+		}
 	}
 	// 版本判定已把读取器绑定到回放后的流：用守卫统一入口读取，
 	// 不得重建 V1Reader，否则会重复消费版本判定阶段的预读字节。
@@ -968,7 +980,8 @@ func (engine *Engine) handleControl(gen *generation, raw *transport.Conn) {
 	}
 	switch first.Type.Name {
 	case "login":
-		err := gen.handleLogin(raw, first.Payload)
+		session := sessionWriter{conn: raw, version: version}
+		err := gen.handleLogin(session, first.Payload)
 		if err != nil {
 			first.Release()
 			engine.closeSession(raw, "登录被拒绝", nil)
@@ -991,7 +1004,7 @@ func (engine *Engine) handleControl(gen *generation, raw *transport.Conn) {
 			RemoteAddr: raw.RemoteAddr().String(),
 			EventMeta:  core.NewEventMeta(),
 		})
-		engine.serveControlLoop(gen, raw, guard, request.ClientID)
+		engine.serveControlLoop(gen, session, guard, request.ClientID)
 	case "new-work-conn":
 		engine.serveWorkDeclaration(gen, raw, first.Payload)
 		first.Release()
@@ -1009,38 +1022,38 @@ func (engine *Engine) handleControl(gen *generation, raw *transport.Conn) {
 //
 // 会话级错误（心跳失活、未知帧、读取失败）只关闭本会话：FR-03 的多客户端
 // 语义下，单个客户端掉线不能让服务器停机（FR-25 的单会话语义已被取代）。
-func (engine *Engine) serveControlLoop(gen *generation, conn *transport.Conn, guard *wire.ConnectionGuard, clientID string) {
+func (engine *Engine) serveControlLoop(gen *generation, session sessionWriter, guard *wire.ConnectionGuard, clientID string) {
 	liveness := engine.controlLivenessWindow()
 	for {
-		if deadlineErr := conn.SetReadDeadline(time.Now().Add(liveness)); deadlineErr != nil {
-			engine.closeSession(conn, "设置读截止时间失败", deadlineErr)
+		if deadlineErr := session.conn.SetReadDeadline(time.Now().Add(liveness)); deadlineErr != nil {
+			engine.closeSession(session.conn, "设置读截止时间失败", deadlineErr)
 			return
 		}
 		frame, err := guard.ReadFrame()
 		if err != nil {
 			if isReadDeadline(err) {
-				engine.closeSession(conn, "心跳失活（超过失活窗口未收到心跳）", nil)
+				engine.closeSession(session.conn, "心跳失活（超过失活窗口未收到心跳）", nil)
 			} else {
-				engine.closeSession(conn, "控制连接读取失败", err)
+				engine.closeSession(session.conn, "控制连接读取失败", err)
 			}
 			return
 		}
 		switch frame.Type.Name {
 		case "ping":
 			frame.Release()
-			if err := engine.replyPong(conn); err != nil {
-				engine.closeSession(conn, "心跳应答失败", err)
+			if err := engine.replyPong(session); err != nil {
+				engine.closeSession(session.conn, "心跳应答失败", err)
 				return
 			}
 		case "new-proxy":
-			engine.handleNewProxy(gen, conn, clientID, frame.Payload)
+			engine.handleNewProxy(gen, session, clientID, frame.Payload)
 			frame.Release()
 		case "close-proxy":
-			engine.handleCloseProxy(gen, conn, clientID, frame.Payload)
+			engine.handleCloseProxy(gen, session, clientID, frame.Payload)
 			frame.Release()
 		default:
 			frame.Release()
-			engine.closeSession(conn, "控制连接收到未知帧", nil)
+			engine.closeSession(session.conn, "控制连接收到未知帧", nil)
 			return
 		}
 	}
@@ -1059,6 +1072,75 @@ func (engine *Engine) closeSession(conn *transport.Conn, reason string, err erro
 		engine.log().Info("控制会话关闭", "原因", reason)
 	}
 	_ = conn.Close()
+}
+
+// wireOptionsFromCompat 按兼容基线声明推导控制入口的 wire 版本策略。
+//
+// 兼容声明是真源（core/compat.Current()），不引入独立的服务端配置项：声明
+// 同时含 v1/v2 时两个版本都必须在同一入口登录成功（FR-03 §3.9 的「分别强制
+// wire v1 与 wire v2 发起连接」）。注意 MaxWireVersion 的既有语义是「入口可
+// 接受的最低版本」——取 v1 表示 v1/v2 都接受，只有取 v2 才是「仅接受 v2」；
+// v2 是否可用由 V2Enabled 单独控制。
+func wireOptionsFromCompat() wire.Options {
+	options := wire.Options{MaxWireVersion: wire.VersionV2}
+	for _, version := range compat.Current().WireVersions() {
+		switch version {
+		case string(wire.VersionV1):
+			options.MaxWireVersion = wire.VersionV1
+		case string(wire.VersionV2):
+			options.V2Enabled = true
+		}
+	}
+	return options
+}
+
+// sessionWriter 按会话的 wire 版本写出站消息帧。
+//
+// 入站读取已由连接守卫统一（版本判定后绑定读取器），出站编码没有守卫遮挡：
+// v1 是单字节类型前缀 + JSON，v2 是帧头 + 两字节类型 ID + JSON。同一段业务
+// 处理必须按会话版本选择编码，否则 v2 客户端解不出服务端响应。
+type sessionWriter struct {
+	conn    *transport.Conn
+	version wire.Version
+}
+
+// writeMessage 编码并写出单条消息帧。
+func (writer sessionWriter) writeMessage(messageType wire.MessageType, body []byte) error {
+	encoded, err := encodeSessionMessage(writer.version, messageType, body)
+	if err != nil {
+		return err
+	}
+	_, err = writer.conn.Write(encoded)
+	return err
+}
+
+// encodeSessionMessage 按 wire 版本编码一条消息帧。
+func encodeSessionMessage(version wire.Version, messageType wire.MessageType, body []byte) ([]byte, error) {
+	if version == wire.VersionV2 {
+		return wire.EncodeV2MessageFrame(messageType, body)
+	}
+	return wire.EncodeV1Frame(wire.Frame{Type: messageType, Payload: body})
+}
+
+// completeV2Negotiation 完成 wire v2 协商并回写 server hello。
+//
+// 协商读取器持有流位置，guard.Negotiate 已把它绑定为后续消息帧的读取器；
+// server hello 是协商结果的下行确认，必须在协商成功后立即发送。
+func (engine *Engine) completeV2Negotiation(conn *transport.Conn, guard *wire.ConnectionGuard) error {
+	result, err := guard.Negotiate()
+	if err != nil {
+		return err
+	}
+	payload, err := wire.EncodeServerHello(result)
+	if err != nil {
+		return err
+	}
+	frame, err := wire.EncodeV2Frame(wire.V2FrameTypeServerHello, payload)
+	if err != nil {
+		return err
+	}
+	_, err = conn.Write(frame)
+	return err
 }
 
 // controlLivenessWindow 返回控制会话的失活窗口：心跳周期的三倍。
@@ -1246,46 +1328,35 @@ type loginResponsePayload struct {
 // 校验链当前阶段：凭证摘要比较（FR-03 §3.4）。快照凭证持有摘要，请求明文
 // 在本地转摘要后恒定时间比较；客户端状态、时间窗口与重放边界由登录链
 // （loginChain）逐步接入。
-func (gen *generation) handleLogin(conn *transport.Conn, payload []byte) error {
+func (gen *generation) handleLogin(session sessionWriter, payload []byte) error {
 	var request loginPayload
 	if err := json.Unmarshal(payload, &request); err != nil {
-		_ = gen.writeLoginResponse(conn, false, "登录载荷非法")
+		_ = gen.writeLoginResponse(session, false, "登录载荷非法")
 		return err
 	}
 	if !gen.credentialsMatch(request.ClientID, request.Token) {
-		_ = gen.writeLoginResponse(conn, false, "鉴权未通过")
+		_ = gen.writeLoginResponse(session, false, "鉴权未通过")
 		return errors.New("服务端拒绝客户端登录")
 	}
-	if err := gen.writeLoginResponse(conn, true, ""); err != nil {
+	if err := gen.writeLoginResponse(session, true, ""); err != nil {
 		return err
 	}
 	return nil
 }
 
 // writeLoginResponse 写出登录响应帧。
-func (gen *generation) writeLoginResponse(conn *transport.Conn, ok bool, message string) error {
+func (gen *generation) writeLoginResponse(session sessionWriter, ok bool, message string) error {
 	response := loginResponsePayload{OK: ok, Error: message}
 	body, err := json.Marshal(response)
 	if err != nil {
 		return err
 	}
-	encoded, err := wire.EncodeV1Frame(wire.Frame{Type: wire.MessageTypeLoginResponse, Payload: body})
-	if err != nil {
-		return err
-	}
-	_, err = conn.Write(encoded)
-	return err
+	return session.writeMessage(wire.MessageTypeLoginResponse, body)
 }
 
 // replyPong 回复心跳。
-func (engine *Engine) replyPong(conn *transport.Conn) error {
-	body := []byte(`{}`)
-	encoded, err := wire.EncodeV1Frame(wire.Frame{Type: wire.MessageTypePong, Payload: body})
-	if err != nil {
-		return err
-	}
-	_, err = conn.Write(encoded)
-	return err
+func (engine *Engine) replyPong(session sessionWriter) error {
+	return session.writeMessage(wire.MessageTypePong, []byte(`{}`))
 }
 
 // serveGuest 接受指定代理的访客连接。
