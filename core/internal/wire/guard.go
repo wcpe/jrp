@@ -61,6 +61,11 @@ type ConnectionGuard struct {
 	reader  *PeekReader
 	v1      *V1Reader
 	v2      *V2Reader
+
+	// v2ClientHello 与 v2ServerHello 是 v2 协商记录的两段原始载荷：
+	// 控制通道密钥由它们共同派生，任一段被篡改都会导致首帧认证失败。
+	v2ClientHello []byte
+	v2ServerHello []byte
 }
 
 // NewConnectionGuard 建立连接守卫。
@@ -195,6 +200,8 @@ func (guard *ConnectionGuard) Negotiate() (NegotiationResult, error) {
 	}
 
 	request, frameErr := guard.decodeClientHello(helloFrame)
+	// 协商记录要参与密钥派生，必须在归还缓冲前留下副本。
+	guard.v2ClientHello = append([]byte(nil), helloFrame.Message.Payload...)
 	helloFrame.Release()
 	if frameErr != nil {
 		return NegotiationResult{}, guard.fail(frameErr)
@@ -327,5 +334,51 @@ func (guard *ConnectionGuard) EnableV1Cipher(key []byte) error {
 	reader := NewV1Reader(NewV1CipherReader(stream, key), DefaultV1PayloadLimit)
 	reader.SetPool(guard.pool)
 	guard.bindReader(reader)
+	return nil
+}
+
+// RecordV2ServerHello 记录服务端 hello 的原始载荷，供协商记录派生使用。
+func (guard *ConnectionGuard) RecordV2ServerHello(payload []byte) {
+	guard.mu.Lock()
+	defer guard.mu.Unlock()
+	guard.v2ServerHello = append([]byte(nil), payload...)
+}
+
+// V2Transcript 返回协商记录哈希；两段载荷都已记录时才可用。
+func (guard *ConnectionGuard) V2Transcript() ([]byte, bool) {
+	guard.mu.Lock()
+	clientHello := guard.v2ClientHello
+	serverHello := guard.v2ServerHello
+	guard.mu.Unlock()
+	if len(clientHello) == 0 || len(serverHello) == 0 {
+		return nil, false
+	}
+	return V2CryptoTranscript(clientHello, serverHello), true
+}
+
+// EnableV2Cipher 在 v2 连接上把消息读取切换到分帧 AEAD 通道。
+//
+// 切换前提是登录握手已完成（登录消息与其响应在 v2 下同样是明文）；调用后读取器
+// 先消费对端的明文流随机数，再逐帧认证解密。写侧的加密由宿主在写出目标上套同一
+// 算法的分帧写入器，两个方向使用各自派生的密钥。
+func (guard *ConnectionGuard) EnableV2Cipher(key []byte) error {
+	if err := guard.requireVersion(VersionV2); err != nil {
+		return err
+	}
+	guard.mu.Lock()
+	stream := guard.reader
+	guard.mu.Unlock()
+	if stream == nil {
+		return protocolError(CategoryTransportFailure, StageMessage, "v2 读取流尚未绑定，无法切换加密通道")
+	}
+	encrypted, err := NewV2AEADReader(stream, key)
+	if err != nil {
+		return err
+	}
+	reader := NewV2Reader(encrypted, DefaultV2PayloadLimit)
+	reader.SetPool(guard.pool)
+	guard.mu.Lock()
+	guard.v2 = reader
+	guard.mu.Unlock()
 	return nil
 }

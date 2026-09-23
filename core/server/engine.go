@@ -1011,10 +1011,10 @@ func (engine *Engine) handleControl(gen *generation, raw *transport.Conn) {
 		var request loginPayload
 		_ = json.Unmarshal(first.Payload, &request)
 		first.Release()
-		// 官方形态客户端在登录响应之后切换加密通道（登录握手本身是明文）。
-		// 只对 v1 生效：v2 的加密由 AEAD 协商承担，不套这一层。
-		if official && version == wire.VersionV1 {
-			if cipherErr := gen.enableControlCipher(guard, &session, request.ClientID); cipherErr != nil {
+		// 官方形态客户端在登录响应之后切换加密通道（登录握手本身是明文）：
+		// v1 走 AES-128-CFB，v2 走协商出的分帧 AEAD，两者切换时序一致。
+		if official {
+			if cipherErr := gen.enableControlCipher(guard, &session, request.ClientID, version); cipherErr != nil {
 				engine.closeSession(raw, "控制通道加密切换失败", cipherErr)
 				return
 			}
@@ -1183,6 +1183,8 @@ func (engine *Engine) completeV2Negotiation(conn *transport.Conn, guard *wire.Co
 	if err != nil {
 		return err
 	}
+	// 协商记录要参与控制通道密钥派生：在写出前留下服务端 hello 的原始载荷。
+	guard.RecordV2ServerHello(payload)
 	frame, err := wire.EncodeV2Frame(wire.V2FrameTypeServerHello, payload)
 	if err != nil {
 		return err
@@ -1426,7 +1428,10 @@ func (engine *Engine) requestWorkConn(clientID string) {
 // （密钥由 token 明文经 PBKDF2(SHA-1, 盐 "frp", 64 次) 派生）；jrpc 走摘要链、
 // 不启用加密。读侧切换由守卫完成（先消费对端 IV），写侧把会话的输出目标替换为
 // 加密写入器（首次写入时发送本端 IV）。
-func (gen *generation) enableControlCipher(guard *wire.ConnectionGuard, session *sessionWriter, clientID string) error {
+func (gen *generation) enableControlCipher(guard *wire.ConnectionGuard, session *sessionWriter, clientID string, version wire.Version) error {
+	if version == wire.VersionV2 {
+		return gen.enableV2ControlCipher(guard, session, clientID)
+	}
 	token, ok := gen.compatToken(clientID)
 	if !ok {
 		return errors.New("官方鉴权链通过但缺少兼容明文材料，无法建立加密通道")
@@ -1443,7 +1448,41 @@ func (gen *generation) enableControlCipher(guard *wire.ConnectionGuard, session 
 		return err
 	}
 	session.output = encrypted
-	gen.engine.log().Info("控制通道已切换加密（官方形态客户端）", "客户端", clientID)
+	gen.engine.log().Info("控制通道已切换加密（官方形态客户端，v1）", "客户端", clientID)
+	return nil
+}
+
+// enableV2ControlCipher 在 v2 会话上切换分帧 AEAD 通道。
+//
+// 密钥由协商记录（两段 hello）与 token 明文共同派生，两个方向各取一个：服务端
+// 读用 client-to-server、写用 server-to-client。协商记录缺失时拒绝切换——没有它
+// 派生出的密钥与对端不一致，切换只会让会话静默失败。
+func (gen *generation) enableV2ControlCipher(guard *wire.ConnectionGuard, session *sessionWriter, clientID string) error {
+	token, ok := gen.compatToken(clientID)
+	if !ok {
+		return errors.New("官方鉴权链通过但缺少兼容明文材料，无法建立加密通道")
+	}
+	transcript, ok := guard.V2Transcript()
+	if !ok {
+		return errors.New("v2 协商记录不完整，无法派生控制通道密钥")
+	}
+	readKey, err := wire.DeriveV2ControlKey(token, wire.V2CipherAlgorithmAES256GCM, wire.V2DirectionClientToServer, transcript)
+	if err != nil {
+		return err
+	}
+	writeKey, err := wire.DeriveV2ControlKey(token, wire.V2CipherAlgorithmAES256GCM, wire.V2DirectionServerToClient, transcript)
+	if err != nil {
+		return err
+	}
+	encrypted, err := wire.NewV2AEADWriter(session.conn, writeKey)
+	if err != nil {
+		return err
+	}
+	if err := guard.EnableV2Cipher(readKey); err != nil {
+		return err
+	}
+	session.output = encrypted
+	gen.engine.log().Info("控制通道已切换加密（官方形态客户端，v2）", "客户端", clientID)
 	return nil
 }
 

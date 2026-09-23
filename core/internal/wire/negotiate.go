@@ -79,8 +79,12 @@ type Capabilities struct {
 // DefaultCapabilities 返回 P1 服务端默认能力。
 func DefaultCapabilities() Capabilities {
 	return Capabilities{
-		Codecs:           []string{CodecJSON},
-		CryptoAlgorithms: []string{CryptoNone, CryptoStreamV1},
+		Codecs: []string{CodecJSON},
+		// 算法标识必须是官方线上取值：v2 的协商集合要包含本实现真正支持的 AEAD
+		// （官方客户端声明的是 aes-256-gcm 与 xchacha20-poly1305，服务端选定前者）。
+		// v1 的控制通道加密不在协商范围内——它在登录后按固定算法切换，
+		// 因此 "none" 与 "stream-v1" 只是 v1 语义的自有标识，不是 v2 的候选。
+		CryptoAlgorithms: []string{V2CipherAlgorithmAES256GCM, CryptoNone, CryptoStreamV1},
 		CompressionAlgos: []string{CompressionNone},
 		MaxPayload:       DefaultV2PayloadLimit,
 	}
