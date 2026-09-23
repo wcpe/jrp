@@ -1,0 +1,230 @@
+package server
+
+import (
+	"encoding/json"
+	"errors"
+	"net/netip"
+
+	"github.com/wcpe/jrp/core/internal/proxy"
+	"github.com/wcpe/jrp/core/internal/transport"
+	"github.com/wcpe/jrp/core/internal/wire"
+)
+
+// proxyOperationResponse 是 new-proxy / close-proxy 的统一响应载荷。
+type proxyOperationResponse struct {
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+}
+
+// runtimeProxyRequest 是 new-proxy 的请求载荷（P1 字段子集）。
+//
+// 官方 frpc 的注册载荷包含大量额外字段（域名、插件、压缩、限速等）；解析
+// 容忍未知字段，P1 只表达四类代理必需的字段。未知字段被忽略而不是拒绝：
+// 拒绝会让携带可选字段的合法客户端无法注册。
+type runtimeProxyRequest struct {
+	ProxyName  string `json:"proxyName"`
+	ProxyType  string `json:"proxyType"`
+	RemotePort int    `json:"remotePort"`
+	Target     string `json:"target"`
+}
+
+// 稳定失败类别（FR-03 规格 §3.6）。
+var (
+	ErrProxyTypeUnsupported = errors.New("proxy_rejected: type_unsupported")
+	ErrProxyNameConflict    = errors.New("proxy_rejected: name_conflict")
+	ErrProxyPortConflict    = errors.New("proxy_rejected: port_conflict")
+	ErrProxyFieldInvalid    = errors.New("proxy_rejected: field_invalid")
+)
+
+// P1 支持的运行时注册代理类型；之外一律可判定拒绝。
+var runtimeProxyTypes = map[string]bool{
+	"tcp":   true,
+	"udp":   true,
+	"http":  true,
+	"https": true,
+}
+
+// handleNewProxy 处理 new-proxy 消息：运行时注册一个代理。
+//
+// 四段校验顺序固定（FR-06a §3.2）：字段 → 权限 → 端口/名称冲突 → P1 范围。
+// 全部通过后创建入口监听器并登记到当前代——成功响应只在资源可用后返回，
+// 失败不得留下半注册监听器。
+//
+// 运行时注册的代理是会话级的：不写 desired、不参与快照换代；控制会话结束时
+// 由代清理路径统一释放。关闭走 close-proxy 消息。
+func (engine *Engine) handleNewProxy(gen *generation, conn *transport.Conn, clientID string, payload []byte) {
+	var request runtimeProxyRequest
+	if err := json.Unmarshal(payload, &request); err != nil {
+		engine.writeProxyResponse(conn, proxyOperationResponse{OK: false, Error: ErrProxyFieldInvalid.Error()})
+		return
+	}
+
+	// ── 第一段：字段完整性 ────────────────────────────────
+	if request.ProxyName == "" || request.RemotePort <= 0 || request.RemotePort > 65535 || request.Target == "" {
+		engine.writeProxyResponse(conn, proxyOperationResponse{OK: false, Error: ErrProxyFieldInvalid.Error()})
+		return
+	}
+	target, parseErr := netip.ParseAddrPort(request.Target)
+	if parseErr != nil {
+		engine.writeProxyResponse(conn, proxyOperationResponse{OK: false, Error: ErrProxyFieldInvalid.Error()})
+		return
+	}
+
+	// ── 第二段：权限（P2 类型在此拒绝）────────────────────
+	if !runtimeProxyTypes[request.ProxyType] {
+		engine.writeProxyResponse(conn, proxyOperationResponse{OK: false, Error: ErrProxyTypeUnsupported.Error()})
+		return
+	}
+
+	// ── 第三段：冲突（名称与端口）─────────────────────────
+	if err := engine.checkRuntimeProxyConflicts(gen, clientID, request); err != nil {
+		engine.writeProxyResponse(conn, proxyOperationResponse{OK: false, Error: err.Error()})
+		return
+	}
+
+	// ── 第四段：创建数据面资源 ────────────────────────────
+	entry, openErr := engine.listenGuest(gen.config, request.RemotePort)
+	if openErr != nil {
+		engine.writeProxyResponse(conn, proxyOperationResponse{OK: false, Error: ErrProxyPortConflict.Error()})
+		return
+	}
+
+	engine.mu.Lock()
+	// 注册表增量并入：工作连接的归属与目标校验立即生效。
+	merged := make(proxy.Registry)
+	current := gen.engine.registry.Current()
+	for name, binding := range current {
+		merged[name] = binding
+	}
+	merged[request.ProxyName] = &proxy.Binding{
+		Name:          request.ProxyName,
+		OwnerClientID: clientID,
+		Targets:       []netip.AddrPort{target},
+	}
+	gen.runtimeProxies[request.ProxyName] = &runtimeProxy{
+		name:     request.ProxyName,
+		clientID: clientID,
+		listener: entry,
+	}
+	gen.guestLns[request.ProxyName] = entry
+	gen.guestAddr[request.ProxyName] = entry.Addr()
+	gen.engine.registry.Publish(merged)
+	engine.mu.Unlock()
+
+	// 接入循环独立启动：动态注册的入口与快照入口共用同一条访客服务路径。
+	gen.acceptWG.Add(1)
+	go engine.serveGuest(gen, request.ProxyName, entry)
+
+	engine.writeProxyResponse(conn, proxyOperationResponse{OK: true})
+	engine.log().Info("运行时代理已注册", "代理", request.ProxyName, "客户端", clientID, "入口", entry.Addr().String())
+}
+
+// handleCloseProxy 处理 close-proxy 消息：停止入口接收并清理登记。
+//
+// 活动连接按代排水语义自然结束；只允许代理属主关闭自己的代理。
+func (engine *Engine) handleCloseProxy(gen *generation, conn *transport.Conn, clientID string, payload []byte) {
+	var request struct {
+		ProxyName string `json:"proxyName"`
+	}
+	if err := json.Unmarshal(payload, &request); err != nil || request.ProxyName == "" {
+		engine.writeProxyResponse(conn, proxyOperationResponse{OK: false, Error: ErrProxyFieldInvalid.Error()})
+		return
+	}
+
+	engine.mu.Lock()
+	proxyEntry, ok := gen.runtimeProxies[request.ProxyName]
+	if !ok || proxyEntry.clientID != clientID {
+		engine.mu.Unlock()
+		engine.writeProxyResponse(conn, proxyOperationResponse{OK: false, Error: ErrProxyNameConflict.Error()})
+		return
+	}
+	listener := proxyEntry.listener
+	delete(gen.runtimeProxies, request.ProxyName)
+	delete(gen.guestLns, request.ProxyName)
+	delete(gen.guestAddr, request.ProxyName)
+
+	merged := make(proxy.Registry)
+	for name, binding := range gen.engine.registry.Current() {
+		if name != request.ProxyName {
+			merged[name] = binding
+		}
+	}
+	gen.engine.registry.Publish(merged)
+	engine.mu.Unlock()
+
+	// 停止接收：与 stopAccepting 同一语义，但不走代的整体排水。
+	_ = listener.Release()
+
+	engine.writeProxyResponse(conn, proxyOperationResponse{OK: true})
+	engine.log().Info("运行时代理已关闭", "代理", request.ProxyName, "客户端", clientID)
+}
+
+// checkRuntimeProxyConflicts 校验名称与端口的运行期冲突。
+func (engine *Engine) checkRuntimeProxyConflicts(gen *generation, clientID string, request runtimeProxyRequest) error {
+	current := gen.engine.registry.Current()
+	if _, exists := current[request.ProxyName]; exists {
+		return ErrProxyNameConflict
+	}
+	// 端口冲突：检查当前代所有入口的绑定端口（快照入口 + 运行时入口）。
+	for _, addr := range gen.guestAddr {
+		if resolved, err := netip.ParseAddrPort(addr.String()); err == nil && resolved.Port() == uint16(request.RemotePort) {
+			return ErrProxyPortConflict
+		}
+	}
+	_ = clientID
+	return nil
+}
+
+// writeProxyResponse 写出代理操作响应帧。
+func (engine *Engine) writeProxyResponse(conn *transport.Conn, response proxyOperationResponse) {
+	body, err := json.Marshal(response)
+	if err != nil {
+		return
+	}
+	frame, frameErr := wire.EncodeV1Frame(wire.Frame{Type: wire.MessageTypeNewProxyResponse, Payload: body})
+	if frameErr != nil {
+		return
+	}
+	_, _ = conn.Write(frame)
+}
+
+// runtimeProxy 是一条运行时注册代理的会话级登记。
+type runtimeProxy struct {
+	name     string
+	clientID string
+	listener *transport.Listener
+}
+
+// cleanupRuntimeProxiesForClient 释放指定客户端注册的运行时代理。
+//
+// clientID 为空串表示清理全部会话的注册；控制会话结束时由 login 分支的
+// defer 调用，传入该会话的客户端标识。
+func (gen *generation) cleanupRuntimeProxiesForClient(clientID string) {
+	gen.engine.mu.Lock()
+	names := make([]string, 0, len(gen.runtimeProxies))
+	for name, entry := range gen.runtimeProxies {
+		if clientID != "" && entry.clientID != clientID {
+			continue
+		}
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		gen.engine.mu.Unlock()
+		return
+	}
+	merged := make(proxy.Registry)
+	for name, binding := range gen.engine.registry.Current() {
+		if _, runtime := gen.runtimeProxies[name]; !runtime {
+			merged[name] = binding
+		}
+	}
+	for _, name := range names {
+		_ = gen.runtimeProxies[name].listener.Release()
+		delete(gen.runtimeProxies, name)
+		delete(gen.guestLns, name)
+		delete(gen.guestAddr, name)
+	}
+	gen.engine.registry.Publish(merged)
+	gen.engine.mu.Unlock()
+	gen.engine.log().Info("会话结束，运行时代理已清理", "数量", len(names))
+}

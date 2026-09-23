@@ -79,6 +79,12 @@ type generation struct {
 	// 又换了别的端口"，那时后继代自己会释放。
 	donated map[string]bool
 
+	// runtimeProxies 是本代内经消息族运行时注册的代理（FR-03）。
+	//
+	// 与快照预建入口分账管理：注册与清理都发生在会话生命周期内，不写 desired。
+	// 读写都取 Engine 锁；代清理（cleanupRuntimeProxies）与 close-proxy 共用。
+	runtimeProxies map[string]*runtimeProxy
+
 	// acceptWG 跟踪本代的入口接收循环（流入口与 UDP 入口各一个）。
 	//
 	// 与 wg 分开：交接只等"停止接收"这一段，不能连在途桥接一起等，否则 publish
@@ -101,7 +107,9 @@ func newGeneration(engine *Engine, revision uint64, config core.ServerConfig) *g
 		revision: revision,
 		conns:    make(map[*transport.Conn]struct{}),
 		reused:   make(map[string]bool),
-		donated:  make(map[string]bool),
+
+		runtimeProxies: make(map[string]*runtimeProxy),
+		donated:        make(map[string]bool),
 	}
 }
 
@@ -948,6 +956,8 @@ func (engine *Engine) handleControl(gen *generation, raw *transport.Conn) {
 		_ = json.Unmarshal(first.Payload, &request)
 		first.Release()
 		engine.trackControlClient(raw, request.ClientID)
+		// 会话级清理（FR-03）：该连接上注册的运行时代理随会话结束释放。
+		defer gen.cleanupRuntimeProxiesForClient(request.ClientID)
 		engine.events.Publish(core.ClientConnected{
 			ClientID:   request.ClientID,
 			RemoteAddr: raw.RemoteAddr().String(),
@@ -963,11 +973,16 @@ func (engine *Engine) handleControl(gen *generation, raw *transport.Conn) {
 	}
 }
 
-// serveControlLoop 在已登录的控制连接上处理心跳，直到连接结束。
+// serveControlLoop 在已登录的控制连接上处理心跳与代理管理消息，直到连接结束。
 //
 // 心跳中断或未知帧都视为异常终止：记录首个异常错误并关闭 Done，
 // 使宿主可通过 Err() 判定。正常 Shutdown 不经过本路径。
 func (engine *Engine) serveControlLoop(gen *generation, conn *transport.Conn, guard *wire.ConnectionGuard) {
+	clientID := ""
+	engine.mu.Lock()
+	clientID = engine.controlClients[conn]
+	engine.mu.Unlock()
+
 	for {
 		frame, err := guard.ReadFrame()
 		if err != nil {
@@ -981,6 +996,12 @@ func (engine *Engine) serveControlLoop(gen *generation, conn *transport.Conn, gu
 				engine.failAbnormal(gen, err)
 				return
 			}
+		case "new-proxy":
+			engine.handleNewProxy(gen, conn, clientID, frame.Payload)
+			frame.Release()
+		case "close-proxy":
+			engine.handleCloseProxy(gen, conn, clientID, frame.Payload)
+			frame.Release()
 		default:
 			frame.Release()
 			engine.failAbnormal(gen, errors.New("控制连接收到未知帧"))

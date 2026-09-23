@@ -57,6 +57,16 @@ func (view *RegistryView) Publish(registry Registry) {
 	view.registry = registry
 }
 
+// Current 返回注册表的当前完整快照（引用共享，调用方不得修改）。
+//
+// 供增量并入场景读取全表：运行时代理注册（FR-03）在既有快照表上追加条目后
+// 整体发布，保持「整表替换」的原子语义。
+func (view *RegistryView) Current() Registry {
+	view.mu.RLock()
+	defer view.mu.RUnlock()
+	return view.registry
+}
+
 // Binding 返回指定代理的绑定；未注册时返回 nil。
 func (view *RegistryView) Binding(name string) *Binding {
 	view.mu.RLock()
