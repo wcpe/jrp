@@ -146,7 +146,7 @@ func serveFakeControlConn(conn net.Conn) {
 		if frame.Type.Name == wire.MessageTypeLogin.Name {
 			encoded, encodeErr := wire.EncodeV1Frame(wire.Frame{
 				Type:    wire.MessageTypeLoginResponse,
-				Payload: []byte(`{"ok":true}`),
+				Payload: []byte(`{"run_id":"test-run"}`),
 			})
 			if encodeErr != nil {
 				frame.Release()

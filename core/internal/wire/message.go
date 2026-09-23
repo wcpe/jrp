@@ -25,13 +25,13 @@ var (
 	MessageTypeNewProxy = MessageType{Name: "new-proxy", V1Byte: 'p', V2ID: 3}
 	// MessageTypeNewProxyResponse 是新建代理响应消息。
 	MessageTypeNewProxyResponse = MessageType{Name: "new-proxy-response", V1Byte: '2', V2ID: 4}
-	// MessageTypeCloseProxy 是关闭代理消息。
-	MessageTypeCloseProxy = MessageType{Name: "close-proxy", V1Byte: 'b', V2ID: 5}
-	// MessageTypeCloseProxyResponse 是关闭代理响应消息。
-	MessageTypeCloseProxyResponse = MessageType{Name: "close-proxy-response", V1Byte: '5', V2ID: 7}
+	// MessageTypeCloseProxy 是关闭代理消息。官方协议不为它定义响应消息。
+	MessageTypeCloseProxy = MessageType{Name: "close-proxy", V1Byte: 'c', V2ID: 5}
 	// MessageTypeNewWorkConn 是新工作连接消息。
 	MessageTypeNewWorkConn = MessageType{Name: "new-work-conn", V1Byte: 'w', V2ID: 6}
-	// MessageTypeStartWorkConn 是启动工作连接消息。
+	// MessageTypeReqWorkConn 是请求工作连接消息（服务端发起）。
+	MessageTypeReqWorkConn = MessageType{Name: "req-work-conn", V1Byte: 'r', V2ID: 7}
+	// MessageTypeStartWorkConn 是启动工作连接消息：服务端向新工作连接指派代理与源/目标摘要。
 	MessageTypeStartWorkConn = MessageType{Name: "start-work-conn", V1Byte: 's', V2ID: 8}
 	// MessageTypePing 是心跳消息。
 	MessageTypePing = MessageType{Name: "ping", V1Byte: 'h', V2ID: 11}
@@ -48,8 +48,8 @@ var supportedMessageTypes = []MessageType{
 	MessageTypeNewProxy,
 	MessageTypeNewProxyResponse,
 	MessageTypeCloseProxy,
-	MessageTypeCloseProxyResponse,
 	MessageTypeNewWorkConn,
+	MessageTypeReqWorkConn,
 	MessageTypeStartWorkConn,
 	MessageTypePing,
 	MessageTypePong,

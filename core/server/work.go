@@ -308,7 +308,10 @@ func (broker *workBroker) closeStaged() {
 type workConnRequest struct {
 	ClientID string `json:"client_id"`
 	Token    string `json:"token"`
-	RunID    string `json:"run_id"`
-	Proxy    string `json:"proxy_name"`
-	Target   string `json:"target_addr"`
+	// Timestamp 是官方鉴权材料的组成部分：官方 frpc 送 md5(token ∥ timestamp)，
+	// 服务端复算需要同一时间戳。过渡形态下 jrpc 的明文材料不使用它。
+	Timestamp int64  `json:"timestamp"`
+	RunID     string `json:"run_id"`
+	Proxy     string `json:"proxy_name"`
+	Target    string `json:"target_addr"`
 }

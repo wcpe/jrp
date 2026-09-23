@@ -11,10 +11,10 @@ func TestLoginChainRejectsTokenMismatch(t *testing.T) {
 	digest := DigestToken("real-secret")
 	gen := &generation{config: mustCredentialConfig(t, "c1", digest)}
 
-	if gen.credentialsMatch("c1", "wrong-secret") {
+	if gen.credentialsMatch("c1", "wrong-secret", 0) {
 		t.Fatal("错误明文不应通过摘要比较")
 	}
-	if gen.credentialsMatch("c1", "") {
+	if gen.credentialsMatch("c1", "", 0) {
 		t.Fatal("空 token 不应通过")
 	}
 }
@@ -24,8 +24,28 @@ func TestLoginChainAcceptsDigestMatch(t *testing.T) {
 	digest := DigestToken("real-secret")
 	gen := &generation{config: mustCredentialConfig(t, "c1", digest)}
 
-	if !gen.credentialsMatch("c1", "real-secret") {
+	if !gen.credentialsMatch("c1", "real-secret", 0) {
 		t.Fatal("正确明文应通过摘要比较")
+	}
+}
+
+// 官方链：官方 frpc 送 md5(token ∥ timestamp)，服务端用快照里的明文复算比对。
+//
+// 只有配置了兼容明文材料的客户端才走这条链；材料是官方协议的既定算法，
+// 时间戳参与其中，因此同一 token 在不同时间戳下材料不同。
+func TestLoginChainAcceptsOfficialPrivilegeKey(t *testing.T) {
+	gen := &generation{config: mustCredentialConfigWithCompat(t, "c1", DigestToken("real-secret"), "real-secret")}
+	timestamp := time.Now().Unix()
+
+	official := officialPrivilegeKey("real-secret", timestamp)
+	if !gen.credentialsMatch("c1", official, timestamp) {
+		t.Fatal("官方鉴权材料应通过兼容链")
+	}
+	if gen.credentialsMatch("c1", official, timestamp+1) {
+		t.Fatal("时间戳不匹配的官方材料不应通过")
+	}
+	if gen.credentialsMatch("c1", officialPrivilegeKey("other-secret", timestamp), timestamp) {
+		t.Fatal("明文不匹配的官方材料不应通过")
 	}
 }
 
@@ -34,7 +54,7 @@ func TestLoginChainRejectsUnknownClient(t *testing.T) {
 	digest := DigestToken("real-secret")
 	gen := &generation{config: mustCredentialConfig(t, "c1", digest)}
 
-	if gen.credentialsMatch("ghost", DigestToken("real-secret")) {
+	if gen.credentialsMatch("ghost", DigestToken("real-secret"), 0) {
 		t.Fatal("未知客户端不应通过")
 	}
 }

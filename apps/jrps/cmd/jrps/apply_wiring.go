@@ -19,10 +19,10 @@ const dataPlaneListenPort = store.DefaultControlListenPort
 
 // storeCredentials 从 jrps 数据库组装数据面凭证集合（apply.CredentialProvider）。
 //
-// 摘要桥接（FR-03 §3.4 已收口）：登录校验链把请求明文在服务端转为 SHA-256 摘要
-// 后与快照内的摘要恒定时间比较——因此快照凭证的 Token 字段直接承载客户端表的
-// `TokenDigest` 列。真源始终是摘要（FR-07），明文不落库、不经快照传递；官方 frpc
-// 与 jrpc 均以明文登录、由服务端摘要后比对，两个客户端体系共用同一条校验链。
+// 双链装配（FR-03 §3.4）：摘要列（TokenDigest）供 jrpc 的摘要链使用——客户端送
+// 明文、服务端摘要后恒定时间比较；兼容明文列（TokenCompat）供官方 frpc 使用——
+// 官方客户端只送 md5(token ∥ 时间戳)，服务端必须持有明文才能复算。两条链共用
+// 同一条兼容消息路径，管理面与日志一律只展示摘要前缀。
 type storeCredentials struct {
 	store *store.Store
 }
@@ -34,15 +34,16 @@ type storeCredentials struct {
 func (provider storeCredentials) DataPlaneCredentials(ctx context.Context) ([]core.ClientCredential, error) {
 	var credentials []core.ClientCredential
 	err := provider.store.View(ctx, func(tx *store.Tx) error {
-		digests, err := tx.ActiveClientDigests()
+		materials, err := tx.ActiveClientCredentials()
 		if err != nil {
 			return err
 		}
-		credentials = make([]core.ClientCredential, 0, len(digests))
-		for clientID, digest := range digests {
+		credentials = make([]core.ClientCredential, 0, len(materials))
+		for clientID, material := range materials {
 			credentials = append(credentials, core.ClientCredential{
-				ClientID: clientID,
-				Token:    digest,
+				ClientID:    clientID,
+				Token:       material.Digest,
+				CompatToken: material.CompatToken,
 			})
 		}
 		return nil
@@ -78,7 +79,9 @@ func startEngine(ctx context.Context, logger *slog.Logger) (*server.Engine, erro
 		_ = listener.Close()
 		return nil, fmt.Errorf("构造引擎初始配置失败：%w", err)
 	}
-	engine := server.New(initialConfig, server.WithListener(listener))
+	// 引擎日志注入宿主日志器：连接级拒绝（版本判定、协商、登录、心跳失活）
+	// 此前无处可查，排障只能靠抓包。
+	engine := server.New(initialConfig, server.WithListener(listener), server.WithLogger(logger))
 	if err := engine.Start(ctx); err != nil {
 		_ = listener.Close()
 		return nil, fmt.Errorf("引擎启动失败：%w", err)

@@ -12,7 +12,11 @@ import (
 // encodeTestLogin 构造登录帧（测试辅助）。
 func encodeTestLogin(t *testing.T, clientID, token string) []byte {
 	t.Helper()
-	body, err := json.Marshal(map[string]string{"clientID": clientID, "token": token})
+	body, err := json.Marshal(map[string]any{
+		"client_id":     clientID,
+		"privilege_key": token,
+		"timestamp":     time.Now().Unix(),
+	})
 	if err != nil {
 		t.Fatalf("编码登录失败：%v", err)
 	}
@@ -38,7 +42,7 @@ func readLoginResponse(t *testing.T, raw net.Conn) {
 	if err := json.Unmarshal(frame.Payload, &response); err != nil {
 		t.Fatalf("解析登录响应失败：%v", err)
 	}
-	if !response.OK {
+	if response.Error != "" {
 		t.Fatalf("登录被拒：%s", response.Error)
 	}
 }
@@ -65,7 +69,7 @@ func encodeTestNewProxy(t *testing.T, name, proxyType string, remotePort int, ta
 // encodeTestCloseProxy 构造 close-proxy 帧（测试辅助）。
 func encodeTestCloseProxy(t *testing.T, name string) []byte {
 	t.Helper()
-	body, err := json.Marshal(map[string]string{"proxyName": name})
+	body, err := json.Marshal(map[string]string{"proxy_name": name})
 	if err != nil {
 		t.Fatalf("编码关闭失败：%v", err)
 	}

@@ -29,10 +29,14 @@ func openV2TestSession(t *testing.T, listener net.Listener, clientID, token stri
 	session := &v2TestSession{t: t, raw: raw, reader: wire.NewV2Reader(raw, wire.DefaultV2PayloadLimit)}
 	session.writeHello([]string{wire.CodecJSON})
 	session.readServerHello()
-	session.writeMessage(wire.MessageTypeLogin, map[string]string{"clientID": clientID, "token": token})
+	session.writeMessage(wire.MessageTypeLogin, map[string]any{
+		"client_id":     clientID,
+		"privilege_key": token,
+		"timestamp":     time.Now().Unix(),
+	})
 	var response loginResponsePayload
 	session.readMessage(wire.MessageTypeLoginResponse, &response)
-	if !response.OK {
+	if response.Error != "" {
 		t.Fatalf("v2 登录被拒：%s", response.Error)
 	}
 	return session

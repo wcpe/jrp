@@ -74,12 +74,12 @@ func (s *testSession) registerProxy(name string, remotePort int, target netip.Ad
 }
 
 // closeProxy 关闭一个代理。
+//
+// 官方协议不为 close-proxy 定义响应：客户端只发送，关闭结果由入口状态变化体现。
 func (s *testSession) closeProxy(name string) error {
 	s.t.Helper()
-	if _, err := s.raw.Write(encodeTestCloseProxy(s.t, name)); err != nil {
-		return err
-	}
-	return readTestProxyResponse(s.t, s.raw, 5*time.Second)
+	_, err := s.raw.Write(encodeTestCloseProxy(s.t, name))
+	return err
 }
 
 // registerProxyOfTypeForTest 在一次性会话上注册指定类型的代理。

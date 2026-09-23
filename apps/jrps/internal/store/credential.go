@@ -163,13 +163,16 @@ func (tx *Tx) RedeemEnrollmentCredential(secret string) (ClientView, string, err
 		updates := map[string]any{
 			"enrollment_state": EnrollmentStateActive,
 			"token_digest":     DigestToken(issued),
-			"updated_at":       now,
+			// 兼容明文随本次发放写入：官方 frpc 的鉴权材料复算需要它。
+			"token_compat": issued,
+			"updated_at":   now,
 		}
 		if err := tx.db.Model(&Client{}).Where("id = ?", client.ID).Updates(updates).Error; err != nil {
 			return fmt.Errorf("更新客户端失败：%w", translateSQLError(err))
 		}
 		client.EnrollmentState = EnrollmentStateActive
 		client.TokenDigest = DigestToken(issued)
+		client.TokenCompat = issued
 		return tx.writeAudit(AuditEvent{
 			ActorType:  ActorTypeClient,
 			ActorID:    client.ID,
@@ -214,14 +217,17 @@ func (tx *Tx) RotateClientToken(clientID string) (ClientView, string, error) {
 		token = issued
 		now := time.Now().UTC()
 		// 摘要覆写即旧 token 失效：查询按摘要唯一索引命中，旧摘要不再匹配任何行。
+		// 兼容明文与摘要同事务覆写，避免出现"官方链仍接受旧 token"的窗口。
 		updates := map[string]any{
 			"token_digest": DigestToken(issued),
+			"token_compat": issued,
 			"updated_at":   now,
 		}
 		if err := tx.db.Model(&Client{}).Where("id = ?", client.ID).Updates(updates).Error; err != nil {
 			return fmt.Errorf("轮换 token 失败：%w", translateSQLError(err))
 		}
 		client.TokenDigest = DigestToken(issued)
+		client.TokenCompat = issued
 		if err := tx.writeAudit(AuditEvent{
 			ActorType:  ActorTypeAdmin,
 			ActorID:    "admin",

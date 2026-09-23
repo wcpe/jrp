@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"crypto/md5"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1049,7 +1052,7 @@ func (engine *Engine) serveControlLoop(gen *generation, session sessionWriter, g
 			engine.handleNewProxy(gen, session, clientID, frame.Payload)
 			frame.Release()
 		case "close-proxy":
-			engine.handleCloseProxy(gen, session, clientID, frame.Payload)
+			engine.handleCloseProxy(gen, clientID, frame.Payload)
 			frame.Release()
 		default:
 			frame.Release()
@@ -1209,7 +1212,7 @@ func (engine *Engine) serveWorkDeclaration(gen *generation, raw *transport.Conn,
 		_ = raw.Close()
 		return
 	}
-	if !gen.credentialsMatch(declaration.clientID, declaration.token) {
+	if !gen.credentialsMatch(declaration.clientID, declaration.token, declaration.timestamp) {
 		engine.log().Warn("工作连接的鉴权材料无效，已拒绝")
 		_ = raw.Close()
 		return
@@ -1257,31 +1260,50 @@ func (engine *Engine) serveWorkDeclaration(gen *generation, raw *transport.Conn,
 	}
 }
 
-// credentialsMatch 判断客户端标识与令牌是否与服务端配置的凭据一致。
-func (gen *generation) credentialsMatch(clientID, token string) bool {
-	if clientID == "" || token == "" {
+// credentialsMatch 判断客户端鉴权材料是否与服务端快照凭证匹配（FR-03 §3.4）。
+//
+// 两条链共存（同一条兼容消息路径，两种客户端形态）：
+//   - 摘要链：jrpc 送 token 明文，服务端在本地转 SHA-256 摘要后与快照摘要恒定
+//     时间比较；
+//   - 官方链：官方 frpc 送 `md5(token + 十进制时间戳)` 的摘要前处理材料，服务端
+//     必须持有 token 明文才能复算比对（快照的 CompatToken 字段）。
+//
+// 任一条通过即通过；失败时不区分是哪条链的哪一环，避免泄漏校验进度。
+func (gen *generation) credentialsMatch(clientID, material string, timestamp int64) bool {
+	if clientID == "" || material == "" {
 		return false
 	}
-	// 快照凭证集合持有摘要（SHA-256 hex）；请求携带的明文在本地转摘要后
-	// 恒定时间比较（FR-03 §3.4）。比较耗时差异不再随匹配进度变化。
-	provided := DigestToken(token)
+	provided := DigestToken(material)
 	for _, credential := range gen.config.Credentials() {
 		if credential.ClientID != clientID {
 			continue
 		}
-		if digestEqual(provided, credential.Token) {
+		if credential.Token != "" && digestEqual(provided, credential.Token) {
+			return true
+		}
+		if credential.CompatToken != "" && digestEqual(officialPrivilegeKey(credential.CompatToken, timestamp), material) {
 			return true
 		}
 	}
 	return false
 }
 
+// officialPrivilegeKey 复算官方 frpc 的鉴权材料：md5(token ∥ 十进制时间戳) 的十六进制。
+//
+// 这里使用 MD5 不是为了自身安全性，而是官方协议既定的线上算法：材料只做一次性
+// 比对、不落库、不派生任何后续密钥，服务端只按官方语义复算以完成互操作。
+func officialPrivilegeKey(token string, timestamp int64) string {
+	sum := md5.Sum([]byte(token + strconv.FormatInt(timestamp, 10))) //nolint:gosec // 兼容官方协议的线上算法
+	return hex.EncodeToString(sum[:])
+}
+
 // workDeclaration 是一条工作连接声明的解出结果。
 type workDeclaration struct {
-	clientID string
-	token    string
-	proxy    string
-	target   netip.AddrPort
+	clientID  string
+	token     string
+	timestamp int64
+	proxy     string
+	target    netip.AddrPort
 }
 
 // parseWorkDeclaration 解析工作连接声明载荷，返回代理归属与本地目标地址。
@@ -1304,49 +1326,83 @@ func parseWorkDeclaration(payload []byte) (workDeclaration, error) {
 		return workDeclaration{}, errors.New("工作连接声明的目标地址不可解析")
 	}
 	return workDeclaration{
-		clientID: request.ClientID,
-		token:    request.Token,
-		proxy:    request.Proxy,
-		target:   target,
+		clientID:  request.ClientID,
+		token:     request.Token,
+		timestamp: request.Timestamp,
+		proxy:     request.Proxy,
+		target:    target,
 	}, nil
 }
 
-// loginPayload 是 wire v1 登录载荷的最小形态。
+// loginPayload 是登录载荷。
+//
+// 字段名与官方兼容消息族一致（FR-03 §3.3：官方 frpc 与 jrpc 共用同一条协议
+// 路径）：官方形状为 {version, hostname, os, arch, user, privilege_key,
+// timestamp, run_id, client_id, metas, client_spec, pool_count}，服务端只取
+// 鉴权与身份所需的字段；未知字段一律忽略。
 type loginPayload struct {
-	ClientID string `json:"clientID"`
-	Token    string `json:"token"`
+	// ClientID 是客户端标识，官方字段名 client_id。
+	ClientID string `json:"client_id"`
+	// Token 是独立 token 明文，官方字段名 privilege_key。
+	Token string `json:"privilege_key"`
+	// RunID 是本轮连接的运行 ID；官方 frpc 首次登录为空，由服务端分配。
+	RunID string `json:"run_id"`
+	// Timestamp 是鉴权时间材料（Unix 秒，官方语义）。
+	Timestamp int64 `json:"timestamp"`
+	// Version 是客户端版本号，仅用于诊断与日志。
+	Version string `json:"version"`
 }
 
-// loginResponsePayload 是登录响应载荷的最小形态。
+// loginResponsePayload 是登录响应载荷。
+//
+// 官方形状为 {version, run_id, error}：对端以「error 为空」判定成功，成功后
+// 采用响应里的 run_id 作为本会话运行 ID。未知字段被对端忽略，但这里不做多余承诺。
 type loginResponsePayload struct {
-	OK    bool   `json:"ok"`
-	Error string `json:"error,omitempty"`
+	Version string `json:"version,omitempty"`
+	RunID   string `json:"run_id,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 // handleLogin 校验客户端凭证并回复登录结果。
 //
 // 校验链当前阶段：凭证摘要比较（FR-03 §3.4）。快照凭证持有摘要，请求明文
 // 在本地转摘要后恒定时间比较；客户端状态、时间窗口与重放边界由登录链
-// （loginChain）逐步接入。
+// （loginChain）逐步接入。成功后由服务端分配运行 ID 并回写。
 func (gen *generation) handleLogin(session sessionWriter, payload []byte) error {
 	var request loginPayload
 	if err := json.Unmarshal(payload, &request); err != nil {
-		_ = gen.writeLoginResponse(session, false, "登录载荷非法")
+		_ = gen.writeLoginResponse(session, "", "登录载荷非法")
 		return err
 	}
-	if !gen.credentialsMatch(request.ClientID, request.Token) {
-		_ = gen.writeLoginResponse(session, false, "鉴权未通过")
+	if !gen.credentialsMatch(request.ClientID, request.Token, request.Timestamp) {
+		_ = gen.writeLoginResponse(session, "", "鉴权未通过")
 		return errors.New("服务端拒绝客户端登录")
 	}
-	if err := gen.writeLoginResponse(session, true, ""); err != nil {
+	runID := request.RunID
+	if runID == "" {
+		// 客户端首次登录不带运行 ID：由服务端分配，后续工作连接声明要回传它。
+		runID = newSessionRunID()
+	}
+	if err := gen.writeLoginResponse(session, runID, ""); err != nil {
 		return err
 	}
 	return nil
 }
 
-// writeLoginResponse 写出登录响应帧。
-func (gen *generation) writeLoginResponse(session sessionWriter, ok bool, message string) error {
-	response := loginResponsePayload{OK: ok, Error: message}
+// newSessionRunID 生成一次控制会话的运行 ID。
+func newSessionRunID() string {
+	buffer := make([]byte, 16)
+	if _, err := rand.Read(buffer); err != nil {
+		// 随机源不可用时退化为时间派生值：运行 ID 用于会话内配对与重放边界，
+		// 不是密钥材料，退化不影响鉴权强度。
+		return strconv.FormatInt(time.Now().UnixNano(), 16)
+	}
+	return hex.EncodeToString(buffer)
+}
+
+// writeLoginResponse 写出登录响应帧；failure 为空表示登录成功。
+func (gen *generation) writeLoginResponse(session sessionWriter, runID, failure string) error {
+	response := loginResponsePayload{RunID: runID, Error: failure}
 	body, err := json.Marshal(response)
 	if err != nil {
 		return err

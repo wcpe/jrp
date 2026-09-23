@@ -139,8 +139,14 @@ func (proxy HTTPSProxy) ProxyRemotePort() int { return proxy.RemotePort }
 type ClientCredential struct {
 	// ClientID 是客户端标识。
 	ClientID string
-	// Token 是该客户端的 token 明文；错误、日志与状态快照必须脱敏。
+	// Token 是该客户端 token 的 SHA-256 摘要（十六进制）。快照持有摘要而不是
+	// 明文：错误、日志与状态快照一律脱敏，明文只在宿主存储与客户端配置中存在。
 	Token string
+	// CompatToken 是该客户端 token 的明文，专供官方 frpc 的鉴权材料校验使用：
+	// 官方客户端只发送 `md5(token + 时间戳)` 的摘要前处理材料，服务端必须持有
+	// 明文才能复算比对（FR-03 规格登记的兼容例外）。为空表示该客户端只接受
+	// 摘要语义登录（纯 jrpc 场景）。
+	CompatToken string
 }
 
 // BindEndpoint 是服务端的监听端点。

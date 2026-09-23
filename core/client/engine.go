@@ -614,16 +614,26 @@ func (gen *generation) trackedConns() []*transport.Conn {
 	return conns
 }
 
-// clientLogin 是 wire v1 登录载荷的最小形态。
+// clientLogin 是登录载荷。
+//
+// 字段名与官方兼容消息族一致（FR-03 §3.3：官方 frpc 与 jrpc 共用同一条协议
+// 路径）：client_id、privilege_key、timestamp（Unix 秒）、run_id、version。
 type clientLogin struct {
-	ClientID string `json:"clientID"`
-	Token    string `json:"token"`
+	ClientID  string `json:"client_id"`
+	Token     string `json:"privilege_key"`
+	Timestamp int64  `json:"timestamp"`
+	RunID     string `json:"run_id,omitempty"`
+	Version   string `json:"version,omitempty"`
 }
 
-// loginResponse 是登录响应载荷的最小形态。
+// loginResponse 是登录响应载荷的客户端视图。
+//
+// 官方形状为 {version, run_id, error}：error 为空即成功，run_id 是本会话的
+// 运行 ID，工作连接声明要回传它。
 type loginResponse struct {
-	OK    bool   `json:"ok"`
-	Error string `json:"error,omitempty"`
+	Version string `json:"version,omitempty"`
+	RunID   string `json:"run_id,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 // controlSession 封装一条控制连接的读写状态。
@@ -635,6 +645,8 @@ type controlSession struct {
 	done chan struct{}
 
 	mu sync.Mutex
+	// runID 是本会话的运行 ID：登录成功后由服务端分配，工作连接声明需回传它。
+	runID string
 }
 
 // loginControl 在控制连接上完成登录握手。
@@ -647,7 +659,11 @@ func loginControl(ctx context.Context, control *controlSession, config core.Clie
 
 // writeLogin 编码并发送登录帧。
 func (control *controlSession) writeLogin(config core.ClientConfig) error {
-	body, err := json.Marshal(clientLogin{ClientID: config.ClientID(), Token: config.Auth().Token})
+	body, err := json.Marshal(clientLogin{
+		ClientID:  config.ClientID(),
+		Token:     config.Auth().Token,
+		Timestamp: time.Now().Unix(),
+	})
 	if err != nil {
 		return err
 	}
@@ -690,9 +706,13 @@ func (control *controlSession) readLoginResponse(timeout time.Duration) error {
 	if err := json.Unmarshal(frame.Payload, &response); err != nil {
 		return fmt.Errorf("登录响应载荷非法：%w", err)
 	}
-	if !response.OK {
+	if response.Error != "" {
 		return errors.New("服务端拒绝客户端登录")
 	}
+	if response.RunID == "" {
+		return errors.New("登录响应缺少运行 ID")
+	}
+	control.runID = response.RunID
 	return nil
 }
 

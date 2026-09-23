@@ -123,12 +123,15 @@ func (engine *Engine) handleNewProxy(gen *generation, session sessionWriter, cli
 // handleCloseProxy 处理 close-proxy 消息：停止入口接收并清理登记。
 //
 // 活动连接按代排水语义自然结束；只允许代理属主关闭自己的代理。
-func (engine *Engine) handleCloseProxy(gen *generation, session sessionWriter, clientID string, payload []byte) {
+//
+// 官方协议不为 close-proxy 定义响应：这里只在服务端侧清理，不向对端回写任何帧
+// ——官方 frpc 的读循环遇到预期之外的消息会报错，回写响应会直接打断它的会话。
+func (engine *Engine) handleCloseProxy(gen *generation, clientID string, payload []byte) {
 	var request struct {
-		ProxyName string `json:"proxyName"`
+		ProxyName string `json:"proxy_name"`
 	}
 	if err := json.Unmarshal(payload, &request); err != nil || request.ProxyName == "" {
-		engine.writeProxyResponse(session, proxyOperationResponse{OK: false, Error: ErrProxyFieldInvalid.Error()})
+		engine.log().Warn("关闭代理载荷非法", "客户端", clientID)
 		return
 	}
 
@@ -136,7 +139,7 @@ func (engine *Engine) handleCloseProxy(gen *generation, session sessionWriter, c
 	proxyEntry, ok := gen.runtimeProxies[request.ProxyName]
 	if !ok || proxyEntry.clientID != clientID {
 		engine.mu.Unlock()
-		engine.writeProxyResponse(session, proxyOperationResponse{OK: false, Error: ErrProxyNameConflict.Error()})
+		engine.log().Warn("关闭代理被拒绝：代理不存在或不属于该客户端", "代理", request.ProxyName, "客户端", clientID)
 		return
 	}
 	listener := proxyEntry.listener
@@ -156,7 +159,6 @@ func (engine *Engine) handleCloseProxy(gen *generation, session sessionWriter, c
 	// 停止接收：与 stopAccepting 同一语义，但不走代的整体排水。
 	_ = listener.Release()
 
-	engine.writeProxyResponse(session, proxyOperationResponse{OK: true})
 	engine.log().Info("运行时代理已关闭", "代理", request.ProxyName, "客户端", clientID)
 }
 
