@@ -1466,6 +1466,7 @@ func (gen *generation) enableV2ControlCipher(guard *wire.ConnectionGuard, sessio
 	if !ok {
 		return errors.New("v2 协商记录不完整，无法派生控制通道密钥")
 	}
+	gen.engine.log().Info("v2 协商记录", "客户端", clientID, "transcript", fmt.Sprintf("%x", transcript))
 	readKey, err := wire.DeriveV2ControlKey(token, wire.V2CipherAlgorithmAES256GCM, wire.V2DirectionClientToServer, transcript)
 	if err != nil {
 		return err

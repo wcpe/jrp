@@ -184,6 +184,8 @@ type v2AEADReader struct {
 	streamNonce []byte
 	nonce       []byte
 	pending     []byte
+	// frameCount 记录已成功解出的帧数，仅用于诊断。
+	frameCount uint64
 }
 
 // Read 按帧解密；帧边界上的 EOF 视为正常结束。
@@ -228,9 +230,12 @@ func (reader *v2AEADReader) readFrame() error {
 
 	plaintext, err := reader.aead.Open(nil, reader.nonce, ciphertext, aad)
 	if err != nil {
-		return fmt.Errorf("v2 帧认证失败：%w", err)
+		// 流随机数是双方对齐状态的直接指纹：认证失败时带上它，便于与对端记录
+		// 的实际字节序列对照，判断是密钥不一致还是流位置漂移。
+		return fmt.Errorf("v2 帧认证失败（流随机数=%x 帧号=%d）：%w", reader.streamNonce, reader.frameCount, err)
 	}
 	incrementV2Nonce(reader.nonce)
+	reader.frameCount++
 	reader.pending = plaintext
 	return nil
 }
