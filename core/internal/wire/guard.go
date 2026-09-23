@@ -390,6 +390,29 @@ func (guard *ConnectionGuard) PeekV2FirstFrameType() (uint16, error) {
 	return binary.BigEndian.Uint16(header[0:2]), nil
 }
 
+// BindV2PlainReader 在未协商的 v2 连接上绑定明文消息读取器。
+//
+// 客户端建立的工作连接只发版本魔数后直接发消息帧：它既不参与 hello 协商，
+// 也不启用 AEAD，因此协商路径建立的读取器对它不存在。宿主在判定连接种类后
+// 调用本方法为该连接绑定明文读取器，其后的读取与 v1 的明文语义一致。
+func (guard *ConnectionGuard) BindV2PlainReader() error {
+	if err := guard.requireVersion(VersionV2); err != nil {
+		return err
+	}
+	guard.mu.Lock()
+	stream := guard.reader
+	guard.mu.Unlock()
+	if stream == nil {
+		return protocolError(CategoryTransportFailure, StageMessage, "v2 预读流尚未绑定")
+	}
+	reader := NewV2Reader(stream, DefaultV2PayloadLimit)
+	reader.SetPool(guard.pool)
+	guard.mu.Lock()
+	guard.v2 = reader
+	guard.mu.Unlock()
+	return nil
+}
+
 // EnableV2Cipher 在 v2 连接上把消息读取切换到分帧 AEAD 通道。
 //
 // 切换前提是登录握手已完成（登录消息与其响应在 v2 下同样是明文）；调用后读取器

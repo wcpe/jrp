@@ -986,6 +986,7 @@ func (engine *Engine) handleControl(gen *generation, raw *transport.Conn) {
 		engine.closeSession(raw, "版本检测失败", err)
 		return
 	}
+	engine.log().Info("版本判定完成", "来源", raw.RemoteAddr().String(), "版本", string(version))
 	// v2 连接先完成协商（hello 往返）再进入消息阶段（FR-03 §3.4/§4.2）：
 	// 协商失败必须失败，不静默降级到 v1。
 	if version == wire.VersionV2 {
@@ -996,6 +997,7 @@ func (engine *Engine) handleControl(gen *generation, raw *transport.Conn) {
 			engine.closeSession(raw, "v2 首帧类型探测失败", peekErr)
 			return
 		}
+		engine.log().Info("v2 首帧类型", "来源", raw.RemoteAddr().String(), "类型", firstFrameType)
 		if firstFrameType == wire.V2FrameTypeMessage {
 			engine.serveV2WorkConn(gen, raw, guard)
 			return
@@ -1054,7 +1056,8 @@ func (engine *Engine) handleControl(gen *generation, raw *transport.Conn) {
 		})
 		engine.serveControlLoop(gen, session, guard, request.ClientID)
 	case "new-work-conn":
-		engine.serveWorkDeclaration(gen, raw, first.Payload)
+		// 走到这里的都是 v1 工作连接：v2 的连接在入口已按首帧类型分流。
+		engine.serveWorkDeclaration(gen, raw, first.Payload, wire.VersionV1)
 		first.Release()
 	default:
 		first.Release()
@@ -1267,7 +1270,7 @@ func (engine *Engine) failAbnormal(gen *generation, err error) {
 // 归属 → 代理归属 → 目标地址允许集合。会话校验先于归属校验，使已退出的控制
 // 会话无法在残留在途的工作连接上继续声明（FR-03 §7.5「过期会话」）；归属校验
 // 先于目标校验，使未认证对端无法借"越权目标"这一分支触碰配对中心。
-func (engine *Engine) serveWorkDeclaration(gen *generation, raw *transport.Conn, payload []byte) {
+func (engine *Engine) serveWorkDeclaration(gen *generation, raw *transport.Conn, payload []byte, version wire.Version) {
 	declaration, err := parseWorkDeclaration(payload)
 	if err != nil {
 		// 声明非法必须可见：静默关闭会让对端只看到"连接被断开"而无从定位。
@@ -1282,7 +1285,7 @@ func (engine *Engine) serveWorkDeclaration(gen *generation, raw *transport.Conn,
 		return
 	}
 	if declaration.official {
-		engine.serveOfficialWorkConn(gen, raw, declaration)
+		engine.serveOfficialWorkConn(gen, raw, declaration, version)
 		return
 	}
 	if matched, _ := gen.credentialsMatch(declaration.clientID, declaration.token, declaration.timestamp); !matched {
@@ -1722,6 +1725,11 @@ func (engine *Engine) pendingProxyFor(gen *generation, clientID string) string {
 // new-work-conn）；它既不参与 hello 协商，也不启用 AEAD。这里读出该帧并按
 // 既有的声明校验与指派流程处理，与 v1 的工作连接语义一致。
 func (engine *Engine) serveV2WorkConn(gen *generation, raw *transport.Conn, guard *wire.ConnectionGuard) {
+	// 工作连接不参与协商，协商路径不会为它建立读取器：这里按明文语义单独绑定。
+	if bindErr := guard.BindV2PlainReader(); bindErr != nil {
+		engine.closeSession(raw, "v2 工作连接读取器绑定失败", bindErr)
+		return
+	}
 	frame, err := guard.ReadFrame()
 	if err != nil {
 		engine.closeSession(raw, "v2 工作连接读取失败", err)
@@ -1733,7 +1741,7 @@ func (engine *Engine) serveV2WorkConn(gen *generation, raw *transport.Conn, guar
 		engine.closeSession(raw, "v2 工作连接首帧类型非法", nil)
 		return
 	}
-	engine.serveWorkDeclaration(gen, raw, frame.Payload)
+	engine.serveWorkDeclaration(gen, raw, frame.Payload, wire.VersionV2)
 }
 
 // serveOfficialWorkConn 处理官方形态的工作连接声明并指派一个代理。
@@ -1741,7 +1749,7 @@ func (engine *Engine) serveV2WorkConn(gen *generation, raw *transport.Conn, guar
 // 顺序与声明式路径同构：会话归属（运行 ID）→ 鉴权材料 → 代理归属（由服务端
 // 在配对这一刻决定）→ 回写 start-work-conn → 交给配对中心。官方对端在收到
 // start-work-conn 后才开始转发，因此指派必须发生在配对之前。
-func (engine *Engine) serveOfficialWorkConn(gen *generation, raw *transport.Conn, declaration workDeclaration) {
+func (engine *Engine) serveOfficialWorkConn(gen *generation, raw *transport.Conn, declaration workDeclaration, version wire.Version) {
 	clientID, _, ok := engine.sessionByRunID(declaration.runID)
 	if !ok {
 		engine.log().Warn("工作连接声明的运行 ID 不属于活跃会话，已拒绝", "运行ID", declaration.runID)
@@ -1774,7 +1782,9 @@ func (engine *Engine) serveOfficialWorkConn(gen *generation, raw *transport.Conn
 		_ = raw.Close()
 		return
 	}
-	encoded, err := wire.EncodeV1Frame(wire.Frame{Type: wire.MessageTypeStartWorkConn, Payload: payload})
+	// 按会话的 wire 版本编码：工作连接的帧格式必须与控制连接一致，v2 下是
+	// 帧头 + 消息类型 ID 的消息帧，v1 下是单字节类型前缀。
+	encoded, err := encodeSessionMessage(version, wire.MessageTypeStartWorkConn, payload)
 	if err != nil {
 		_ = raw.Close()
 		return
