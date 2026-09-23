@@ -26,6 +26,9 @@ func startEngineForRuntimeProxy(t *testing.T) (*Engine, net.Listener) {
 			Transport: core.TransportTCP,
 		}),
 		core.WithWire(core.WireV1),
+		// 短心跳周期：失活窗口收敛到下限 1 秒，失活用例可在秒级内断言；
+		// 其余用例均为毫秒级操作，不受窗口影响。
+		core.WithServerHeartbeat(300*time.Millisecond),
 		core.WithClientCredential(core.ClientCredential{ClientID: "rt", Token: DigestToken("rt-token")}),
 	)
 	if err != nil {

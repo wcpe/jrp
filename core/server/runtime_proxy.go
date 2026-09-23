@@ -102,9 +102,10 @@ func (engine *Engine) handleNewProxy(gen *generation, conn *transport.Conn, clie
 		Targets:       []netip.AddrPort{target},
 	}
 	gen.runtimeProxies[request.ProxyName] = &runtimeProxy{
-		name:     request.ProxyName,
-		clientID: clientID,
-		listener: entry,
+		name:      request.ProxyName,
+		clientID:  clientID,
+		ownerConn: conn,
+		listener:  entry,
 	}
 	gen.guestLns[request.ProxyName] = entry
 	gen.guestAddr[request.ProxyName] = entry.Addr()
@@ -189,21 +190,25 @@ func (engine *Engine) writeProxyResponse(conn *transport.Conn, response proxyOpe
 }
 
 // runtimeProxy 是一条运行时注册代理的会话级登记。
+//
+// ownerConn 是注册它的控制连接：清理按连接归属进行（不是按 clientID）——
+// 同一客户端的新会话接管时，旧会话的清理绝不能误伤新会话刚注册的代理。
 type runtimeProxy struct {
-	name     string
-	clientID string
-	listener *transport.Listener
+	name      string
+	clientID  string
+	ownerConn *transport.Conn
+	listener  *transport.Listener
 }
 
-// cleanupRuntimeProxiesForClient 释放指定客户端注册的运行时代理。
+// cleanupRuntimeProxiesForConn 释放某条控制会话注册的全部运行时代理。
 //
-// clientID 为空串表示清理全部会话的注册；控制会话结束时由 login 分支的
-// defer 调用，传入该会话的客户端标识。
-func (gen *generation) cleanupRuntimeProxiesForClient(clientID string) {
+// 会话结束（正常断开、心跳失活或被新会话替换）时由 handleControl 的 defer
+// 调用；只清理本连接注册的代理，其他会话不受影响（FR-03 §3.4/§3.5）。
+func (gen *generation) cleanupRuntimeProxiesForConn(conn *transport.Conn) {
 	gen.engine.mu.Lock()
 	names := make([]string, 0, len(gen.runtimeProxies))
 	for name, entry := range gen.runtimeProxies {
-		if clientID != "" && entry.clientID != clientID {
+		if entry.ownerConn != conn {
 			continue
 		}
 		names = append(names, name)

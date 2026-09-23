@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -166,6 +167,11 @@ type Engine struct {
 	events *core.EventHub
 	// controlClients 记录控制连接的客户端标识：登录成功时登记，供状态快照聚合。
 	controlClients map[*transport.Conn]string
+	// clientControl 是 clientID → 活跃控制连接的反向索引（FR-03 §3.4）。
+	//
+	// 同一客户端同时只允许一个活跃控制会话：新会话登录时接管索引并关闭旧
+	// 会话；工作连接的"活跃会话归属"校验也读它。
+	clientControl map[string]*transport.Conn
 }
 
 // engineState 是 Engine 的内部状态，切换只在持锁下进行。
@@ -204,6 +210,7 @@ func New(config core.ServerConfig, options ...Option) *Engine {
 		done:           make(chan struct{}),
 		registry:       &proxy.RegistryView{},
 		controlConns:   make(map[*transport.Conn]struct{}),
+		clientControl:  make(map[string]*transport.Conn),
 		heartbeat:      config.Heartbeat(),
 		dialer:         transport.Dialer{Timeout: config.Timeout()},
 		drainTimeout:   config.DrainTimeout(),
@@ -712,19 +719,43 @@ func (engine *Engine) trackControl(conn *transport.Conn) {
 	engine.controlConns[conn] = struct{}{}
 }
 
-// untrackControl 移除一条控制连接及其客户端标识。
+// untrackControl 移除一条控制连接、其客户端标识与会话索引。
+//
+// 会话索引只在仍指向本连接时删除：被新会话替换的旧连接退出时不得抹掉
+// 新会话的索引（FR-03 §3.4 的接管语义）。
 func (engine *Engine) untrackControl(conn *transport.Conn) {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
+	if clientID, ok := engine.controlClients[conn]; ok {
+		if engine.clientControl[clientID] == conn {
+			delete(engine.clientControl, clientID)
+		}
+	}
 	delete(engine.controlConns, conn)
 	delete(engine.controlClients, conn)
 }
 
-// trackControlClient 登记控制连接的客户端标识（登录成功后调用）。
-func (engine *Engine) trackControlClient(conn *transport.Conn, clientID string) {
+// bindControlClient 登记控制连接的客户端标识并返回被替换的旧会话连接。
+//
+// 同一客户端同时只允许一个活跃控制会话（FR-03 §3.4）：新会话提交登录时
+// 接管索引，旧会话连接由调用方关闭。返回 nil 表示没有旧会话。
+func (engine *Engine) bindControlClient(conn *transport.Conn, clientID string) *transport.Conn {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	engine.controlClients[conn] = clientID
+	old := engine.clientControl[clientID]
+	engine.clientControl[clientID] = conn
+	return old
+}
+
+// hasActiveControlSession 报告给定客户端是否有活跃控制会话。
+//
+// 工作连接必须属于活跃会话（FR-03 §3.5/§7.3「过期会话必须拒绝」）：
+// 控制会话关闭后，其残留在途的工作连接声明不得再被接纳。
+func (engine *Engine) hasActiveControlSession(clientID string) bool {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	return engine.clientControl[clientID] != nil
 }
 
 // untrack 移除一条活动连接。
@@ -908,15 +939,6 @@ func (engine *Engine) reportAcceptFatal(gen *generation, listener *transport.Lis
 	engine.failAbnormal(gen, fmt.Errorf("监听 %s 的 Accept 失败：%w", listener.Addr().String(), err))
 }
 
-// handleControl 处理一条控制连接：版本判定 → 登录 → 心跳/工作连接服务。
-//
-// 控制连接只承载登录与心跳；工作连接是独立的 TCP 连接，由客户端主动拨号到
-// 同一监听器建立。两类连接用首帧类型区分：登录帧走控制路径，工作声明帧走
-// 配对路径。
-//
-// 等待组归 Engine 而不是传进来的代：控制连接跨代存活，若计入代的等待组，drain
-// 旧代就会等满排水上限——客户端的控制连接在整个运行期都开着，永远等不到自然
-// 结束，于是每次 Apply 都耗时一个完整上限并白白标记为"排空未完成"。
 func (engine *Engine) handleControl(gen *generation, raw *transport.Conn) {
 	defer engine.controlWG.Done()
 	gen.track(raw)
@@ -930,18 +952,18 @@ func (engine *Engine) handleControl(gen *generation, raw *transport.Conn) {
 	})
 	version, err := guard.DetectVersion(raw)
 	if err != nil {
-		engine.failAbnormal(gen, err)
+		engine.closeSession(raw, "版本检测失败", err)
 		return
 	}
 	if version != wire.VersionV1 {
-		engine.failAbnormal(gen, errors.New("服务端仅接受 wire v1"))
+		engine.closeSession(raw, "wire 版本不被接受", nil)
 		return
 	}
 	// 版本判定已把读取器绑定到回放后的流：用守卫统一入口读取，
 	// 不得重建 V1Reader，否则会重复消费版本判定阶段的预读字节。
 	first, err := guard.ReadFrame()
 	if err != nil {
-		engine.failAbnormal(gen, err)
+		engine.closeSession(raw, "首帧读取失败", err)
 		return
 	}
 	switch first.Type.Name {
@@ -949,51 +971,65 @@ func (engine *Engine) handleControl(gen *generation, raw *transport.Conn) {
 		err := gen.handleLogin(raw, first.Payload)
 		if err != nil {
 			first.Release()
-			engine.failAbnormal(gen, err)
+			engine.closeSession(raw, "登录被拒绝", nil)
 			return
 		}
 		var request loginPayload
 		_ = json.Unmarshal(first.Payload, &request)
 		first.Release()
-		engine.trackControlClient(raw, request.ClientID)
+		// 会话登记与旧会话替换（FR-03 §3.4）：同一客户端的新会话接管，
+		// 旧会话转入退出——关闭其控制连接，由其 defer 完成会话资源清理。
+		// 运行时代理按连接归属清理，替换过程不会误伤新会话的注册。
+		if oldSession := engine.bindControlClient(raw, request.ClientID); oldSession != nil {
+			engine.log().Info("同一客户端的新会话已接管，旧会话退出", "客户端", request.ClientID)
+			_ = oldSession.Close()
+		}
 		// 会话级清理（FR-03）：该连接上注册的运行时代理随会话结束释放。
-		defer gen.cleanupRuntimeProxiesForClient(request.ClientID)
+		defer gen.cleanupRuntimeProxiesForConn(raw)
 		engine.events.Publish(core.ClientConnected{
 			ClientID:   request.ClientID,
 			RemoteAddr: raw.RemoteAddr().String(),
 			EventMeta:  core.NewEventMeta(),
 		})
-		engine.serveControlLoop(gen, raw, guard)
+		engine.serveControlLoop(gen, raw, guard, request.ClientID)
 	case "new-work-conn":
 		engine.serveWorkDeclaration(gen, raw, first.Payload)
 		first.Release()
 	default:
 		first.Release()
-		engine.failAbnormal(gen, errors.New("控制连接首帧类型非法"))
+		engine.closeSession(raw, "控制连接首帧类型非法", nil)
 	}
 }
 
-// serveControlLoop 在已登录的控制连接上处理心跳与代理管理消息，直到连接结束。
+// serveControlLoop 在已登录的控制连接上处理心跳与代理管理消息，直到会话结束。
 //
-// 心跳中断或未知帧都视为异常终止：记录首个异常错误并关闭 Done，
-// 使宿主可通过 Err() 判定。正常 Shutdown 不经过本路径。
-func (engine *Engine) serveControlLoop(gen *generation, conn *transport.Conn, guard *wire.ConnectionGuard) {
-	clientID := ""
-	engine.mu.Lock()
-	clientID = engine.controlClients[conn]
-	engine.mu.Unlock()
-
+// 失活判定（FR-03 §3.5）：每轮读取前把读截止时间设为失活窗口（心跳周期的
+// 三倍）。窗口内到达的任何心跳自动续期，单次丢失不影响会话；连续超过窗口
+// 未收到心跳即判失活并关闭会话。
+//
+// 会话级错误（心跳失活、未知帧、读取失败）只关闭本会话：FR-03 的多客户端
+// 语义下，单个客户端掉线不能让服务器停机（FR-25 的单会话语义已被取代）。
+func (engine *Engine) serveControlLoop(gen *generation, conn *transport.Conn, guard *wire.ConnectionGuard, clientID string) {
+	liveness := engine.controlLivenessWindow()
 	for {
+		if deadlineErr := conn.SetReadDeadline(time.Now().Add(liveness)); deadlineErr != nil {
+			engine.closeSession(conn, "设置读截止时间失败", deadlineErr)
+			return
+		}
 		frame, err := guard.ReadFrame()
 		if err != nil {
-			engine.failAbnormal(gen, err)
+			if isReadDeadline(err) {
+				engine.closeSession(conn, "心跳失活（超过失活窗口未收到心跳）", nil)
+			} else {
+				engine.closeSession(conn, "控制连接读取失败", err)
+			}
 			return
 		}
 		switch frame.Type.Name {
 		case "ping":
 			frame.Release()
 			if err := engine.replyPong(conn); err != nil {
-				engine.failAbnormal(gen, err)
+				engine.closeSession(conn, "心跳应答失败", err)
 				return
 			}
 		case "new-proxy":
@@ -1004,13 +1040,54 @@ func (engine *Engine) serveControlLoop(gen *generation, conn *transport.Conn, gu
 			frame.Release()
 		default:
 			frame.Release()
-			engine.failAbnormal(gen, errors.New("控制连接收到未知帧"))
+			engine.closeSession(conn, "控制连接收到未知帧", nil)
 			return
 		}
 	}
 }
 
+// closeSession 关闭一条控制会话并记录会话级诊断。
+//
+// 与 failAbnormal 的边界：会话级错误（协议违规、鉴权失败、心跳失活、
+// 客户端掉线）绝不能让引擎停机——否则一个客户端掉线会杀死全部会话，
+// 官方 frpc 的断线重连更会反复触发。引擎停止只由 Accept 致命失败与
+// Shutdown 触发（FR-03 §3.4/§3.5 明确"关闭连接"，不是"停止服务"）。
+func (engine *Engine) closeSession(conn *transport.Conn, reason string, err error) {
+	if err != nil {
+		engine.log().Warn("控制会话关闭", "原因", reason, "错误", err)
+	} else {
+		engine.log().Info("控制会话关闭", "原因", reason)
+	}
+	_ = conn.Close()
+}
+
+// controlLivenessWindow 返回控制会话的失活窗口：心跳周期的三倍。
+//
+// 三倍窗口允许两次连续心跳丢失后仍能恢复；与官方 frpc 的默认参数
+// （心跳 30s、超时 90s）一致。下限一秒，防止极小测试配置导致误杀。
+func (engine *Engine) controlLivenessWindow() time.Duration {
+	window := engine.heartbeat * 3
+	if window < time.Second {
+		window = time.Second
+	}
+	return window
+}
+
+// isReadDeadline 判定错误是否为读截止时间超时。
+func isReadDeadline(err error) bool {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
 // failAbnormal 记录异常停止的首个错误并关闭 Done。
+//
+// 用途收窄（FR-03 §3.4/§3.5）：只用于引擎级致命错误——当前唯一调用点是
+// 控制入口的 Accept 致命失败。会话级错误（协议违规、鉴权失败、心跳失活、
+// 客户端掉线）一律走 closeSession，只影响本会话：一个客户端掉线不能让
+// 服务器停机，否则官方 frpc 的断线重连会反复杀死服务端。
 //
 // 正常 Shutdown 路径不得调用：Shutdown 后 Err() 必须保持 nil。
 // 引擎已进入停止流程时调用为空操作——此时连接关闭引发的读错误是 Shutdown
@@ -1040,9 +1117,10 @@ func (engine *Engine) failAbnormal(gen *generation, err error) {
 // 的对端都能声明任意代理名：既能与真实访客配对并读取其数据，也能借该代理名触发
 // 配对中心的副作用（例如释放该代理的暂存访客）。
 //
-// 三级校验按顺序执行，任一失败都关闭连接且不产生副作用：鉴权材料 → 代理归属 →
-// 目标地址允许集合。归属校验先于目标校验，使未认证对端无法借"越权目标"这一
-// 分支触碰配对中心。
+// 四级校验按顺序执行，任一失败都关闭连接且不产生副作用：鉴权材料 → 活跃会话
+// 归属 → 代理归属 → 目标地址允许集合。会话校验先于归属校验，使已退出的控制
+// 会话无法在残留在途的工作连接上继续声明（FR-03 §7.5「过期会话」）；归属校验
+// 先于目标校验，使未认证对端无法借"越权目标"这一分支触碰配对中心。
 func (engine *Engine) serveWorkDeclaration(gen *generation, raw *transport.Conn, payload []byte) {
 	declaration, err := parseWorkDeclaration(payload)
 	if err != nil {
@@ -1051,6 +1129,12 @@ func (engine *Engine) serveWorkDeclaration(gen *generation, raw *transport.Conn,
 	}
 	if !gen.credentialsMatch(declaration.clientID, declaration.token) {
 		engine.log().Warn("工作连接的鉴权材料无效，已拒绝")
+		_ = raw.Close()
+		return
+	}
+	if !engine.hasActiveControlSession(declaration.clientID) {
+		engine.log().Warn("工作连接声明来自无活跃控制会话的客户端，已拒绝",
+			"客户端", declaration.clientID)
 		_ = raw.Close()
 		return
 	}

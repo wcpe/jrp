@@ -12,9 +12,13 @@ import (
 	"github.com/wcpe/jrp/core"
 )
 
-// B1 复现：控制连接异常断开后，Err() 应返回非 nil 且 Done 应关闭。
-// 当前行为：Err() 恒 nil，Done 在 Shutdown 前不关闭。
-func TestReproServerAbnormalStopSetsErr(t *testing.T) {
+// B1（FR-03 修订）：控制连接异常断开不停止引擎。
+//
+// 原语义（FR-25 垂直切片）：单条控制连接断开 = 引擎异常终止（Done 关闭、
+// Err 非 nil）。FR-03 引入多客户端语义后该行为已修订（见 §3.4/§3.5）：
+// 会话级错误只关闭本会话，引擎停止只由 Accept 致命失败与 Shutdown 触发——
+// 否则一个客户端掉线会杀死全部会话，官方 frpc 的断线重连会反复触发停机。
+func TestSessionDropDoesNotStopEngine(t *testing.T) {
 	config := mustServerConfig(t)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -33,23 +37,23 @@ func TestReproServerAbnormalStopSetsErr(t *testing.T) {
 	}
 	_ = raw.Close()
 
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		select {
-		case <-engine.Done():
-			goto CHECKED
-		default:
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("复现确认：异常连接断开后 Done 未关闭（当前行为）")
-		}
-		time.Sleep(20 * time.Millisecond)
+	// 会话断开后引擎必须保持运行：Done 不关闭、Err 保持 nil。
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case <-engine.Done():
+		t.Fatalf("会话断开不应停止引擎，实际 Done 已关闭：%v", engine.Err())
+	default:
 	}
-CHECKED:
-	if err := engine.Err(); err == nil {
-		t.Fatalf("复现确认 B1：Done 已关闭但 Err() 为 nil（当前行为）")
+	if err := engine.Err(); err != nil {
+		t.Fatalf("会话断开后 Err() 应为 nil，实际：%v", err)
 	}
-	_ = engine.Shutdown(context.Background())
+	// 正常 Shutdown 后 Err() 仍为 nil（正常路径不受此路径污染）。
+	if err := engine.Shutdown(context.Background()); err != nil {
+		t.Fatalf("关闭失败：%v", err)
+	}
+	if err := engine.Err(); err != nil {
+		t.Fatalf("正常 Shutdown 后 Err() 应为 nil，实际：%v", err)
+	}
 }
 
 // B2 复现：N 个 goroutine 并发 Start，只应有一个成功。
