@@ -82,7 +82,7 @@ func TestLoginChainReplayBoundary(t *testing.T) {
 // 重放缓存有上限：超过上限时淘汰最旧条目，不无界增长。
 func TestLoginChainReplayCacheBounded(t *testing.T) {
 	chain := newLoginChain(loginChainConfig{
-		TimeWindow:    2 * time.Minute,
+		TimeWindow:      2 * time.Minute,
 		ReplayCacheSize: 8,
 	})
 	base := time.Now().UnixMilli()
