@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"crypto/sha256"
 	"errors"
 	"io"
 	"net"
@@ -354,6 +355,19 @@ func (guard *ConnectionGuard) V2Transcript() ([]byte, bool) {
 		return nil, false
 	}
 	return V2CryptoTranscript(clientHello, serverHello), true
+}
+
+// V2HelloDigests 返回两段协商载荷各自的 SHA-256 摘要（诊断用）。
+//
+// 协商记录不一致时，用它区分是客户端 hello 还是服务端 hello 的内容在传递中
+// 被改写——直接对比最终哈希无法定位到具体一段。
+func (guard *ConnectionGuard) V2HelloDigests() (client, server [32]byte, ok bool) {
+	guard.mu.Lock()
+	defer guard.mu.Unlock()
+	if len(guard.v2ClientHello) == 0 || len(guard.v2ServerHello) == 0 {
+		return client, server, false
+	}
+	return sha256.Sum256(guard.v2ClientHello), sha256.Sum256(guard.v2ServerHello), true
 }
 
 // EnableV2Cipher 在 v2 连接上把消息读取切换到分帧 AEAD 通道。
