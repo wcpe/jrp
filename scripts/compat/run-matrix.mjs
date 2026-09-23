@@ -59,8 +59,12 @@ async function reservePort() {
 // startEchoService 启动本地回显服务，作为被代理的目标。
 function startEchoService() {
   const service = net.createServer((socket) => {
+    // 回显连接必须自带错误处理：数据面中断时对端会发 RST，未处理的 error
+    // 会以未捕获异常终止整个矩阵进程（这正是此前掩盖断言结果的原因）。
+    socket.on('error', () => socket.destroy());
     socket.pipe(socket);
   });
+  service.on('error', () => {});
   return new Promise((resolve) => {
     service.listen(0, '127.0.0.1', () => resolve(service));
   });
