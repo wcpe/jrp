@@ -90,7 +90,7 @@ func main() {
 	serverConfig, err := core.NewServerConfig(
 		core.WithListen(core.BindEndpoint{Address: control, Transport: core.TransportTCP}),
 		core.WithWire(core.WireV1),
-		core.WithClientCredential(core.ClientCredential{ClientID: "ext-client", Token: "ext-token"}),
+		core.WithClientCredential(core.ClientCredential{ClientID: "ext-client", Token: server.DigestToken("ext-token")}),
 		core.WithTCPProxyBinding(core.TCPProxyBinding{
 			Name: "ext-ssh", ClientID: "ext-client", RemotePort: guestPort,
 			AllowedTargets: []netip.AddrPort{target},
