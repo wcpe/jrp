@@ -29,7 +29,12 @@ const (
 	// v2CipherMaxPayloadSize 是单帧明文上限（官方默认值）。
 	v2CipherMaxPayloadSize = 64 * 1024
 	// v2TranscriptLabel 是协商记录哈希的固定标签。
-	v2TranscriptLabel = "frp wire v2 control aead"
+	//
+	// 它与下面的 info 前缀是两个不同的常量：黑盒取证确认二者取值不同，
+	// 混用会让派生密钥与对端不一致，且症状只在首帧认证时暴露。
+	v2TranscriptLabel = "frp wire v2 crypto transcript"
+	// v2ControlInfoPrefix 是控制通道密钥派生的 HKDF info 前缀。
+	v2ControlInfoPrefix = "frp wire v2 control aead"
 	// v2FrameHeaderSize 是每帧密文长度头的宽度。
 	v2FrameHeaderSize = 4
 	// v2CipherRandomSize 是协商随机材料的固定长度（官方校验要求）。
@@ -71,7 +76,7 @@ func writeV2TranscriptPart(hash io.Writer, label string, payload []byte) {
 // 口令是 token 明文（与 v1 通道同源），盐是协商记录哈希，info 由固定前缀、
 // 算法名与方向拼成；三个输入中任意一个不一致都会导致首帧认证失败。
 func DeriveV2ControlKey(token, algorithm, direction string, transcript []byte) ([]byte, error) {
-	info := v2TranscriptLabel + " " + algorithm + " " + direction
+	info := v2ControlInfoPrefix + " " + algorithm + " " + direction
 	key, err := hkdf.Key(sha256.New, []byte(token), transcript, info, v2CipherKeySize)
 	if err != nil {
 		return nil, fmt.Errorf("派生 v2 控制通道密钥失败：%w", err)
