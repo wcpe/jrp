@@ -2,6 +2,7 @@ package wire
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -368,6 +369,25 @@ func (guard *ConnectionGuard) V2HelloDigests() (client, server [32]byte, ok bool
 		return client, server, false
 	}
 	return sha256.Sum256(guard.v2ClientHello), sha256.Sum256(guard.v2ServerHello), true
+}
+
+// PeekV2FirstFrameType 窥视 v2 连接的首帧类型，不消费任何字节。
+//
+// v2 下两种连接的起始形状不同：控制连接以 client hello 帧开头并进入协商与加密，
+// 而客户端建立的工作连接只发魔数后直接发消息帧，既不协商也不加密。宿主据此分流，
+// 窥视后流位置不变，控制连接仍可按原路径读取 hello。
+func (guard *ConnectionGuard) PeekV2FirstFrameType() (uint16, error) {
+	guard.mu.Lock()
+	peeker := guard.reader
+	guard.mu.Unlock()
+	if peeker == nil {
+		return 0, protocolError(CategoryTransportFailure, StageDetect, "v2 预读流尚未绑定")
+	}
+	header, err := peeker.Peek(V2HeaderSize)
+	if err != nil {
+		return 0, protocolError(CategoryPayloadTruncated, StageDetect, "v2 首帧帧头不可读")
+	}
+	return binary.BigEndian.Uint16(header[0:2]), nil
 }
 
 // EnableV2Cipher 在 v2 连接上把消息读取切换到分帧 AEAD 通道。

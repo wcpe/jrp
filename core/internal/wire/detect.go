@@ -31,17 +31,20 @@ func NewPeekReader(source io.Reader) *PeekReader {
 // 返回的切片是内部缓冲视图，调用方只读不写。
 // 连接在预读期间结束且已读字节不足 size 时，返回已读字节与 io.EOF 之外的错误。
 func (reader *PeekReader) Peek(size int) ([]byte, error) {
-	if len(reader.peeked) < size {
+	// 窥视的是「尚未消费」的部分：已消费的字节（例如版本魔数）不得再次返回，
+	// 否则调用方会把上一步读过的数据当成当前流的内容——版本判定之后的任何
+	// 窥视都会因此错位。
+	if len(reader.peeked)-reader.offset < size {
 		reader.compact()
-		missing := size - len(reader.peeked)
+		missing := size - (len(reader.peeked) - reader.offset)
 		buffer := make([]byte, missing)
 		read, err := io.ReadFull(reader.source, buffer)
 		reader.peeked = append(reader.peeked, buffer[:read]...)
 		if err != nil {
-			return reader.peeked, err
+			return reader.peeked[reader.offset:], err
 		}
 	}
-	return reader.peeked[:size], nil
+	return reader.peeked[reader.offset : reader.offset+size], nil
 }
 
 // Read 实现 io.Reader：先回放已预读字节，再继续读取底层流。

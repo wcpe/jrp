@@ -977,6 +977,9 @@ func (engine *Engine) handleControl(gen *generation, raw *transport.Conn) {
 	engine.trackControl(raw)
 	defer engine.untrackControl(raw)
 
+	// 连接到达即记录：后续任何一步（版本判定、协商、首帧读取）卡住或失败时，
+	// 这条日志是区分"连接没到"与"到了但没走通"的唯一依据。
+	engine.log().Info("控制入口收到连接", "来源", raw.RemoteAddr().String())
 	guard := wire.NewConnectionGuard(raw, nil, wireOptionsFromCompat())
 	version, err := guard.DetectVersion(raw)
 	if err != nil {
@@ -986,6 +989,17 @@ func (engine *Engine) handleControl(gen *generation, raw *transport.Conn) {
 	// v2 连接先完成协商（hello 往返）再进入消息阶段（FR-03 §3.4/§4.2）：
 	// 协商失败必须失败，不静默降级到 v1。
 	if version == wire.VersionV2 {
+		// v2 下两种连接起始形状不同：控制连接以 client hello 开头并进入协商与
+		// 加密；客户端建立的工作连接只发魔数后直接发消息帧（不协商、不加密）。
+		firstFrameType, peekErr := guard.PeekV2FirstFrameType()
+		if peekErr != nil {
+			engine.closeSession(raw, "v2 首帧类型探测失败", peekErr)
+			return
+		}
+		if firstFrameType == wire.V2FrameTypeMessage {
+			engine.serveV2WorkConn(gen, raw, guard)
+			return
+		}
 		if negErr := engine.completeV2Negotiation(raw, guard); negErr != nil {
 			engine.closeSession(raw, "v2 协商失败", negErr)
 			return
@@ -1700,6 +1714,26 @@ func (engine *Engine) pendingProxyFor(gen *generation, clientID string) string {
 		}
 	}
 	return ""
+}
+
+// serveV2WorkConn 处理 v2 的工作连接：明文路径，不经协商也不加密。
+//
+// 官方客户端建立工作连接时只发送版本魔数，随后直接是消息帧（首个即
+// new-work-conn）；它既不参与 hello 协商，也不启用 AEAD。这里读出该帧并按
+// 既有的声明校验与指派流程处理，与 v1 的工作连接语义一致。
+func (engine *Engine) serveV2WorkConn(gen *generation, raw *transport.Conn, guard *wire.ConnectionGuard) {
+	frame, err := guard.ReadFrame()
+	if err != nil {
+		engine.closeSession(raw, "v2 工作连接读取失败", err)
+		return
+	}
+	defer frame.Release()
+	engine.log().Info("v2 工作连接到达", "来源", raw.RemoteAddr().String(), "类型", frame.Type.Name)
+	if frame.Type.Name != "new-work-conn" {
+		engine.closeSession(raw, "v2 工作连接首帧类型非法", nil)
+		return
+	}
+	engine.serveWorkDeclaration(gen, raw, frame.Payload)
 }
 
 // serveOfficialWorkConn 处理官方形态的工作连接声明并指派一个代理。
