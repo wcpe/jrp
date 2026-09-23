@@ -11,7 +11,7 @@
 // 因此同一时刻只允许一个黑盒实例运行。
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, openSync } from 'node:fs';
+import { existsSync, mkdirSync, openSync, rmSync } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -124,6 +124,9 @@ export async function startJrpsHost(options) {
     clientToken,
     adminPassword = 'compat-verify-password',
   } = options;
+  // 数据目录是运行产物而不是证据（证据是日志与 result.json）：用例重跑时必须
+  // 从干净状态开始，否则 jrps init 会因"管理员已初始化"拒绝执行。
+  rmSync(dataDirectory, { recursive: true, force: true });
   mkdirSync(dataDirectory, { recursive: true });
   mkdirSync(evidenceDirectory, { recursive: true });
   if (!(await portIsFree(ControlPort))) {

@@ -998,6 +998,7 @@ func (engine *Engine) handleControl(gen *generation, raw *transport.Conn) {
 		engine.closeSession(raw, "首帧读取失败", err)
 		return
 	}
+	engine.log().Info("控制连接首帧", "来源", raw.RemoteAddr().String(), "类型", first.Type.Name)
 	switch first.Type.Name {
 	case "login":
 		session := sessionWriter{conn: raw, version: version, mu: &sync.Mutex{}}
@@ -1253,6 +1254,14 @@ func (engine *Engine) failAbnormal(gen *generation, err error) {
 func (engine *Engine) serveWorkDeclaration(gen *generation, raw *transport.Conn, payload []byte) {
 	declaration, err := parseWorkDeclaration(payload)
 	if err != nil {
+		// 声明非法必须可见：静默关闭会让对端只看到"连接被断开"而无从定位。
+		// 只记录字段是否存在，不记录任何字段值——鉴权材料不得进日志。
+		var probe workConnRequest
+		_ = json.Unmarshal(payload, &probe)
+		engine.log().Warn("工作连接声明解析失败，已拒绝", "错误", err,
+			"载荷长度", len(payload), "有客户端字段", probe.ClientID != "",
+			"有运行ID字段", probe.RunID != "", "有官方材料字段", probe.PrivilegeKey != "",
+			"有明文材料字段", probe.Token != "", "有时间戳", probe.Timestamp != 0)
 		_ = raw.Close()
 		return
 	}
@@ -1468,8 +1477,12 @@ func parseWorkDeclaration(payload []byte) (workDeclaration, error) {
 	if err := json.Unmarshal(payload, &request); err != nil {
 		return workDeclaration{}, err
 	}
-	// 官方形态：只声明运行 ID 与 md5 鉴权材料，代理与目标由服务端指派。
-	if request.ClientID == "" && request.RunID != "" && request.PrivilegeKey != "" {
+	// 官方形态：只声明运行 ID（必要时附带 md5 鉴权材料），代理与目标由服务端指派。
+	//
+	// 材料是否出现取决于客户端的鉴权 scope：实测官方 v0.70.0 的默认配置下
+	// new-work-conn 只带 run_id。运行 ID 由服务端分配、经加密通道下发，本身
+	// 就是会话凭据；材料存在时仍照常校验。
+	if request.ClientID == "" && request.RunID != "" {
 		return workDeclaration{
 			token:     request.PrivilegeKey,
 			timestamp: request.Timestamp,
@@ -1660,10 +1673,12 @@ func (engine *Engine) serveOfficialWorkConn(gen *generation, raw *transport.Conn
 		return
 	}
 	engine.log().Info("官方工作连接到达", "客户端", clientID, "运行ID", declaration.runID)
-	if matched, _ := gen.credentialsMatch(clientID, declaration.token, declaration.timestamp); !matched {
-		engine.log().Warn("工作连接的鉴权材料无效，已拒绝")
-		_ = raw.Close()
-		return
+	if declaration.token != "" {
+		if matched, _ := gen.credentialsMatch(clientID, declaration.token, declaration.timestamp); !matched {
+			engine.log().Warn("工作连接的鉴权材料无效，已拒绝")
+			_ = raw.Close()
+			return
+		}
 	}
 	name := engine.pendingProxyFor(gen, clientID)
 	if name == "" {

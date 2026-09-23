@@ -120,20 +120,30 @@ async function assertEchoThroughProxy(port, timeoutMilliseconds = 20000) {
     try {
       const payload = Buffer.from('黑盒互操作-回显断言-0123456789');
       const echoed = await new Promise((resolve, reject) => {
+        // 只让首个结局生效：连接被对端重置时 error 会在 resolve/close 之后再次
+        // 到达，未受保护的 reject 会变成未处理异常并让整个矩阵中断。
+        let settled = false;
+        const finish = (action, value) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          action(value);
+        };
         const socket = net.connect(port, '127.0.0.1');
         socket.setTimeout(3000);
-        socket.once('error', reject);
-        socket.once('timeout', () => reject(new Error('入口读取超时')));
+        socket.on('error', (error) => finish(reject, error));
+        socket.on('timeout', () => finish(reject, new Error('入口读取超时')));
         socket.once('connect', () => socket.write(payload));
         const chunks = [];
         socket.on('data', (chunk) => {
           chunks.push(chunk);
           if (Buffer.concat(chunks).length >= payload.length) {
             socket.end();
-            resolve(Buffer.concat(chunks));
+            finish(resolve, Buffer.concat(chunks));
           }
         });
-        socket.once('close', () => resolve(Buffer.concat(chunks)));
+        socket.on('close', () => finish(resolve, Buffer.concat(chunks)));
       });
       if (echoed.length >= payload.length && echoed.subarray(0, payload.length).equals(payload)) {
         return;
@@ -220,7 +230,12 @@ async function runCase({ name, wireVersion, binary, dateStamp }) {
 // main 执行矩阵并汇总退出码。
 async function main() {
   const options = parseArguments(process.argv.slice(2));
-  const binary = await ensureFrpcBinary();
+  // JRP_COMPAT_FRPC 可指向替代的可执行文件（例如带源码级探针的构建），
+  // 用于对照排障；缺省使用校验过摘要的官方发行二进制。
+  const override = process.env.JRP_COMPAT_FRPC;
+  const binary = override
+    ? { version: `override:${override}`, executable: override, directory: path.dirname(override) }
+    : await ensureFrpcBinary();
   const dateStamp = new Date().toISOString().slice(0, 10);
   const results = [];
   for (const name of options.cases) {
