@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -308,10 +309,65 @@ func (broker *workBroker) closeStaged() {
 type workConnRequest struct {
 	ClientID string `json:"client_id"`
 	Token    string `json:"token"`
+	// PrivilegeKey 是官方形态的鉴权材料（md5(token ∥ timestamp)）。
+	//
+	// 官方客户端的工作连接只声明运行 ID 与鉴权材料，不带客户端标识、代理名与
+	// 目标：服务端按运行 ID 定位控制会话，并在配对那一刻指派它服务哪个代理
+	// （PROTOCOL §7 第 2、3 步）。jrpc 走声明式路径，使用上面的既有字段。
+	PrivilegeKey string `json:"privilege_key"`
 	// Timestamp 是官方鉴权材料的组成部分：官方 frpc 送 md5(token ∥ timestamp)，
-	// 服务端复算需要同一时间戳。过渡形态下 jrpc 的明文材料不使用它。
+	// 服务端复算需要同一时间戳。
 	Timestamp int64  `json:"timestamp"`
 	RunID     string `json:"run_id"`
 	Proxy     string `json:"proxy_name"`
 	Target    string `json:"target_addr"`
+}
+
+// stagingSummary 是暂存访客的源/目标摘要，用于填充 start-work-conn。
+type stagingSummary struct {
+	srcAddr string
+	srcPort uint16
+	dstAddr string
+	dstPort uint16
+}
+
+// startWorkConnPayload 是服务端向工作连接指派代理与源/目标摘要的载荷（官方形状）。
+type startWorkConnPayload struct {
+	ProxyName string `json:"proxy_name,omitempty"`
+	SrcAddr   string `json:"src_addr,omitempty"`
+	SrcPort   uint16 `json:"src_port,omitempty"`
+	DstAddr   string `json:"dst_addr,omitempty"`
+	DstPort   uint16 `json:"dst_port,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// hasStagedGuest 报告该代理是否有暂存访客等待工作连接。
+func (broker *workBroker) hasStagedGuest(proxyName string) bool {
+	broker.mu.Lock()
+	defer broker.mu.Unlock()
+	return len(broker.guests[proxyName]) > 0
+}
+
+// stagingSummaryFor 返回该代理最早暂存访客的地址摘要。
+//
+// 摘要只是信息性的（官方对端用它做日志与观测），因此这里与配对之间存在竞争
+// 窗口是可接受的：真正的归属决策由 park 在锁内完成。
+func (broker *workBroker) stagingSummaryFor(proxyName string) (stagingSummary, bool) {
+	broker.mu.Lock()
+	staged := broker.guests[proxyName]
+	broker.mu.Unlock()
+	if len(staged) == 0 {
+		return stagingSummary{}, false
+	}
+	guest := staged[0].conn
+	summary := stagingSummary{}
+	if remote, err := netip.ParseAddrPort(guest.RemoteAddr().String()); err == nil {
+		summary.srcAddr = remote.Addr().String()
+		summary.srcPort = remote.Port()
+	}
+	if local, err := netip.ParseAddrPort(guest.LocalAddr().String()); err == nil {
+		summary.dstAddr = local.Addr().String()
+		summary.dstPort = local.Port()
+	}
+	return summary, true
 }

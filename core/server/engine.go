@@ -171,6 +171,15 @@ type Engine struct {
 	events *core.EventHub
 	// controlClients 记录控制连接的客户端标识：登录成功时登记，供状态快照聚合。
 	controlClients map[*transport.Conn]string
+	// officialSessions 是官方形态控制会话的登记（clientID → 会话写出通道与运行 ID）。
+	//
+	// 官方客户端的工作连接由服务端指派：服务端在有待处理访客时向控制连接发
+	// req-work-conn，客户端随后新建连接并只声明运行 ID 与鉴权材料。要完成这次
+	// 指派，服务端必须持有控制连接的写出通道与运行 ID 索引。
+	officialSessions map[string]officialControlSession
+	// sessionRunIDs 是 runID → clientID 的反向索引，供工作连接声明定位会话。
+	sessionRunIDs map[string]string
+
 	// clientControl 是 clientID → 活跃控制连接的反向索引（FR-03 §3.4）。
 	//
 	// 同一客户端同时只允许一个活跃控制会话：新会话登录时接管索引并关闭旧
@@ -210,16 +219,18 @@ func WithLogger(logger *slog.Logger) Option {
 // config 是首次应用（Start）使用的配置；后续通过 Apply 提交新 revision 替换它。
 func New(config core.ServerConfig, options ...Option) *Engine {
 	engine := &Engine{
-		config:         config,
-		done:           make(chan struct{}),
-		registry:       &proxy.RegistryView{},
-		controlConns:   make(map[*transport.Conn]struct{}),
-		clientControl:  make(map[string]*transport.Conn),
-		heartbeat:      config.Heartbeat(),
-		dialer:         transport.Dialer{Timeout: config.Timeout()},
-		drainTimeout:   config.DrainTimeout(),
-		events:         core.NewEventHub(),
-		controlClients: make(map[*transport.Conn]string),
+		config:           config,
+		done:             make(chan struct{}),
+		registry:         &proxy.RegistryView{},
+		controlConns:     make(map[*transport.Conn]struct{}),
+		clientControl:    make(map[string]*transport.Conn),
+		heartbeat:        config.Heartbeat(),
+		dialer:           transport.Dialer{Timeout: config.Timeout()},
+		drainTimeout:     config.DrainTimeout(),
+		events:           core.NewEventHub(),
+		controlClients:   make(map[*transport.Conn]string),
+		officialSessions: make(map[string]officialControlSession),
+		sessionRunIDs:    make(map[string]string),
 	}
 	for _, option := range options {
 		option(engine)
@@ -734,6 +745,12 @@ func (engine *Engine) untrackControl(conn *transport.Conn) {
 		if engine.clientControl[clientID] == conn {
 			delete(engine.clientControl, clientID)
 		}
+		// 官方会话登记与运行 ID 索引同属该会话：控制连接结束即失效，
+		// 否则后续工作连接可能按已退出的会话被接纳。
+		if session, ok := engine.officialSessions[clientID]; ok {
+			delete(engine.sessionRunIDs, session.runID)
+			delete(engine.officialSessions, clientID)
+		}
 	}
 	delete(engine.controlConns, conn)
 	delete(engine.controlClients, conn)
@@ -983,8 +1000,8 @@ func (engine *Engine) handleControl(gen *generation, raw *transport.Conn) {
 	}
 	switch first.Type.Name {
 	case "login":
-		session := sessionWriter{conn: raw, version: version}
-		official, err := gen.handleLogin(session, first.Payload)
+		session := sessionWriter{conn: raw, version: version, mu: &sync.Mutex{}}
+		official, runID, err := gen.handleLogin(session, first.Payload)
 		if err != nil {
 			first.Release()
 			engine.closeSession(raw, "登录被拒绝", nil)
@@ -1000,6 +1017,11 @@ func (engine *Engine) handleControl(gen *generation, raw *transport.Conn) {
 				engine.closeSession(raw, "控制通道加密切换失败", cipherErr)
 				return
 			}
+		}
+		if official {
+			// 官方形态会话需要登记：其工作连接由服务端指派（req-work-conn），
+			// 指派要能拿到控制连接的写出通道与运行 ID。
+			engine.registerOfficialSession(request.ClientID, session, runID)
 		}
 		// 会话登记与旧会话替换（FR-03 §3.4）：同一客户端的新会话接管，
 		// 旧会话转入退出——关闭其控制连接，由其 defer 完成会话资源清理。
@@ -1116,6 +1138,9 @@ type sessionWriter struct {
 	// output 是消息写出目标；为空表示直接写连接。官方形态客户端在登录成功后
 	// 把出站字节流切换为加密写入器。
 	output io.Writer
+	// mu 串行化同一控制连接上的并发写入：控制循环的应答（心跳、代理响应）与
+	// 访客路径发起的 req-work-conn 来自不同 goroutine，不加锁会撕裂帧边界。
+	mu *sync.Mutex
 }
 
 // writeMessage 编码并写出单条消息帧。
@@ -1127,6 +1152,10 @@ func (writer sessionWriter) writeMessage(messageType wire.MessageType, body []by
 	target := writer.output
 	if target == nil {
 		target = writer.conn
+	}
+	if writer.mu != nil {
+		writer.mu.Lock()
+		defer writer.mu.Unlock()
 	}
 	_, err = target.Write(encoded)
 	return err
@@ -1227,6 +1256,10 @@ func (engine *Engine) serveWorkDeclaration(gen *generation, raw *transport.Conn,
 		_ = raw.Close()
 		return
 	}
+	if declaration.official {
+		engine.serveOfficialWorkConn(gen, raw, declaration)
+		return
+	}
 	if matched, _ := gen.credentialsMatch(declaration.clientID, declaration.token, declaration.timestamp); !matched {
 		engine.log().Warn("工作连接的鉴权材料无效，已拒绝")
 		_ = raw.Close()
@@ -1313,6 +1346,71 @@ func (gen *generation) compatToken(clientID string) (string, bool) {
 	return "", false
 }
 
+// officialControlSession 是官方形态客户端控制会话的登记项。
+type officialControlSession struct {
+	// writer 是控制连接的写出通道（已含加密切换与并发锁）。
+	writer sessionWriter
+	// runID 是登录时分配给该会话的运行 ID：官方客户端在 new-work-conn 里回传它。
+	runID string
+}
+
+// registerOfficialSession 登记官方形态控制会话，并建立运行 ID 反向索引。
+//
+// 只在本次登录实际走官方链时登记：jrpc 的工作连接走声明式路径（客户端在声明里
+// 携带代理名与目标），不需要服务端指派。
+func (engine *Engine) registerOfficialSession(clientID string, writer sessionWriter, runID string) {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	engine.officialSessions[clientID] = officialControlSession{writer: writer, runID: runID}
+	if runID != "" {
+		engine.sessionRunIDs[runID] = clientID
+	}
+}
+
+// sessionByRunID 按运行 ID 查找官方会话。
+func (engine *Engine) sessionByRunID(runID string) (string, officialControlSession, bool) {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	clientID, ok := engine.sessionRunIDs[runID]
+	if !ok {
+		return "", officialControlSession{}, false
+	}
+	session, ok := engine.officialSessions[clientID]
+	if !ok {
+		return "", officialControlSession{}, false
+	}
+	return clientID, session, true
+}
+
+// proxyOwner 返回代理绑定的属主客户端标识；未注册时返回空字符串。
+func (engine *Engine) proxyOwner(name string) string {
+	binding := engine.registry.Binding(name)
+	if binding == nil {
+		return ""
+	}
+	return binding.OwnerClientID
+}
+
+// requestWorkConn 向官方形态客户端的控制连接请求一条工作连接。
+//
+// 官方语义（FR-03 §3.7）：服务端在有待处理访客时主动请求工作连接，客户端新建
+// 连接后只声明运行 ID 与鉴权材料，由服务端在配对那一刻指派它服务哪个代理。
+// 非官方会话不做任何事：那条路径由客户端的声明式工作连接承担。
+func (engine *Engine) requestWorkConn(clientID string) {
+	engine.mu.Lock()
+	session, ok := engine.officialSessions[clientID]
+	engine.mu.Unlock()
+	if !ok {
+		// 声明式客户端（jrpc）：工作连接由客户端主动送来，服务端不请求。
+		return
+	}
+	if err := session.writer.writeMessage(wire.MessageTypeReqWorkConn, []byte(`{}`)); err != nil {
+		engine.log().Warn("请求工作连接失败", "客户端", clientID, "错误", err)
+		return
+	}
+	engine.log().Info("已请求工作连接", "客户端", clientID)
+}
+
 // enableControlCipher 在官方形态客户端登录成功后把控制通道切换为加密读写。
 //
 // 官方 frpc 的既定行为：登录握手是明文，其后所有消息走 AES-128-CFB 加密通道
@@ -1356,6 +1454,10 @@ type workDeclaration struct {
 	timestamp int64
 	proxy     string
 	target    netip.AddrPort
+	// official 表示官方形态声明：只带运行 ID 与 md5 鉴权材料，
+	// 代理归属与源/目标摘要由服务端在配对那一刻指派（FR-03 §3.7）。
+	official bool
+	runID    string
 }
 
 // parseWorkDeclaration 解析工作连接声明载荷，返回代理归属与本地目标地址。
@@ -1365,6 +1467,15 @@ func parseWorkDeclaration(payload []byte) (workDeclaration, error) {
 	var request workConnRequest
 	if err := json.Unmarshal(payload, &request); err != nil {
 		return workDeclaration{}, err
+	}
+	// 官方形态：只声明运行 ID 与 md5 鉴权材料，代理与目标由服务端指派。
+	if request.ClientID == "" && request.RunID != "" && request.PrivilegeKey != "" {
+		return workDeclaration{
+			token:     request.PrivilegeKey,
+			timestamp: request.Timestamp,
+			official:  true,
+			runID:     request.RunID,
+		}, nil
 	}
 	// 鉴权材料与代理名都是必填：缺失即拒绝，不进入后续任何校验或配对流程。
 	if request.ClientID == "" || request.Token == "" {
@@ -1420,16 +1531,16 @@ type loginResponsePayload struct {
 // 校验链当前阶段：凭证摘要比较（FR-03 §3.4）。快照凭证持有摘要，请求明文
 // 在本地转摘要后恒定时间比较；客户端状态、时间窗口与重放边界由登录链
 // （loginChain）逐步接入。成功后由服务端分配运行 ID 并回写。
-func (gen *generation) handleLogin(session sessionWriter, payload []byte) (bool, error) {
+func (gen *generation) handleLogin(session sessionWriter, payload []byte) (bool, string, error) {
 	var request loginPayload
 	if err := json.Unmarshal(payload, &request); err != nil {
 		_ = gen.writeLoginResponse(session, "", "登录载荷非法")
-		return false, err
+		return false, "", err
 	}
 	matched, official := gen.credentialsMatch(request.ClientID, request.Token, request.Timestamp)
 	if !matched {
 		_ = gen.writeLoginResponse(session, "", "鉴权未通过")
-		return false, errors.New("服务端拒绝客户端登录")
+		return false, "", errors.New("服务端拒绝客户端登录")
 	}
 	runID := request.RunID
 	if runID == "" {
@@ -1437,9 +1548,9 @@ func (gen *generation) handleLogin(session sessionWriter, payload []byte) (bool,
 		runID = newSessionRunID()
 	}
 	if err := gen.writeLoginResponse(session, runID, ""); err != nil {
-		return false, err
+		return false, "", err
 	}
-	return official, nil
+	return official, runID, nil
 }
 
 // newSessionRunID 生成一次控制会话的运行 ID。
@@ -1514,6 +1625,84 @@ func (engine *Engine) serveHTTPGuest(gen *generation, port int, listener *transp
 	}
 }
 
+// pendingProxyFor 返回该客户端名下「有暂存访客」的代理名；没有时返回空字符串。
+//
+// 官方工作连接不声明代理归属，服务端用这个查询把「刚到达的工作连接」与
+// 「正在等它的访客」对上：请求方（req-work-conn）与到达方都按同一条件匹配。
+func (engine *Engine) pendingProxyFor(gen *generation, clientID string) string {
+	broker := engine.activeBroker()
+	gen.engine.mu.Lock()
+	names := make([]string, 0, len(gen.runtimeProxies))
+	for name, entry := range gen.runtimeProxies {
+		if entry.clientID == clientID {
+			names = append(names, name)
+		}
+	}
+	gen.engine.mu.Unlock()
+	for _, name := range names {
+		if broker.hasStagedGuest(name) {
+			return name
+		}
+	}
+	return ""
+}
+
+// serveOfficialWorkConn 处理官方形态的工作连接声明并指派一个代理。
+//
+// 顺序与声明式路径同构：会话归属（运行 ID）→ 鉴权材料 → 代理归属（由服务端
+// 在配对这一刻决定）→ 回写 start-work-conn → 交给配对中心。官方对端在收到
+// start-work-conn 后才开始转发，因此指派必须发生在配对之前。
+func (engine *Engine) serveOfficialWorkConn(gen *generation, raw *transport.Conn, declaration workDeclaration) {
+	clientID, _, ok := engine.sessionByRunID(declaration.runID)
+	if !ok {
+		engine.log().Warn("工作连接声明的运行 ID 不属于活跃会话，已拒绝", "运行ID", declaration.runID)
+		_ = raw.Close()
+		return
+	}
+	engine.log().Info("官方工作连接到达", "客户端", clientID, "运行ID", declaration.runID)
+	if matched, _ := gen.credentialsMatch(clientID, declaration.token, declaration.timestamp); !matched {
+		engine.log().Warn("工作连接的鉴权材料无效，已拒绝")
+		_ = raw.Close()
+		return
+	}
+	name := engine.pendingProxyFor(gen, clientID)
+	if name == "" {
+		engine.log().Warn("工作连接到达时该客户端没有待处理访客，已拒绝", "客户端", clientID)
+		_ = raw.Close()
+		return
+	}
+	summary, _ := engine.activeBroker().stagingSummaryFor(name)
+	payload, err := json.Marshal(startWorkConnPayload{
+		ProxyName: name,
+		SrcAddr:   summary.srcAddr,
+		SrcPort:   summary.srcPort,
+		DstAddr:   summary.dstAddr,
+		DstPort:   summary.dstPort,
+	})
+	if err != nil {
+		_ = raw.Close()
+		return
+	}
+	encoded, err := wire.EncodeV1Frame(wire.Frame{Type: wire.MessageTypeStartWorkConn, Payload: payload})
+	if err != nil {
+		_ = raw.Close()
+		return
+	}
+	if _, err := raw.Write(encoded); err != nil {
+		_ = raw.Close()
+		return
+	}
+	gen.track(raw)
+	accepted, pair := engine.activeBroker().park(name, raw)
+	if !accepted {
+		_ = raw.Close()
+		return
+	}
+	if pair != nil {
+		pair.start(gen.track, gen.wg.Add)
+	}
+}
+
 // pairGuest 为访客配对工作连接，跳过已失效的连接。
 //
 // 跨网络环境下待命工作连接会被 NAT 或中间设备静默回收，池中无法预先感知，
@@ -1556,6 +1745,12 @@ func (engine *Engine) handleGuest(gen *generation, name string, guest *transport
 	case parkStaged:
 		// 连接留在配对中心，Shutdown 与 close 负责最终释放。
 		// untrack 不在此处调用，避免重复记账：配对中心的关闭路径统一处理。
+		//
+		// 官方形态客户端不会主动送来工作连接：服务端必须在这里请求一条
+		// （req-work-conn），否则访客会一直停到失活超时。
+		if owner := engine.proxyOwner(name); owner != "" {
+			engine.requestWorkConn(owner)
+		}
 	case parkRejected:
 		gen.untrack(guest)
 		_ = guest.Close()

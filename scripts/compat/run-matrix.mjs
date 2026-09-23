@@ -81,7 +81,7 @@ function renderFrpcConfig({ wireVersion, token, echoPort, remotePort, logFile, p
     // v1/v2 互操作，故显式关闭两层包装。
     'transport.tls.enable = false',
     'transport.tcpMux = false',
-    'log.level = "info"',
+    'log.level = "debug"',
     `log.to = "${logFile.replace(/\\/gu, '/')}"`,
     '',
     '[[proxies]]',
