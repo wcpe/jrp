@@ -32,6 +32,8 @@ const (
 	v2TranscriptLabel = "frp wire v2 control aead"
 	// v2FrameHeaderSize 是每帧密文长度头的宽度。
 	v2FrameHeaderSize = 4
+	// v2CipherRandomSize 是协商随机材料的固定长度（官方校验要求）。
+	v2CipherRandomSize = 32
 )
 
 // v2 控制通道密钥派生的两个方向标识（官方固定取值）。

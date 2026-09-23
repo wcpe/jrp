@@ -1,6 +1,11 @@
 package wire
 
-import "encoding/json"
+import (
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+)
 
 // 消息编码方式。
 const (
@@ -208,10 +213,16 @@ func DecodeClientHello(payload []byte) (ClientHello, error) {
 
 // EncodeServerHello 编码服务端 hello 载荷（不含帧头）。
 func EncodeServerHello(result NegotiationResult) ([]byte, error) {
+	// 协商随机材料按官方字段类型承载：对端声明的是字节数组，JSON 里必须是
+	// base64 字符串、长度固定 32 字节——长度不符会被对端的协商校验直接拒绝。
+	random := make([]byte, v2CipherRandomSize)
+	if _, err := rand.Read(random); err != nil {
+		return nil, fmt.Errorf("生成协商随机材料失败：%w", err)
+	}
 	hello := ServerHello{
 		Selected: SelectedCaps{
 			Message:    SelectedMessage{Codec: result.MessageCodec},
-			Crypto:     SelectedCrypto{Algorithm: result.CryptoAlgorithm},
+			Crypto:     SelectedCrypto{Algorithm: result.CryptoAlgorithm, Random: base64.StdEncoding.EncodeToString(random)},
 			MaxPayload: result.MaxPayload,
 		},
 	}
