@@ -30,7 +30,7 @@ function parseArguments(argv) {
       options.wire = argument.slice('--wire='.length);
     } else if (argument.startsWith('--case=')) {
       const value = argument.slice('--case='.length);
-      options.cases = value === 'all' ? ['login', 'proxy-tcp'] : value.split(',');
+      options.cases = value === 'all' ? ['login', 'proxy-tcp', 'login-rejected'] : value.split(',');
     } else if (argument === '--keep') {
       options.keep = true;
     } else {
@@ -172,6 +172,8 @@ async function runCase({ name, wireVersion, binary, dateStamp }) {
   const remotePort = await reservePort();
 
   const result = { case: name, wire: wireVersion, frpc: binary.version, startedAt: new Date().toISOString() };
+  // 鉴权失败用例使用错误 token：官方客户端仍会按自己的配置发送材料，服务端必须拒绝。
+  const caseToken = name === 'login-rejected' ? 'wrong-token-for-rejection-000' : clientToken;
   let host;
   let frpc;
   try {
@@ -187,7 +189,7 @@ async function runCase({ name, wireVersion, binary, dateStamp }) {
       configPath,
       renderFrpcConfig({
         wireVersion,
-        token: clientToken,
+        token: caseToken,
         echoPort,
         remotePort,
         logFile: path.join(caseDirectory, 'frpc.log'),
@@ -195,6 +197,24 @@ async function runCase({ name, wireVersion, binary, dateStamp }) {
       }),
     );
     frpc = startFrpc(binary.executable, configPath);
+
+    // 鉴权失败路径：期望对端被拒且服务端不产生已连接事件。
+    if (name === 'login-rejected') {
+      const observed = await host.waitForLog({ event: 'client-connected' }, (item) => item.clientId === clientId, 8000);
+      if (observed) {
+        throw new Error('鉴权材料错误却观测到已连接事件');
+      }
+      // 客户端默认在登录失败后退出（loginFailExit）：这本身即是拒绝的可观测证据。
+      const deadline = Date.now() + 8000;
+      while (!frpc.state.exited && Date.now() < deadline) {
+        await delay(200);
+      }
+      if (!frpc.state.exited) {
+        throw new Error('鉴权失败后客户端未退出，说明登录未被拒绝');
+      }
+      result.passed = true;
+      return result;
+    }
 
     // 断言 1：jrps 侧观测到客户端接入（权威通道是运行日志事件）。
     const connected = await host.waitForLog({ event: 'client-connected' }, (item) => item.clientId === clientId, 20000);
