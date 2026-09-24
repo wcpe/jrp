@@ -186,6 +186,13 @@ func (engine *Engine) checkRuntimeProxyConflicts(gen *generation, clientID strin
 // 写入失败被有意忽略：响应写不出去意味着会话即将被读取路径判定为失败并关闭，
 // 这里不再叠加一次会话关闭动作。编码错误同理，只可能是内部缺陷而非对端输入。
 func (engine *Engine) writeProxyResponse(session sessionWriter, response proxyOperationResponse) {
+	if response.Error != "" {
+		// 拒绝必须在服务端留痕：黑盒验收要求"冲突返回明确错误"，而错误只在响应体
+		// 里时，服务端日志无从证明它确实按类别拒绝了。类别本身不含敏感材料。
+		// 类别并入消息文本：日志查询按消息检索，类别只放结构化字段时外部
+		// 观测不到"按什么类别拒绝"。
+		engine.log().Info("代理注册被拒："+response.Error, "代理", response.ProxyName)
+	}
 	body, err := json.Marshal(response)
 	if err != nil {
 		return
