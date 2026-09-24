@@ -65,6 +65,11 @@ func (engine *Engine) handleNewProxy(gen *generation, session sessionWriter, cli
 		return
 	}
 
+	// 注册参数留痕：端口与类型的取值是"冲突是否应当发生"的判定依据，
+	// 缺了它只能在事后靠入口端口反推。
+	engine.log().Info("收到代理注册请求", "客户端", clientID,
+		"代理", request.ProxyName, "类型", request.ProxyType, "远端端口", request.RemotePort)
+
 	// ── 第一段：字段完整性 ────────────────────────────────
 	if request.ProxyName == "" || request.RemotePort <= 0 || request.RemotePort > 65535 {
 		engine.writeProxyResponse(session, proxyOperationResponse{ProxyName: request.ProxyName, Error: ErrProxyFieldInvalid.Error()})

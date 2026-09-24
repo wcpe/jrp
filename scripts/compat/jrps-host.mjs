@@ -11,7 +11,7 @@
 // 因此同一时刻只允许一个黑盒实例运行。
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, openSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, openSync, readFileSync, rmSync } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -203,6 +203,28 @@ export async function startJrpsHost(options) {
     return undefined;
   }
 
+  // waitForServerLog 轮询服务端进程日志文件。
+  //
+  // 引擎日志直写该文件、不经过运行日志表，因此重启类与流量类事件的判定必须
+  // 以文件为准：日志表是异步批量落库的，用它判定会引入不确定的等待。
+  async function waitForServerLog(marker, timeoutMilliseconds = 20000) {
+    const deadline = Date.now() + timeoutMilliseconds;
+    while (Date.now() < deadline) {
+      try {
+        const line = readFileSync(processLog, 'utf8')
+          .split(/\r?\n/u)
+          .find((candidate) => candidate.includes(marker));
+        if (line !== undefined) {
+          return line;
+        }
+      } catch {
+        // 日志尚未创建：继续等待。
+      }
+      await delay(300);
+    }
+    return undefined;
+  }
+
   async function stop() {
     if (exited) {
       return;
@@ -223,6 +245,7 @@ export async function startJrpsHost(options) {
     clientId,
     queryLogs,
     waitForLog,
+    waitForServerLog,
     stop,
     evidenceDirectory,
   };

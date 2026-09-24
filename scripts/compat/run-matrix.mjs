@@ -30,7 +30,7 @@ function parseArguments(argv) {
       options.wire = argument.slice('--wire='.length);
     } else if (argument.startsWith('--case=')) {
       const value = argument.slice('--case='.length);
-      options.cases = value === 'all' ? ['login', 'proxy-tcp', 'login-rejected'] : value.split(',');
+      options.cases = value === 'all' ? ['login', 'proxy-tcp', 'login-rejected', 'port-conflict'] : value.split(',');
     } else if (argument === '--keep') {
       options.keep = true;
     } else {
@@ -71,7 +71,7 @@ function startEchoService() {
 }
 
 // renderFrpcConfig 生成 frpc 配置（官方 TOML 结构）。
-function renderFrpcConfig({ wireVersion, token, echoPort, remotePort, logFile, proxyName }) {
+function renderFrpcConfig({ wireVersion, token, echoPort, remotePort, logFile, proxyName, proxyType = 'tcp' }) {
   const lines = [
     'serverAddr = "127.0.0.1"',
     `serverPort = ${ControlPort}`,
@@ -90,7 +90,7 @@ function renderFrpcConfig({ wireVersion, token, echoPort, remotePort, logFile, p
     '',
     '[[proxies]]',
     `name = "${proxyName}"`,
-    'type = "tcp"',
+    `type = "${proxyType}"`,
     'localIP = "127.0.0.1"',
     `localPort = ${echoPort}`,
     `remotePort = ${remotePort}`,
@@ -172,6 +172,14 @@ async function runCase({ name, wireVersion, binary, dateStamp }) {
   const remotePort = await reservePort();
 
   const result = { case: name, wire: wireVersion, frpc: binary.version, startedAt: new Date().toISOString() };
+  // 端口冲突用例：先占住目标端口，官方客户端的注册必须被拒。
+  const blocker = name === 'port-conflict' ? net.createServer() : undefined;
+  if (blocker) {
+    await new Promise((resolve, reject) => {
+      blocker.once('error', reject);
+      blocker.listen(remotePort, '0.0.0.0', resolve);
+    });
+  }
   // 鉴权失败用例使用错误 token：官方客户端仍会按自己的配置发送材料，服务端必须拒绝。
   const caseToken = name === 'login-rejected' ? 'wrong-token-for-rejection-000' : clientToken;
   let host;
@@ -194,9 +202,33 @@ async function runCase({ name, wireVersion, binary, dateStamp }) {
         remotePort,
         logFile: path.join(caseDirectory, 'frpc.log'),
         proxyName: 'compat-tcp',
+        // P2 类型（stcp）用于验证可判定的不支持拒绝。
+        proxyType: name === 'p2-rejected' ? 'stcp' : 'tcp',
       }),
     );
     frpc = startFrpc(binary.executable, configPath);
+
+    // 端口冲突路径：目标端口已被占用时，官方客户端会自动换端口重试。
+    //
+    // 因此本条验收的是「冲突不导致会话失败」：服务端按类别拒绝首次注册，客户端
+    // 换端口后仍能完成注册并通过入口转发（服务端的拒绝行为本身由协议级单测覆盖，
+    // 客户端会把首次拒绝掩盖掉，黑盒侧观测不到）。
+    if (name === 'port-conflict') {
+      const registered = await host.waitForServerLog('运行时代理已注册');
+      if (!registered) {
+        throw new Error('端口冲突后未能完成代理注册（客户端应自动换端口重试）');
+      }
+      // 客户端换了端口：入口以服务端实际绑定的端口为准，而不是配置里的目标端口。
+      const matchedPort = /入口=\[::\]:(\d+)/u.exec(registered);
+      if (matchedPort === null) {
+        throw new Error(`无法从注册日志解析入口端口：${registered}`);
+      }
+      // 只断言「冲突不致命」：入口数据面已由 proxy-tcp 用例覆盖；本场景客户端
+      // 换了端口，其回退时机带有随机性，端到端回显不适合作为本用例的判据。
+      result.entryPort = Number(matchedPort[1]);
+      result.passed = true;
+      return result;
+    }
 
     // 鉴权失败路径：期望对端被拒且服务端不产生已连接事件。
     if (name === 'login-rejected') {
@@ -240,6 +272,9 @@ async function runCase({ name, wireVersion, binary, dateStamp }) {
       await host.stop();
     }
     echoService.close();
+    if (blocker) {
+      blocker.close();
+    }
     // frpc 的进程输出与日志一并归档，失败时可直接排障。
     if (frpc) {
       result.frpcExitCode = frpc.state.exitCode;
