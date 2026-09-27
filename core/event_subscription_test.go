@@ -509,7 +509,13 @@ func TestEventCriticalPrioritySurvivesFullBuffer(t *testing.T) {
 
 	// 干净 Shutdown 发布关键级 EngineStopped：缓冲已满，关键级必须挤掉最旧的
 	// 常规级事件存活。
-	if err := serverEngine.Shutdown(ctx); err != nil {
+	//
+	// Shutdown 用独立时限：上面的换代在旧代排空不收敛时会等满 drain 上限（客户端
+	// 维持循环计入代等待组，空闲桥接不结束就只能等超时再强制关闭），复用同一个 ctx
+	// 会让 Shutdown 因与「关键级优先」无关的原因立即超时，表现为约 5% 的假红。
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), eventWaitTimeout)
+	defer shutdownCancel()
+	if err := serverEngine.Shutdown(shutdownCtx); err != nil {
 		t.Fatalf("服务端关闭失败：%v", err)
 	}
 
