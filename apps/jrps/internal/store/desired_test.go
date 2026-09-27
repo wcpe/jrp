@@ -10,7 +10,7 @@ import (
 func TestDesiredDocumentRoundTrip(t *testing.T) {
 	doc := DesiredDocument{
 		SchemaVersion: DesiredSchemaVersion,
-		ControlListen: ControlListen{Host: "127.0.0.1", Port: 7200},
+		ControlListen: ControlListen{Host: "127.0.0.1", Port: 7200, Transport: ControlTransportTCP},
 		Proxies: []DesiredProxy{
 			{ID: "p1", ClientID: "c1", Name: "ssh", Type: "tcp", LocalPort: 22, RemotePort: 6022, Target: "127.0.0.1:22", CaptureEnabled: false, Deleted: false},
 		},
@@ -40,22 +40,64 @@ func TestDesiredDocumentRoundTrip(t *testing.T) {
 	}
 }
 
+// 旧版 schema v1 文档没有新增传输字段，解析后仍按 TCP 解释并可再次序列化。
+func TestParseDesiredDocumentLegacyControlListenRoundTrip(t *testing.T) {
+	content := `{"schemaVersion":1,"controlListen":{"host":"127.0.0.1","port":7200},"proxies":[]}`
+	parsed, err := ParseDesiredDocument(content)
+	if err != nil {
+		t.Fatalf("旧文档解析失败：%v", err)
+	}
+	if parsed.ControlListen.Transport != ControlTransportTCP {
+		t.Fatalf("旧文档默认传输应为 TCP：%+v", parsed.ControlListen)
+	}
+	serialized, err := MarshalDesiredDocument(parsed)
+	if err != nil {
+		t.Fatalf("旧文档重新序列化失败：%v", err)
+	}
+	roundTrip, err := ParseDesiredDocument(serialized)
+	if err != nil {
+		t.Fatalf("旧文档重新解析失败：%v", err)
+	}
+	if roundTrip.ControlListen != parsed.ControlListen {
+		t.Fatalf("旧文档 round-trip 不一致：读回 %+v，原始 %+v", roundTrip.ControlListen, parsed.ControlListen)
+	}
+}
+
 // 非法内容必须报错而不是静默为零值文档：真源内容损坏时宁可拒绝应用。
 func TestParseDesiredDocumentRejectsGarbage(t *testing.T) {
 	for name, content := range map[string]string{
-		"非 JSON":     "这不是 JSON",
-		"空文档":        "",
-		"缺版本":        `{"controlListen":{"host":"127.0.0.1","port":7200},"proxies":[]}`,
-		"版本超前":       `{"schemaVersion":2,"controlListen":{},"proxies":[]}`,
-		"缺控制监听":      `{"schemaVersion":1,"proxies":[]}`,
-		"端口越界":       `{"schemaVersion":1,"controlListen":{"host":"127.0.0.1","port":70000},"proxies":[]}`,
-		"代理缺标识":      `{"schemaVersion":1,"controlListen":{"host":"h","port":1},"proxies":[{"clientID":"c1","name":"n","type":"tcp","remotePort":1}]}`,
-		"代理远程端口越界":   `{"schemaVersion":1,"controlListen":{"host":"h","port":1},"proxies":[{"id":"p1","clientID":"c1","name":"n","type":"tcp","remotePort":0}]}`,
-		"代理类型未支持":    `{"schemaVersion":1,"controlListen":{"host":"h","port":1},"proxies":[{"id":"p1","clientID":"c1","name":"n","type":"stcp","remotePort":1}]}`,
-		"TCP 代理目标为空": `{"schemaVersion":1,"controlListen":{"host":"h","port":1},"proxies":[{"id":"p1","clientID":"c1","name":"n","type":"tcp","remotePort":1,"target":""}]}`,
+		"非 JSON":         "这不是 JSON",
+		"空文档":            "",
+		"缺版本":            `{"controlListen":{"host":"127.0.0.1","port":7200},"proxies":[]}`,
+		"版本超前":           `{"schemaVersion":2,"controlListen":{},"proxies":[]}`,
+		"缺控制监听":          `{"schemaVersion":1,"proxies":[]}`,
+		"端口越界":           `{"schemaVersion":1,"controlListen":{"host":"127.0.0.1","port":70000},"proxies":[]}`,
+		"传输方式未支持":        `{"schemaVersion":1,"controlListen":{"host":"127.0.0.1","port":7200,"transport":"http"},"proxies":[]}`,
+		"WebSocket 路径非法": `{"schemaVersion":1,"controlListen":{"host":"127.0.0.1","port":7200,"transport":"websocket","path":"frp"},"proxies":[]}`,
+		"代理缺标识":          `{"schemaVersion":1,"controlListen":{"host":"h","port":1},"proxies":[{"clientID":"c1","name":"n","type":"tcp","remotePort":1}]}`,
+		"代理远程端口越界":       `{"schemaVersion":1,"controlListen":{"host":"h","port":1},"proxies":[{"id":"p1","clientID":"c1","name":"n","type":"tcp","remotePort":0}]}`,
+		"代理类型未支持":        `{"schemaVersion":1,"controlListen":{"host":"h","port":1},"proxies":[{"id":"p1","clientID":"c1","name":"n","type":"stcp","remotePort":1}]}`,
+		"TCP 代理目标为空":     `{"schemaVersion":1,"controlListen":{"host":"h","port":1},"proxies":[{"id":"p1","clientID":"c1","name":"n","type":"tcp","remotePort":1,"target":""}]}`,
 	} {
 		if _, err := ParseDesiredDocument(content); err == nil {
 			t.Fatalf("%s 应被拒绝，实际通过", name)
+		}
+	}
+}
+
+// WSS 与 QUIC 必须同时提供证书和私钥路径；校验错误不得回显私钥路径。
+func TestParseDesiredDocumentRejectsMissingTLSConfig(t *testing.T) {
+	cases := map[string]string{
+		"WSS 缺少 TLS 配置": `{"schemaVersion":1,"controlListen":{"host":"127.0.0.1","port":7200,"transport":"wss"},"proxies":[]}`,
+		"QUIC 缺少私钥":     `{"schemaVersion":1,"controlListen":{"host":"127.0.0.1","port":7200,"transport":"quic","tlsCertFile":"server.crt"},"proxies":[]}`,
+	}
+	for name, content := range cases {
+		_, err := ParseDesiredDocument(content)
+		if err == nil {
+			t.Fatalf("%s 应被拒绝，实际通过", name)
+		}
+		if strings.Contains(err.Error(), "server.key") {
+			t.Fatalf("%s 错误泄露私钥路径：%v", name, err)
 		}
 	}
 }
@@ -135,8 +177,8 @@ func TestDesiredDocumentDefaultControlListen(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if doc.ControlListen.Port == 0 {
-			t.Fatalf("控制监听端口不应为 0：%+v", doc.ControlListen)
+		if doc.ControlListen.Port == 0 || doc.ControlListen.Transport != ControlTransportTCP {
+			t.Fatalf("控制监听默认值不正确：%+v", doc.ControlListen)
 		}
 		return nil
 	}); err != nil {

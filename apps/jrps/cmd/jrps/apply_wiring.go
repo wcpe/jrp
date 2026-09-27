@@ -2,11 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
-	"net/netip"
+	"os"
 
 	"github.com/wcpe/jrp/apps/jrps/internal/apply"
 	"github.com/wcpe/jrp/apps/jrps/internal/store"
@@ -15,7 +16,10 @@ import (
 )
 
 // 数据面控制监听的默认端口；desired 文档未显式指定时使用同一默认值。
-const dataPlaneListenPort = store.DefaultControlListenPort
+const (
+	dataPlaneListenPort = store.DefaultControlListenPort
+	defaultControlPath  = "/frp"
+)
 
 // storeCredentials 从 jrps 数据库组装数据面凭证集合（apply.CredentialProvider）。
 //
@@ -54,39 +58,144 @@ func (provider storeCredentials) DataPlaneCredentials(ctx context.Context) ([]co
 	return credentials, nil
 }
 
-// startEngine 装配 Core 服务端引擎：构造、注入控制监听器并启动。
+// startEngine 装配 Core 服务端引擎：先读取 desired 与 active 凭证，再按传输方式启动。
 //
-// 控制监听器由宿主创建并注入（Core 的所有权规则）：启动失败时监听器归宿主，
-// 这里统一关闭并返回错误。配置用最小合法集合——真实配置由启动恢复以 desired
-// 为输入走完整四阶段进入。
-func startEngine(ctx context.Context, logger *slog.Logger) (*server.Engine, error) {
-	listener, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", dataPlaneListenPort))
+// TCP 控制监听器由宿主创建并注入；其它传输由 Core 按配置自行创建监听器。
+func startEngine(ctx context.Context, database *store.Store, logger *slog.Logger) (*server.Engine, error) {
+	initialConfig, listener, err := startupConfig(ctx, database)
 	if err != nil {
-		return nil, fmt.Errorf("控制监听端口 %d 被占用：%w", dataPlaneListenPort, err)
+		return nil, err
 	}
-	initialConfig, err := core.NewServerConfig(
-		core.WithListen(core.BindEndpoint{
-			Address:   netip.AddrPortFrom(netip.IPv4Unspecified(), dataPlaneListenPort),
-			Transport: core.TransportTCP,
-		}),
-		core.WithWire(core.WireV1),
-		// bootstrap 凭证只满足构建器的非空约束；引擎启动后立即由启动恢复以
-		// desired 快照换代，占位值不会通过任何真实登录（快照里的凭证来自
-		// ActiveClientDigests，摘要语义）。
-		core.WithClientCredential(core.ClientCredential{ClientID: "bootstrap", Token: server.DigestToken("bootstrap")}),
-	)
-	if err != nil {
-		_ = listener.Close()
-		return nil, fmt.Errorf("构造引擎初始配置失败：%w", err)
+	options := []server.Option{server.WithLogger(logger)}
+	if listener != nil {
+		options = append(options, server.WithListener(listener))
 	}
-	// 引擎日志注入宿主日志器：连接级拒绝（版本判定、协商、登录、心跳失活）
-	// 此前无处可查，排障只能靠抓包。
-	engine := server.New(initialConfig, server.WithListener(listener), server.WithLogger(logger))
+	engine := server.New(initialConfig, options...)
 	if err := engine.Start(ctx); err != nil {
-		_ = listener.Close()
+		if listener != nil {
+			_ = listener.Close()
+		}
 		return nil, fmt.Errorf("引擎启动失败：%w", err)
 	}
 	return engine, nil
+}
+
+// startupConfig 读取启动前的 desired 与 active 凭证，并构造 Core 首次配置。
+func startupConfig(ctx context.Context, database *store.Store) (core.ServerConfig, net.Listener, error) {
+	document, credentials, err := loadStartupState(ctx, database)
+	if err != nil {
+		return core.ServerConfig{}, nil, err
+	}
+	config, err := buildStartupServerConfig(document, credentials)
+	if err != nil {
+		return core.ServerConfig{}, nil, err
+	}
+	if config.Listen().Transport != core.TransportTCP {
+		return config, nil, nil
+	}
+	listener, err := net.Listen("tcp", config.Listen().Address.String())
+	if err != nil {
+		return core.ServerConfig{}, nil, fmt.Errorf("控制监听端口被占用：%w", err)
+	}
+	return config, listener, nil
+}
+
+// loadStartupState 从数据库读取最新 desired 与当前 active 凭证。
+func loadStartupState(ctx context.Context, database *store.Store) (store.DesiredDocument, []core.ClientCredential, error) {
+	document := store.DesiredDocument{ControlListen: store.ControlListen{Port: dataPlaneListenPort}}
+	var credentials []core.ClientCredential
+	err := database.View(ctx, func(tx *store.Tx) error {
+		latest, err := tx.LatestRevision()
+		if errors.Is(err, store.ErrNoRevision) {
+			latest = store.ConfigRevision{}
+		} else if err != nil {
+			return err
+		}
+		if latest.Revision != 0 {
+			document, err = store.ParseDesiredDocument(latest.Content)
+			if err != nil {
+				return fmt.Errorf("读取最新 desired 失败：%w", err)
+			}
+		}
+		materials, err := tx.ActiveClientCredentials()
+		if err != nil {
+			return err
+		}
+		credentials = make([]core.ClientCredential, 0, len(materials))
+		for clientID, material := range materials {
+			credentials = append(credentials, core.ClientCredential{
+				ClientID:    clientID,
+				Token:       material.Digest,
+				CompatToken: material.CompatToken,
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		return store.DesiredDocument{}, nil, err
+	}
+	return document, credentials, nil
+}
+
+// buildStartupServerConfig 将 desired 控制监听转换为 Core 配置。
+func buildStartupServerConfig(document store.DesiredDocument, credentials []core.ClientCredential) (core.ServerConfig, error) {
+	listen, err := document.ControlListen.AddrPort()
+	if err != nil {
+		return core.ServerConfig{}, fmt.Errorf("构造控制监听失败：%w", err)
+	}
+	transport := document.ControlListen.Transport
+	if transport == "" {
+		transport = store.ControlTransportTCP
+	}
+	endpoint := core.BindEndpoint{Address: listen, Transport: core.Transport(transport)}
+	switch transport {
+	case store.ControlTransportWebSocket, store.ControlTransportWSS:
+		endpoint.TransportConfig.WebSocket.Path = document.ControlListen.Path
+		if endpoint.TransportConfig.WebSocket.Path == "" {
+			endpoint.TransportConfig.WebSocket.Path = defaultControlPath
+		}
+		if transport == store.ControlTransportWSS {
+			tlsConfig, err := readControlTLS(document.ControlListen.TLSCertFile, document.ControlListen.TLSKeyFile)
+			if err != nil {
+				return core.ServerConfig{}, err
+			}
+			endpoint.TransportConfig.WebSocket.TLS = tlsConfig
+		}
+	case store.ControlTransportQUIC:
+		tlsConfig, err := readControlTLS(document.ControlListen.TLSCertFile, document.ControlListen.TLSKeyFile)
+		if err != nil {
+			return core.ServerConfig{}, err
+		}
+		endpoint.TransportConfig.QUIC.TLS = tlsConfig
+	}
+	options := []core.ServerOption{core.WithListen(endpoint), core.WithWire(core.WireV1)}
+	if len(credentials) == 0 {
+		// 无版本或尚未有 active 凭证时，仅用占位凭证满足 Core 构建约束；
+		// 启动恢复成功后会立即用 active 凭证替换运行态。
+		credentials = []core.ClientCredential{{ClientID: "bootstrap", Token: server.DigestToken("bootstrap")}}
+	}
+	options = append(options, core.WithClientCredentials(credentials))
+	config, err := core.NewServerConfig(options...)
+	if err != nil {
+		return core.ServerConfig{}, fmt.Errorf("构造引擎初始配置失败：%w", err)
+	}
+	return config, nil
+}
+
+// readControlTLS 从 desired 指定的文件读取证书与私钥 PEM。
+func readControlTLS(certPath, keyPath string) (core.TLSConfig, error) {
+	certificatePEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return core.TLSConfig{}, errors.New("读取控制监听 TLS 证书失败")
+	}
+	privateKeyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		return core.TLSConfig{}, errors.New("读取控制监听 TLS 私钥失败")
+	}
+	if _, err := tls.X509KeyPair(certificatePEM, privateKeyPEM); err != nil {
+		return core.TLSConfig{}, errors.New("解析控制监听 TLS 证书失败")
+	}
+	return core.TLSConfig{CertificatePEM: string(certificatePEM), PrivateKeyPEM: string(privateKeyPEM)}, nil
 }
 
 // assembleApplyService 装配配置应用编排服务并执行启动恢复。
