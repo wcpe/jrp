@@ -40,6 +40,10 @@
 - STCP 鉴权、允许列表、重放与信息泄露。
 - XTCP 候选交换、超时、部分成功、失败回收和真实 NAT 环境。
 - 代理×传输矩阵与固定基线官方 frpc 黑盒互操作。
+  黑盒互操作矩阵在 CI 的 `compat-interop` job 内以 Linux 运行时复跑（`task build:go` 后直接调用
+  `scripts/compat/run-matrix.mjs`），因此「官方客户端能在 Linux 上跑通」是持续门禁而非一次性结论；
+  该 job 不含 kcp（基线客户端不发数据报，已登记为客户端限制），且依赖官方发行包摘要登记表
+  `scripts/compat/frpc.mjs`——新增平台前必须先登记官方 `frp_sha256_checksums.txt` 中的摘要。
 
 ### 2.5 无中断热更
 

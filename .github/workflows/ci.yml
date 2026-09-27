@@ -112,6 +112,35 @@ jobs:
       - run: task workspace:sync
       - run: task test:fuzz
 
+  compat-interop:
+    name: 官方客户端互操作 / Linux
+    runs-on: ubuntu-latest
+    # 官方客户端互操作此前只在本机 Windows 上跑过，Linux 运行时无人验证——而它正是
+    # 跨平台验收缺的那一半。本 job 在 Linux runner 上用官方 frpc 的 Linux 发行包
+    # （摘要已登记在 scripts/compat/frpc.mjs，与官方 frp_sha256_checksums.txt 一致）
+    # 复跑互操作矩阵，把"能在 Linux 上跑通"变成持续门禁而不是一次性结论。
+    # 不含 kcp：官方 frpc v0.70.0 在 protocol=kcp 下不发出数据报，已登记为基线客户端
+    # 限制，纳入只会让 job 空等超时。
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.25.x
+          cache-dependency-path: |
+            go.work.sum
+            apps/jrps/go.sum
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: arduino/setup-task@v3
+        with:
+          version: 3.52.0
+      - run: task workspace:sync
+      # 黑盒宿主需要已构建的 jrps 回退产物（bin/jrps，Linux 下无扩展名）。
+      - run: task build:go
+      - run: node scripts/compat/run-matrix.mjs --transport=tcp,websocket,wss,quic --wire=both --case=login,proxy-tcp
+
   web-production:
     name: Web 与生产构建 / Ubuntu
     runs-on: ubuntu-latest
