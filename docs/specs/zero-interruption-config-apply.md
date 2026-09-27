@@ -146,6 +146,7 @@ drain（旧资源不再接新流量，已有流跑到自然结束或排空上限
 - **已定位（客户端侧换代排空偶发等满上限，处置待定）**：现象是客户端换代偶发把 `Apply` 从毫秒级拖到 `drainTimeout` 上限（默认 10s）并返回 `DrainIncomplete: true`。**根因证据**：在并发重载下循环事件订阅用例 200 次，出现 24 次排空超 1 秒，用 goroutine 栈转储（`generation.waitDrained` 处埋点，临时注入、已还原）抓到被等待的对象——`startGeneration` 计入代等待组的是维持循环 goroutine，而它此时**停在 `transport.Bridge` 的 `select` 上**（栈：`maintainWorkConns → maintainOneProxy → serveOneWorkConn → serveWorkConn → transport.Bridge`），即等待的是**仍存活的工作连接桥接**，不是内部空转的循环。
   - **这不是计数口径问题**：对 TCP/UDP 代理，一条工作连接桥接的就是一条用户连接，空闲（如 keep-alive 间歇）不代表可以切断——「长连接不断开」正是本规格的验收要求，所以等待本身是正确的。
   - **问题在于收敛与耦合**：对端若不主动收尾，本端只能等满上限再 `closeConns` 强制关闭；而排空与 `Apply` 同步，于是「偶发 10 秒的 Apply」。`TestIntegrationApplyKeepsLongConnectionAlive` 在 CI 上出现过同族现象（切换后新访客 `i/o timeout`，该用例的 10s 重试恰好等于排空上限；同 run 重跑即绿，本机重载 40/40 无法复现），但**服务端侧是否也在等**尚未取到栈证据，不能据此下结论。
+  - **对端状态已取证**：同一批转储里服务端侧没有任何排空或等待中的 goroutine——控制循环与访客服务都停在 IO wait（`serveControlLoop`、`serveGuest`）。所以停滞不是「服务端也在等」，而是**换代时没有任何一方主动收尾旧代的工作连接**：旧桥接既无人关闭、也无数据推动，客户端排空只能等满上限再强制关闭。
   - **处置建议（按代价从小到大）**：① 换代时由对端主动结束旧代工作连接的读侧（半关闭或关闭帧），让桥接及时收敛——需在协议层确认服务端切换时已有／可加该动作；② 把排空阶段与 `Apply` 解耦（publish 后即可返回，排空在后台按上限继续，状态经事件上报）——代价是调用方不再同步拿到 `DrainIncomplete`；③ 结构性方案：工作连接池跨代共享，换代根本不需要排空桥接（与 FR-26 中已回滚的「多 worker 并行维持」同源，需独立 FR 重设计）。
   - 该实现自 FR-26/FR-27 起未变（与本分支零差异）；事件订阅用例的假红已按「Shutdown 用独立时限」单独修掉（判定目的与排空无关）。
 - **风险**：health-check 无法覆盖所有运行期故障，例如依赖在 publish 后才不可达。该类故障归入 publish 后异常，只告警不回切，可能导致短时降级。
