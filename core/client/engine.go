@@ -449,11 +449,20 @@ func (engine *Engine) log() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// track 登记本代的一条活动连接。
-func (gen *generation) track(conn *transport.Conn) {
+// trackIfActive 在本代尚未停止时登记连接，返回是否登记成功。
+//
+// 与 stop() 的清扫必须互斥：stop 先在锁内置位停止标记，随后关闭本代全部待命连接；
+// 若调用方先复查停止、再登记，两步之间的窗口会让连接在本代清扫之后才进表，成为
+// 无人清理的待命桥接——它挂着桥接 goroutine，使换代排空只能等满上限。返回 false
+// 时调用方必须立即关闭该连接。
+func (gen *generation) trackIfActive(conn *transport.Conn) bool {
 	gen.engine.mu.Lock()
 	defer gen.engine.mu.Unlock()
+	if gen.stopping {
+		return false
+	}
 	gen.conns[conn] = struct{}{}
+	return true
 }
 
 // untrack 移除本代的一条活动连接。
@@ -911,22 +920,20 @@ func (engine *Engine) serveOneWorkConn(gen *generation, proxy core.ClientProxy) 
 		}
 		return
 	}
-	// 停止复查：拨号期间本代可能已被停（drain/Shutdown）。此时连接尚未登记，
-	// closeStandby 的清理覆盖不到它，直接关闭并返回，否则它会作为"漏网待命"
-	// 桥接挂进旧代等待组，让 drain 永远等不满。
-	select {
-	case <-gen.stopCh:
-		_ = work.Close()
-		return
-	default:
-	}
 	auth := gen.config.Auth()
 	if err := declareWorkConn(work, gen.config.ClientID(), auth.Token, proxy.ProxyName(), proxy.ProxyLocalAddr()); err != nil {
 		_ = work.Close()
 		return
 	}
+	// 登记与停止必须原子：只在拨号后复查一次停止标记不够——复查与登记之间要写
+	// 网络（声明），落在窗口里的连接会在本代清扫之后才进表，成为无人清理的待命
+	// 桥接，挂着桥接 goroutine 让 drain 只能等满上限（重载实测 200 次命中 24 次）。
+	// trackIfActive 在同一把锁内判定停止状态，停止后一律拒绝登记并立即关闭连接。
+	if !gen.trackIfActive(work) {
+		_ = work.Close()
+		return
+	}
 	// 声明已发送：服务端暂存该连接等待访客，本端拨号本地目标后进入转发。
-	gen.track(work)
 	engine.serveWorkConn(gen, work, proxy)
 	gen.untrack(work)
 	_ = work.Close()

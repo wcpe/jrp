@@ -143,12 +143,10 @@ drain（旧资源不再接新流量，已有流跑到自然结束或排空上限
 
 - **已定（jrps 批次）**：凭证与数据面的边界——jrps 只存 token 摘要（FR-07），Core 的 wire v1 登录按明文比对（FR-25 最小实现），两者之间暂无可用桥。jrps 装配的快照使用由客户端标识派生的占位凭证集合（仅保留归属关系与通过构建器校验），真实数据面鉴权随 FR-03 兼容登录链交付，届时按 `apply.CredentialProvider` 接口位替换实现，编排层不变。此前提下本批交付的应用编排、状态推进、审计与查询语义均完整可用。
 - **风险**：drain 上限设置过短会切断正常长业务流，过长会长期占用资源。缓解方式是默认上限在此规格交付前定稿，管理员可在 Web 查看当前排空状态，超限释放必须留审计记录。
-- **已定位（客户端侧换代排空偶发等满上限，处置待定）**：现象是客户端换代偶发把 `Apply` 从毫秒级拖到 `drainTimeout` 上限（默认 10s）并返回 `DrainIncomplete: true`。**根因证据**：在并发重载下循环事件订阅用例 200 次，出现 24 次排空超 1 秒，用 goroutine 栈转储（`generation.waitDrained` 处埋点，临时注入、已还原）抓到被等待的对象——`startGeneration` 计入代等待组的是维持循环 goroutine，而它此时**停在 `transport.Bridge` 的 `select` 上**（栈：`maintainWorkConns → maintainOneProxy → serveOneWorkConn → serveWorkConn → transport.Bridge`），即等待的是**仍存活的工作连接桥接**，不是内部空转的循环。
-  - **这不是计数口径问题**：对 TCP/UDP 代理，一条工作连接桥接的就是一条用户连接，空闲（如 keep-alive 间歇）不代表可以切断——「长连接不断开」正是本规格的验收要求，所以等待本身是正确的。
-  - **问题在于收敛与耦合**：对端若不主动收尾，本端只能等满上限再 `closeConns` 强制关闭；而排空与 `Apply` 同步，于是「偶发 10 秒的 Apply」。`TestIntegrationApplyKeepsLongConnectionAlive` 在 CI 上出现过同族现象（切换后新访客 `i/o timeout`，该用例的 10s 重试恰好等于排空上限；同 run 重跑即绿，本机重载 40/40 无法复现），但**服务端侧是否也在等**尚未取到栈证据，不能据此下结论。
-  - **对端状态已取证**：同一批转储里服务端侧没有任何排空或等待中的 goroutine——控制循环与访客服务都停在 IO wait（`serveControlLoop`、`serveGuest`）。所以停滞不是「服务端也在等」，而是**换代时没有任何一方主动收尾旧代的工作连接**：旧桥接既无人关闭、也无数据推动，客户端排空只能等满上限再强制关闭。
-  - **处置建议（按代价从小到大）**：① 换代时由对端主动结束旧代工作连接的读侧（半关闭或关闭帧），让桥接及时收敛——需在协议层确认服务端切换时已有／可加该动作；② 把排空阶段与 `Apply` 解耦（publish 后即可返回，排空在后台按上限继续，状态经事件上报）——代价是调用方不再同步拿到 `DrainIncomplete`；③ 结构性方案：工作连接池跨代共享，换代根本不需要排空桥接（与 FR-26 中已回滚的「多 worker 并行维持」同源，需独立 FR 重设计）。
-  - 该实现自 FR-26/FR-27 起未变（与本分支零差异）；事件订阅用例的假红已按「Shutdown 用独立时限」单独修掉（判定目的与排空无关）。
+- **已定位并修复其一（客户端待命连接漏入旧代等待组）**：现象是客户端换代偶发把 `Apply` 从毫秒级拖到 `drainTimeout` 上限（默认 10s）并返回 `DrainIncomplete: true`。**根因证据**：在并发重载下循环事件订阅用例 200 次，出现 24 次排空超 1 秒，用 goroutine 栈转储（`generation.waitDrained` 处埋点，临时注入、已还原）抓到被等待的对象——`startGeneration` 计入代等待组的是维持循环 goroutine，而它此时**停在 `transport.Bridge` 的 `select` 上**（栈：`maintainWorkConns → maintainOneProxy → serveOneWorkConn → serveWorkConn → transport.Bridge`），即等待的是**仍存活的工作连接桥接**，不是内部空转的循环。同一批转储里服务端侧没有任何排空或等待中的 goroutine（控制循环与访客服务都停在 IO wait），所以停滞不是两端互等。
+  - **可修的那部分**：客户端 `serveOneWorkConn` 原先「拨号后复查停止标记 → 写网络声明 → 登记」三步之间没有互斥，落在这个窗口里的连接会在本代清扫之后才进表，成为无人清理的待命桥接，把等待组永久挂住。改为 **`trackIfActive`：在同一把锁内判定停止状态并登记**，停止后一律拒绝登记并立即关闭连接；回归用例 `TestGenerationTrackRefusedAfterStop`（含变异验证）+ 重载对照（修复前 200 次命中 24 次 → 修复后 0 次），整轮耗时从 150–250s 降到 13s。等待「活着的桥接」本身是正确语义（TCP/UDP 代理下一条工作连接就是一条用户连接），不在本次改动范围内。
+  - **仍未处置**：对端不主动收尾时的收敛（①对端在切换时结束旧代工作连接读侧／②排空与 `Apply` 解耦／③工作连接池跨代共享）三条建议保留待定，涉及 Core 客户端代生命周期与 FR-26 中已回滚的池重设计。
+- **已定位（本分支引入的换代后新流量不可用回归，未修复）**：`TestIntegrationApplyKeepsLongConnectionAlive` 在本分支上以 `-race` 稳定失败（`cd apps/jrps && go test -race -run TestIntegrationApplyKeepsLongConnectionAlive -count 1 ./internal/apply/`，本机 12–13/15；`origin/main` 基线 0/15）。`git bisect` 定位到首个坏提交 `ebea434`（jrps 控制入口多传输）。机制证据（临时探针，已还原）：换代后每条新访客在配对中心都是「无待命连接可用」而暂存，客户端侧**不再登记任何新工作连接**，换代前的待命连接也不在暂存队列中；服务端没有任何工作连接声明被拒的告警。即：换代把该代理的待命工作连接弄丢，客户端又不补——新访客会一直等到失活超时。**合并前必须修复**；这不属于「排空语义」待定项，而是本分支的回归。
 - **风险**：health-check 无法覆盖所有运行期故障，例如依赖在 publish 后才不可达。该类故障归入 publish 后异常，只告警不回切，可能导致短时降级。
 - **风险**：端口冲突型 health-check 失败在并发应用时可能与其他进程竞争，需要确保释放顺序与重试提示明确。
 - **待定**：STCP 与 XTCP 等代理类型在 drain 阶段的自然结束判定标准需结合 FR-06b 的实现结果细化。
