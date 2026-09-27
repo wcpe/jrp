@@ -16,6 +16,7 @@ const maxPort = 65535
 // 代理条目内部按注册校验四级顺序执行：字段合法性 → 权限 → 冲突 → P1 范围（FR-06a §3.2）。
 func (config ClientConfig) Validate() error {
 	problems := validateClientEndpoint(config)
+	problems = append(problems, validateTransportConfig("endpoint.transportConfig", config.endpoint.Transport, config.endpoint.TransportConfig)...)
 	problems = append(problems, validateClientAuth(config)...)
 	problems = append(problems, validateClientProxies(config)...)
 	problems = append(problems, validateLimit("proxies", config.proxyCount(), MaxProxyCount)...)
@@ -30,6 +31,7 @@ func (config ClientConfig) Validate() error {
 // 绑定集合内部按注册校验四级顺序执行：字段合法性 → 权限 → 冲突 → P1 范围（FR-06a §3.2）。
 func (config ServerConfig) Validate() error {
 	problems := validateListen(config)
+	problems = append(problems, validateTransportConfig("listen.transportConfig", config.listen.Transport, config.listen.TransportConfig)...)
 	problems = append(problems, validateWire(config.wire)...)
 	problems = append(problems, validateCredentials(config.credentials)...)
 	problems = append(problems, validateLimit("credentials", len(config.credentials), MaxClientCredentialCount)...)
@@ -434,6 +436,33 @@ func validateListen(config ServerConfig) []*ConfigError {
 
 	problems := validateListenAddress("listen.address", config.listen.Address)
 	problems = append(problems, validateEnum("listen.transport", config.listen.Transport, supportedTransports)...)
+	return problems
+}
+
+// validateTransportConfig 校验所选传输的专属参数，避免无关参数影响其它传输。
+func validateTransportConfig(field string, transport Transport, config TransportConfig) []*ConfigError {
+	problems := make([]*ConfigError, 0)
+	if config.WebSocket.MaxPayloadBytes < 0 {
+		problems = append(problems, newConfigError(CodeLimitExceeded, field+".webSocket.maxPayloadBytes", "消息上限不能为负值"))
+	}
+	if config.KCP.MTU < 0 || config.KCP.SendWindow < 0 || config.KCP.ReceiveWindow < 0 || config.KCP.DataShards < 0 || config.KCP.ParityShards < 0 || config.KCP.Resend < 0 {
+		problems = append(problems, newConfigError(CodeLimitExceeded, field+".kcp", "KCP 参数不能为负值"))
+	}
+	if config.KCP.Interval < 0 {
+		problems = append(problems, newConfigError(CodeInvalidDuration, field+".kcp.interval", "时间参数不能为负值"))
+	}
+	if config.QUIC.HandshakeTimeout < 0 || config.QUIC.MaxIdleTimeout < 0 || config.QUIC.KeepAlivePeriod < 0 {
+		problems = append(problems, newConfigError(CodeInvalidDuration, field+".quic", "时间参数不能为负值"))
+	}
+	if config.QUIC.MaxIncomingStreams < 0 {
+		problems = append(problems, newConfigError(CodeLimitExceeded, field+".quic.maxIncomingStreams", "流数量不能为负值"))
+	}
+	if transport == TransportWSS && len(config.WebSocket.TLS.CertificatePEM) == 0 && len(config.WebSocket.TLS.PrivateKeyPEM) != 0 {
+		problems = append(problems, newConfigError(CodeIncomplete, field+".webSocket.tls.certificatePEM", "WSS 提供私钥时必须同时提供证书"))
+	}
+	if transport == TransportQUIC && len(config.QUIC.TLS.CertificatePEM) == 0 && len(config.QUIC.TLS.PrivateKeyPEM) != 0 {
+		problems = append(problems, newConfigError(CodeIncomplete, field+".quic.tls.certificatePEM", "QUIC 提供私钥时必须同时提供证书"))
+	}
 	return problems
 }
 

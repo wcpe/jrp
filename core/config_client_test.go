@@ -341,7 +341,8 @@ func TestNewClientConfigValidationErrors(t *testing.T) {
 			name: "传输取值不在已交付集合内",
 			options: func() []core.ClientOption {
 				endpoint := validServerEndpoint()
-				endpoint.Transport = "kcp"
+				endpoint.Transport = "unsupported"
+
 				return withClientOptions(core.WithServerEndpoint(endpoint))
 			},
 			code:  core.CodeUnsupportedValue,
@@ -479,7 +480,7 @@ func TestNewClientConfigAggregatesAllProblems(t *testing.T) {
 // 即可知道可填什么。此处同时覆盖枚举与 wire 两个字段。
 func TestUnsupportedValueErrorListsSupportedValues(t *testing.T) {
 	endpoint := validServerEndpoint()
-	endpoint.Transport = "kcp"
+	endpoint.Transport = "unsupported"
 
 	_, err := core.NewClientConfig(
 		core.WithClientID("client-a"),

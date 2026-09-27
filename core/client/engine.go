@@ -212,23 +212,56 @@ func (engine *Engine) Start(ctx context.Context) error {
 //
 // 超时来自配置快照：拨号必须带超时，禁止无超时拨号（规格 §3.4）。
 func (engine *Engine) dialControl(ctx context.Context, endpoint core.ServerEndpoint) (*controlSession, error) {
-	conn, err := engine.dial(ctx, endpoint.Address.String(), transport.PurposeControl)
+	conn, err := engine.dial(ctx, endpoint, transport.PurposeControl)
 	if err != nil {
 		return nil, fmt.Errorf("客户端拨号失败：%w", err)
 	}
 	return &controlSession{conn: conn, done: make(chan struct{})}, nil
 }
 
-// dial 拨号一条带用途标记的工作连接。
+// dial 按端点传输选择拨号适配器，并返回带用途标记的工作连接。
 //
-// 超时来自配置快照，由传输层强制门禁：禁止无超时拨号（规格 §3.4）。
+// TCP 继续复用原有带超时拨号器；其余传输由 internal/transport 适配器负责。
 func (engine *Engine) dial(
 	ctx context.Context,
-	address string,
+	endpoint core.ServerEndpoint,
 	purpose transport.Purpose,
 	proxy ...string,
 ) (*transport.Conn, error) {
-	return engine.dialer.Dial(ctx, address, purpose, proxy...)
+	address := endpoint.Address.String()
+	switch endpoint.Transport {
+	case core.TransportTCP:
+		return engine.dialer.Dial(ctx, address, purpose, proxy...)
+	case core.TransportWebSocket, core.TransportWSS:
+		options, err := transport.WebSocketOptionsFromConfig(
+			endpoint.TransportConfig.WebSocket, endpoint.Transport == core.TransportWSS,
+		)
+		if err != nil {
+			return nil, err
+		}
+		return transport.DialWebSocket(ctx, address, options, purpose, firstProxy(proxy))
+	case core.TransportKCP:
+		options, err := transport.KCPOptionsFromConfig(endpoint.TransportConfig.KCP)
+		if err != nil {
+			return nil, err
+		}
+		return transport.DialKCP(ctx, address, options, purpose, firstProxy(proxy))
+	case core.TransportQUIC:
+		options, err := transport.QUICOptionsFromConfig(endpoint.TransportConfig.QUIC, false)
+		if err != nil {
+			return nil, err
+		}
+		return transport.DialQUIC(ctx, address, options, purpose, firstProxy(proxy))
+	default:
+		return nil, fmt.Errorf("不支持的客户端传输：%s", endpoint.Transport)
+	}
+}
+
+func firstProxy(proxy []string) string {
+	if len(proxy) == 0 {
+		return ""
+	}
+	return proxy[0]
 }
 
 // claimStartSlot 校验配置并原子认领启动位，返回服务端端点。
@@ -869,8 +902,8 @@ func (engine *Engine) maintainOneProxy(gen *generation, proxy core.ClientProxy) 
 // 声明载荷携带本地目标地址：服务端据此判定目标是否在该客户端被允许的地址
 // 集合内，越权即拒绝（FR-06a §3.3）。
 func (engine *Engine) serveOneWorkConn(gen *generation, proxy core.ClientProxy) {
-	work, err := gen.dialer.Dial(
-		context.Background(), gen.config.ServerEndpoint().Address.String(), transport.PurposeWork, proxy.ProxyName())
+	work, err := engine.dial(
+		context.Background(), gen.config.ServerEndpoint(), transport.PurposeWork, proxy.ProxyName())
 	if err != nil {
 		select {
 		case <-gen.stopCh:
