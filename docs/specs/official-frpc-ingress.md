@@ -205,6 +205,10 @@ JRP 侧能力已独立确认：控制入口按 desired 就绪（服务端日志�
 
 真实网络批次（公网、弱网、NAT、反向代理、跨平台）不在此表内：它必须由执行者在目标环境运行 `scripts/compat/real-network.mjs` 并回填报告，自动化结果不替代实机结论。
 
+**公网实机批次已完成（2026-09-27，服务端为原生公网地址的 Linux 主机，客户端为 NAT 后的 Windows）**：tcp / websocket / quic 三种控制入口传输 × wire v1/v2 共 6 项全部通过，五项断言（登录、代理注册、入口回显逐字节一致、观察期心跳稳定、重启后重新登录）全绿；覆盖 Windows 客户端 ↔ Linux 服务端的真实跨端组合与跨运营商/跨境链路。KCP 因基线客户端限制不在批次内；WSS 由本机真实 nginx 终结 TLS 拓扑覆盖。完整报告（含执行者回填项与三项按设计生效的行为）见 `.tmp/fr03-closeout/real-acceptance/REPORT.md`（证据不入库）。
+
+实机同时暴露并修复一处外壳缺陷：`jrps` 的启动恢复路径也执行「控制入口身份比较」，而比较基准是上次记录的 active——重启时引擎已按最新 desired 建立新监听，于是把重启本应生效的新身份判为非法变更，入口永远停在旧传输（desired 由 tcp 改为 websocket 后重启即复现）。恢复现已跳过该守卫，热更路径的守卫不变（回归用例 `TestRecoverAppliesChangedBootstrapIdentity`）。
+
 实机批次的前置验证已完成（本机链路夹具 `scripts/compat/link-fixtures.mjs`）：
 
 - **反向代理升级路径**：WebSocket 经本地 HTTP 反向代理（升级透传）执行双 wire 验收，v1/v2 均通过；该验证同时暴露并修复了控制会话接管的登记竞态（见 CHANGELOG「变更」）。更进一步，**真实反向代理软件**已按三种拓扑实测（nginx 1.28.3，`proxy_read_timeout` 默认 60s，显式透传 `Upgrade`/`Connection`）：**L4 stream 透传**下 tcp 传输全部 10 个用例 × 双 wire 共 20/20 通过；**L7 明文反代**下 websocket 传输 16/20 通过、4 项 blocked（`heartbeat-relay` 与 `work-conn-rejected` 依赖裸 TCP 帧或本机中继，仅在 tcp 传输下可执行，已按 blocked 如实登记而非计失败）、0 失败；**L7 终结 TLS**（前端 wss、后端明文 ws）下登录与入口回显双 wire 4/4 通过。反代空闲读超时与心跳间隔的关系也已量化：心跳 90s（大于反代 60s 超时）时 nginx 在 60s 空闲后切断升级连接（`upstream timed out … while proxying upgraded connection`），官方客户端用同一 runID 自动重连，服务端侧会话事件由 1 次变 2 次；心跳 30s（官方默认，小于反代超时）时同一窗口内反代零超时、会话事件恒为 1 次。结论：**反代空闲超时必须大于客户端心跳间隔**，nginx 默认 60s 对默认心跳是安全的。

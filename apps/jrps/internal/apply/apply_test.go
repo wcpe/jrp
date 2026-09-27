@@ -429,6 +429,38 @@ func TestApplyDesiredRejectsBootstrapIdentityChange(t *testing.T) {
 	}
 }
 
+// TestRecoverAppliesChangedBootstrapIdentity 固定「重启后新控制入口身份必须生效」。
+//
+// 曾经缺陷：恢复路径也做引导身份比较，而它比的是"上次记录的 active"——重启时
+// 引擎已按最新 desired 建立了新监听，于是把重启生效的新身份判成非法变更并拒绝，
+// 入口永远停在旧传输上（desired 从 tcp 改为 websocket 后重启，恢复被拒）。
+func TestRecoverAppliesChangedBootstrapIdentity(t *testing.T) {
+	engine := &stubEngine{result: core.ApplyResult{Stage: core.StageDrained}}
+	service, database := newTestService(t, engine, testCredentials())
+	firstRevision := latestRevision(t, database)
+	if err := service.ApplyDesired(context.Background(), firstRevision, store.ActorAdmin("admin"), "req-first"); err != nil {
+		t.Fatalf("初次应用失败：%v", err)
+	}
+	// 模拟管理员改了控制入口传输并重启：desired 推进到新版本。
+	secondRevision := appendDesiredContent(t, database,
+		`{"schemaVersion":1,"controlListen":{"host":"127.0.0.1","port":7200,"transport":"websocket","path":"/control"},"proxies":[]}`)
+
+	// 热更仍必须拒绝（这是引导参数的既定语义）。
+	if err := service.ApplyDesired(context.Background(), secondRevision, store.ActorAdmin("admin"), "req-second"); !errors.Is(err, ErrBootstrapIdentityChanged) {
+		t.Fatalf("热更路径仍应拒绝身份变化，实际：%v", err)
+	}
+	// 恢复路径必须放行：重启就是为了让新身份生效。
+	outcome := service.RecoverApplier(store.ActorAdmin("server")).Apply(context.Background(), "")
+	for _, phase := range outcome.Phases {
+		if !phase.Succeeded {
+			t.Fatalf("恢复不应因引导身份变化而失败：阶段 %s 详情 %s", phase.Phase, phase.ErrorDetail)
+		}
+	}
+	if len(engine.revisions) != 2 {
+		t.Fatalf("恢复应把新版本交给引擎，实际已应用版本=%v", engine.revisions)
+	}
+}
+
 func TestApplyDesiredProxyChangeKeepsBootstrapHotApply(t *testing.T) {
 	engine := &stubEngine{result: core.ApplyResult{Stage: core.StageDrained}}
 	service, database := newTestService(t, engine, testCredentials())

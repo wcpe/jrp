@@ -189,10 +189,16 @@ func (service *Service) runPhases(ctx context.Context, revision uint64, content 
 			"版本", revision, "错误", err)
 		return service.recordValidateFailure(ctx, revision, actor, requestID, err)
 	}
-	if err := service.ensureBootstrapIdentity(ctx, content, config.Listen()); err != nil {
-		logger.Warn("控制入口身份变化，拒绝热更并保留旧 active",
-			"版本", revision, "错误", err)
-		return service.recordValidateFailure(ctx, revision, actor, requestID, err)
+	// 控制入口身份只在热更路径上有意义：启动时引擎已按最新 desired 建立了监听
+	// 套接字，此时拿"上次记录的 active"与新快照比较，会把重启生效的新身份判定为
+	// 非法变更并拒绝——自己把自己卡在旧传输上（实测：desired 从 tcp 改为 websocket
+	// 后重启，恢复被拒、入口永远停在 tcp）。恢复路径因此跳过该守卫。
+	if requestID != "recover" {
+		if err := service.ensureBootstrapIdentity(ctx, content, config.Listen()); err != nil {
+			logger.Warn("控制入口身份变化，拒绝热更并保留旧 active",
+				"版本", revision, "错误", err)
+			return service.recordValidateFailure(ctx, revision, actor, requestID, err)
+		}
 	}
 
 	// 每个阶段有独立超时（规格 §3.3）；Core 的 drain 自带排空上限，此处不再叠加。
