@@ -277,6 +277,25 @@ func (broker *workBroker) takeStaged(proxyName string) *transport.Conn {
 	return broker.works.Take(proxyName)
 }
 
+// stagedWorkConns 返回该代理暂存（未配对）的工作连接数量。
+func (broker *workBroker) stagedWorkConns(proxyName string) int {
+	broker.mu.Lock()
+	defer broker.mu.Unlock()
+	return broker.works.Len(proxyName)
+}
+
+// closeStagedWorks 只关闭尚未配对的待命工作连接，保留等待配对的访客。
+//
+// 换代重建配对中心时调用：被替换掉的旧中心里的待命连接不再被任何一代引用，
+// 若只是丢弃引用而不关闭，客户端的维持循环会认为仍有待命连接而不补建，
+// 新访客于是一直暂存到失活超时（实测：等价配置二次应用后，新访客全部暂存，
+// 直到排空上限才恢复）。关闭后客户端会立刻补建一条新的待命连接。
+func (broker *workBroker) closeStagedWorks() {
+	broker.mu.Lock()
+	defer broker.mu.Unlock()
+	_ = broker.works.Close()
+}
+
 // closeStaged 关闭尚未配对的暂存连接并拒绝后续配对。
 //
 // 已配对并进入桥接的连接不在此处理：它们承载活动流，由 Engine 按排水上限

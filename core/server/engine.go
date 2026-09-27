@@ -727,6 +727,19 @@ func (engine *Engine) GuestAddr(name string) net.Addr {
 	return engine.active.guestAddr[name]
 }
 
+// StagedWorkConns 返回该代理当前暂存（未配对）的工作连接数量。
+//
+// 运维口径：待命连接是客户端为换代准备的缓冲。若新访客持续到达而该计数长期
+// 为 0，说明客户端没有补建——换代重建配对中心时必须关闭旧中心的待命连接，
+// 否则它们会永久泄漏（客户端误以为仍有待命连接而不补建）。
+func (engine *Engine) StagedWorkConns(name string) int {
+	broker := engine.activeBroker()
+	if broker == nil {
+		return 0
+	}
+	return broker.stagedWorkConns(name)
+}
+
 // RejectedGuests 返回累计因暂存队列达上限而被拒绝的访客连接数。
 //
 // 该计数是宿主观察服务端承接能力的入口：拒绝意味着并发等待用户超过了上限，
