@@ -8,7 +8,10 @@
 
 ### 新增
 
-- FR-03 官方 frpc 接入（进行中）：黑盒互操作矩阵与真实官方二进制验证落地——消息契约按官方对齐（登录、心跳、代理注册、工作连接的字段名与响应形状，关闭代理无响应，请求工作连接类型登记）；数据面鉴权按官方材料形态实现兼容例外；v1 控制通道加密（AES-128-CFB，盐值取官方覆盖值 `"frp"`）；工作连接改由服务端指派（req-work-conn → new-work-conn → start-work-conn）。端到端验证通过：官方 frpc v0.70.0 注册的代理可经服务端入口转发访问，回显逐字节一致。
+- FR-03 官方 frpc 接入（自动化矩阵完成，实机验收待确认）：黑盒互操作矩阵与真实官方二进制验证落地——消息契约按官方对齐（登录、心跳、代理注册、工作连接的字段名与响应形状，关闭代理无响应，请求工作连接类型登记）；数据面鉴权按官方材料形态实现兼容例外；v1 控制通道加密（AES-128-CFB，盐值取官方覆盖值 `"frp"`）；工作连接改由服务端指派。官方 frpc v0.70.0 在 wire v1/v2 下的 TCP、UDP、HTTP、HTTPS 代理、鉴权拒绝、P2 STCP 拒绝、端口冲突、心跳 relay 和无效运行 ID 工作连接共 20 项黑盒用例全部通过。
+- FR-05b/FR-05c 传输适配：用户批准 `golang.org/x/net`、`kcp-go/v5` 与 `quic-go` 后，Core 增加 WebSocket/WSS、KCP、QUIC 配置校验、内部适配、TLS 指纹固定和 Engine 传输选择。官方 frpc v0.70.0 传输矩阵中 TCP、WebSocket、WSS、QUIC 的登录与 TCP 代理端到端回显在 wire v1/v2 下全部通过；KCP 因基线客户端不发出数据报（三种配置组合零流量，对照官方 frps 亦无连接）经用户确认登记为基线客户端限制，不计入 P1 互操作门禁。公网/弱网/NAT 实机验收待用户执行。
+- jrps 控制入口可配置传输：desired `controlListen` 新增 `transport` 与 WebSocket 路径、WSS/QUIC 证书私钥文件字段，启动时按配置让 Core 建立 TCP/WebSocket/WSS/KCP/QUIC 控制入口。
+- FR-03 运行时代理资源：官方注册路径支持 UDP 数据报入口、HTTP 主机/路径路由、HTTPS 独占透传，资源随关闭、心跳失活和会话替换清理；协议级测试覆盖四类拒绝与共享入口。
 
 ### 变更
 
@@ -17,7 +20,16 @@
   版本编码。黑盒矩阵扩至 v1/v2 各 4 项（登录、代理注册与端到端转发、鉴权失败
   拒绝、端口冲突恢复），连续运行全部通过。
 - Core 的 wire v1 消息表修正：关闭代理类型字节改为官方值，移除官方不存在的关闭代理响应类型，登记请求工作连接类型。
+- 控制入口参数按引导身份处理：`controlListen` 的地址、端口、传输方式与 TLS 材料变化时应用流程显式拒绝并保留旧 active（此前会被静默忽略），需要重启生效。
+- 传输适配修正：WebSocket 监听器关闭后 Accept 立即返回（此前会让 Shutdown 悬挂）；QUIC 按「每条双向流一条连接」映射并区分会话所有权（同会话上的工作连接此前永远不被接受）；KCP 采用官方参数基线（stream 模式、FEC 10/3、MTU 1350、窗口与 nodelay）。
+- 修复控制会话接管的登记竞态：被替换的旧连接退出时会删除新会话的官方会话登记与运行 ID 索引，表现为「登录与代理注册都成功但访客永远等不到工作连接」；经中间反向代理连续会话的真实链路复现，清理改为按连接归属判定，新会话登记同时失效被替换会话的运行 ID。
 - jrpc 与控制路径同步官方字段名——两个客户端体系共用同一条兼容消息族。
+- 实机验收运行手册入库：`docs/OPERATIONS.md` 新增「官方 frpc 接入的实机验收批次」（只读预检与正式批次命令、参数表、人工回填清单、批次内已知边界），实机验收执行器新增 `--help`，根 Taskfile 新增 `compat:matrix`/`compat:link-fixtures`/`compat:real-network` 三项手工工具任务（参数透传，不进 CI）。
+- `core/go.sum` 入库：Core 引入第三方传输依赖后必须提交该文件——依赖边界门禁在 Core 目录以 `GOWORK=off` 执行 `go list`，缺少该文件的干净检出会直接以 `missing go.sum entry` 失败（已用移除该文件的对照实验证实）。
+- 格式门禁覆盖范围从 `scripts/*.mjs` 扩至 `scripts/**/*.mjs`，六个兼容性脚本（黑盒矩阵、链路夹具、实机执行器、客户端离线观测、frpc 基线与 jrps 宿主）纳入 Prettier 检查并完成格式化。
+- 反向代理条款由夹具升级为真实软件实测：官方 frpc 经 nginx 1.28.3（PGP 验签的发行包）在三种拓扑下运行——L4 stream 透传下 tcp 传输全部用例双 wire 20/20 通过；L7 明文反代下 websocket 传输 16/20 通过、4 项 blocked（`heartbeat-relay` 与 `work-conn-rejected` 依赖裸 TCP 帧/本机中继，仅 tcp 传输下可执行）、0 失败；L7 终结 TLS（前端 wss、后端明文 ws）下登录与入口回显双 wire 4/4 通过。并量化反代空闲读超时与心跳间隔的关系：心跳 90s 时 nginx 在 60s 空闲处切断升级连接、客户端用同一 runID 自动重连（服务端会话事件 1 → 2），心跳 30s 时零超时且会话事件恒为 1。黑盒矩阵新增 `--front=<主机:端口>`、`--frpc-protocol=`（客户端协议与服务端监听解耦）与 `--tls-ca`/`--tls-server-name`；配置要求与实测结论写入 OPERATIONS §6.5。
+- 黑盒矩阵的用例适用性修正：`heartbeat-relay` 与 `work-conn-rejected` 只在 tcp 传输下可执行，此前在其它传输下会报为失败（假红），现按 blocked 如实登记并给出原因。
+- 官方客户端互操作纳入 Linux 运行时门禁：官方 frpc 的 Linux 发行包摘要按官方 `frp_sha256_checksums.txt` 核验后登记（Windows 摘要亦与同一文件交叉核对一致），CI 新增 `compat-interop` job 在 ubuntu runner 上构建 jrps 回退产物并复跑互操作矩阵（tcp/websocket/wss/quic × 双 wire × 登录与代理回显）。「官方客户端能在 Linux 上跑通」由此成为持续门禁，不再是一次性本机结论。
 
 ## 0.3.0 - 2026-09-22
 

@@ -211,4 +211,5 @@ P1 的 NAT 行为以黑盒互操作和真实网络验收为准，不复制参考
 - 覆盖 FR-05a/05b/05c 连接传输与 FR-06a/06b 代理类型的矩阵。
 - 生成 JRP 自有黄金帧和畸形输入，不复制参考测试数据结构或错误文案。
 - 对吞吐、延迟、内存、连接泄漏和并发竞态设门禁。
+- 当前自动化状态：Core 已接入 TCP/WebSocket/WSS/KCP/QUIC 传输适配；官方 frpc v0.70.0 的 v1/v2 黑盒已验证登录、TCP/UDP/HTTP/HTTPS 四类代理、鉴权拒绝、P2 STCP 拒绝、端口冲突恢复、心跳失活 relay 和无效运行 ID 拒绝；传输矩阵中 TCP、WebSocket、WSS、QUIC 已通过本机端到端互操作；KCP 因基线客户端不发出数据报而登记为基线客户端限制（不计入 P1 互操作门禁）。结果与证据见 `docs/specs/official-frpc-ingress.md` §5.1。
 - 真实 KCP/QUIC/WS/WSS、STCP/XTCP 和 NAT 环境结果由用户确认；测试全绿不能替代实机互操作。

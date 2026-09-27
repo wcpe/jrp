@@ -63,7 +63,8 @@ FR-02 的管理面 TLS 引导参数（已实现并通过实机验收，交付状
 FR-10 的引导参数重启清单（已交付，规格 §3.5）：
 
 - 三项引导参数——数据目录、SQLite 路径、管理 API 根监听——变更需要重启，且必须在文档中标注；除此之外的全部 P1 配置项变更都映射到一次无中断应用流程（prepare → health-check → publish → drain），不存在"停止旧进程后重启进入新配置"的分支。
-- 数据面控制监听端口**不在**重启清单内：它是 desired 文档（`controlListen`）的一部分，经四阶段热更生效。缺省端口 7200。
+- 数据面控制入口属于**引导身份**：监听地址、端口、传输方式（`tcp`/`websocket`/`wss`/`kcp`/`quic`）与 WSS/QUIC 的证书、私钥任一变化都需要重启，应用流程会以「控制入口身份变化，需要重启」明确拒绝并保留旧 active。缺省端口 7200、缺省传输 `tcp`。
+- 控制入口参数此前会被应用流程**静默忽略**（引擎只在启动时建立控制入口），现已改为显式拒绝，避免真源与运行态不一致。
 - 控制监听端口被占用属于启动失败：进程拒绝启动并在日志中给出中文原因，不降级为"只有管理面没有数据面"的半可用状态。
 
 ### 1.5 健康检查
@@ -166,3 +167,92 @@ FR-10 的引导参数重启清单（已交付，规格 §3.5）：
 - 区分 DNS、TLS、鉴权、超时、4xx、5xx 和速率限制。
 - 检查重试次数、退避和死信状态，避免无限重试。
 - 日志只显示目标掩码和安全错误摘要，不显示 SMTP 密码、Webhook secret 或消息中的敏感正文。
+
+## 6. 官方 frpc 接入的实机验收批次
+
+FR-03 的设备无关部分已由自动化门禁覆盖（黑盒矩阵、链路夹具、客户端离线观测）；**真实网络的部分只能在实际部署环境执行**，命令与回填项如下（执行器全部参数可查 `node scripts/compat/real-network.mjs --help`）。
+
+### 6.1 前置条件
+
+- 目标环境已运行 jrps，且控制入口按目标传输可达（`wss` 需证书链可从执行机验证；`kcp`/`quic` 需 UDP 可直通）。
+- 已存在该客户端的代理条目，且其入口端口在服务端空闲。
+- 自签证书情形需准备 CA 证书文件，并确认证书含目标主机名的 SAN。
+
+### 6.2 第一步：只读预检
+
+只探查执行条件，不启动客户端、不注册代理、不需要凭据：
+
+```bash
+node scripts/compat/real-network.mjs --server=<控制入口主机:端口> --transport=<tcp|websocket|wss|kcp|quic> --preflight-only
+```
+
+预检结论落 `.tmp/compat-real/<日期>/preflight/preflight.json`。**预检通过不等价于验收通过**，只说明具备执行条件。
+
+### 6.3 第二步：正式批次
+
+```bash
+node scripts/compat/real-network.mjs \
+  --server=<控制入口主机:端口> --transport=all --wire=both \
+  --token=<数据面 token> --entry-port=<服务端代理入口端口> \
+  --entry-host=<代理入口主机> \
+  --tls-ca=<CA 证书路径> --tls-server-name=<证书中的主机名>
+```
+
+| 参数 | 说明 |
+|---|---|
+| `--server` | 控制入口 `主机:端口`，必填 |
+| `--transport` | `tcp`/`websocket`/`wss`/`kcp`/`quic`，`all` 表示全跑 |
+| `--wire` | `v1`/`v2`，`both` 表示两个都跑 |
+| `--token` | 数据面 token，必填（预检模式不需要） |
+| `--entry-port` | 服务端为该代理分配的入口端口，必填 |
+| `--entry-host` | 代理入口主机；与控制入口不同主机时必填 |
+| `--tls-ca`、`--tls-server-name` | WSS/HTTPS 自签证书时的 CA 与 SAN 主机名 |
+| `--duration` | 每用例观察时长（秒，默认 20），观察期内断言心跳稳定 |
+| `--entry-release-wait` | 用例间等待入口端口释放的上限（秒，默认 40） |
+
+自动化断言：登录成功、代理注册成功、入口回显逐字节一致、观察期心跳稳定、客户端重启后重新登录。证据与报告落 `.tmp/compat-real/<日期>/<传输>-<wire>/`（`result.json` 与 `report.md`），**不进入版本库**。
+
+### 6.4 需由执行者回填的项
+
+`report.md` 已列出下列清单，自动化无法证明，必须人工观察后填写：
+
+- 网络拓扑：是否经过 NAT／防火墙，NAT 类型与端口映射方式。
+- 反向代理：升级/隧道是否成功，软件与版本，空闲断链行为。
+- 传输质量：观测到的延迟、丢包、抖动与回环基线的差异。
+- 跨运营商／跨地域：是否明显退化或重连。
+- 跨平台：客户端与服务端的操作系统与架构。
+- 其他异常：日志中的非预期错误（附片段）。
+
+### 6.5 反向代理侧的两条硬要求（已用真实 nginx 1.28.3 实测）
+
+反向代理可放在控制入口之前，但必须满足两点，否则表现为间歇掉线或握手中断：
+
+1. **透传升级头**：WebSocket 传输要求反代显式转发 `Upgrade` 与 `Connection`，否则握手停在 400。
+
+   ```nginx
+   location /~!frp {
+     proxy_pass http://127.0.0.1:7200;
+     proxy_http_version 1.1;
+     proxy_set_header Upgrade $http_upgrade;
+     proxy_set_header Connection $connection_upgrade;  # 由 map 决定：有 Upgrade 用 upgrade，否则 close
+     proxy_read_timeout 60s;                          # 见第 2 条
+   }
+   ```
+
+2. **空闲读超时必须大于客户端心跳间隔**（官方默认心跳 30s，nginx 默认 `proxy_read_timeout` 60s）。实测对照：心跳 30s 时同一窗口内反代零超时、服务端会话事件恒为 1；把心跳调到 90s 后，nginx 在 60s 空闲处切断升级连接（`upstream timed out … while proxying upgraded connection`），官方客户端随即用**同一 runID** 自动重连，服务端侧表现为一次会话接管（会话事件 1 → 2）。即：心跳间隔调大时，必须同步调大反代的空闲超时，否则控制连接会被周期性重建。
+
+**已实测的三种前置拓扑**（均由官方 frpc 与 jrps 真实运行）：
+
+| 拓扑 | nginx 配置 | 结果 |
+|---|---|---|
+| L7 明文反代 | `server { listen 7201; location / { proxy_pass http://127.0.0.1:7200; … } }` | WebSocket 升级透传；websocket 传输 16/20 通过、4 项 blocked（`heartbeat-relay`、`work-conn-rejected` 依赖裸 TCP 帧，仅 tcp 传输下可执行）、0 失败 |
+| L7 终结 TLS | `listen 7443 ssl;` + 证书，后端仍为明文 WebSocket | jrps 只监听明文 websocket，frpc 以 `wss` 连前置；登录与入口回显双 wire 4/4 通过 |
+| L4 透传 | `stream { server { listen 7202; proxy_pass 127.0.0.1:7200; } }` | TCP 传输全部用例双 wire 20/20 通过 |
+
+L7 终结 TLS 时客户端与服务端协议不同（frpc 用 `wss`，jrps 用 `websocket`），这是常见形态：证书只装在前置。若反代只做 L4 透传，则前端协议与后端一致。
+
+### 6.6 批次内的已知边界
+
+- **KCP 不在批次内**：官方 frpc v0.70.0 在 `transport.protocol = "kcp"` 下不发出任何数据报（三种配置组合零流量、对照官方 frps 亦无连接，`frpc verify` 判定配置合法），已按基线客户端限制登记；JRP 侧 KCP 由引擎端到端用例与 jrps 级登录覆盖。
+- **客户端被强杀后的入口行为**：流传输（tcp/websocket/wss）约 0.5 秒内停止接受新连接；QUIC 需等会话空闲回收（约 30 秒，短于控制会话 90 秒失活窗口），期间新访客受配对中心暂存上限约束。
+- **入口端口释放**：UDP 载体（KCP/QUIC）在客户端被强杀后释放慢于 TCP，因此用例之间默认等待至多 40 秒；短于该值会造成下一个用例的端口冲突误判。

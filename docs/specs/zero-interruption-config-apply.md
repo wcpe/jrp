@@ -119,7 +119,7 @@ drain（旧资源不再接新流量，已有流跑到自然结束或排空上限
 - [x] 实现 publish 后异常不回切的约束与告警审计路径。（Core Apply，FR-26；drain 未完成在结果里标记 `DrainIncomplete`）
 - [x] 实现并发互斥、等待队列、409 冲突与幂等键。（P1 取"进行中直接 409"分支，不实现等待队列；幂等键暂以进程内受理记录 + Core 同 revision 幂等兜底，持久化幂等键随 FR-11 Web 管理台再评估）
 - [x] 实现 restore：以历史内容创建新 desired revision 并复用同一状态机。（store `RestoreRevision` 已有；jrps 侧 `:restore` 端点已接线，应用路径与普通 desired 一致）
-- [x] 明确引导参数重启清单，并禁止任何以重启冒充热更的路径。（重启清单登记于 OPERATIONS；控制监听端口是 desired 的一部分，属可热更项）
+- [x] 明确引导参数重启清单，并禁止任何以重启冒充热更的路径。（重启清单登记于 OPERATIONS；控制入口的地址、端口、传输方式与 TLS 材料属引导身份，变更需重启——此前该字段会被应用流程静默忽略，现改为显式拒绝并保留旧 active，见 OPERATIONS §1.4）
 - [ ] 在 jrpc 侧接入同一阶段编排并回报 apply result。**随 FR-08 交付**（依赖 desired state 下发通道与 `/agent/v1/apply-results` 回执端点）。
 - [x] 运行 jrps、jrpc 测试、竞态检测与构建；同步 PRD、ARCHITECTURE、API、OPERATIONS、SECURITY、CHANGELOG 中受影响内容。（jrpc 侧无行为变化，其测试与构建随本批 CI 覆盖）
 - [ ] 实机验收（分批）：管理 API 触发应用与 restore 的完整链路、长连接跨应用不中断。**随 FR-11 交付**——Web 管理台的代理编辑是"改配置→应用"的常规写入端，交付前 desired 版本只能由测试与后续 FR 写入，实机条款不具备触发条件。
