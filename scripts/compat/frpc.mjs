@@ -21,8 +21,15 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '.
 export const FrpcVersion = '0.70.0';
 
 // 官方发行资产摘要登记表：键为资产文件名，值为 SHA-256。
+//
+// 摘要取自官方发行附件 `frp_sha256_checksums.txt`（同一文件里已登记的 windows_amd64 摘要
+// 与本表逐字符一致，可交叉验证登记方式本身），并且每个平台的归档都实际下载后重算摘要比对过。
 const assetDigests = {
-  'frp_0.70.0_windows_amd64.zip': '8407f83429643aa3fa9590d0c87a46b1ac14660efb96e46c955a4c2802f744b0',
+  'frp_0.70.0_windows_amd64.zip':
+    '8407f83429643aa3fa9590d0c87a46b1ac14660efb96e46c955a4c2802f744b0',
+  // linux_amd64 用于在 CI 的 Linux runner 上跑官方客户端互操作（跨平台的运行时一半）。
+  'frp_0.70.0_linux_amd64.tar.gz':
+    '281cb31e6b915113179c6ebb65b5977a5d9d7fb96f9a70867be83dee3b657721',
 };
 
 // 官方发行资产按平台命名，归档格式在 Windows 与其他平台间不同。
@@ -76,7 +83,9 @@ export async function ensureFrpcBinary(workDirectory = path.join(root, '.tmp', '
   }
   const actualDigest = sha256File(archive);
   if (actualDigest !== expectedDigest) {
-    throw new Error(`官方 frpc 发行包摘要不匹配（${name}）：期望 ${expectedDigest}，实际 ${actualDigest}`);
+    throw new Error(
+      `官方 frpc 发行包摘要不匹配（${name}）：期望 ${expectedDigest}，实际 ${actualDigest}`,
+    );
   }
 
   const extracted = path.join(workDirectory, `frp_${FrpcVersion}_${platform}_${arch}`);

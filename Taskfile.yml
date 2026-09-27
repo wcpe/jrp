@@ -186,7 +186,6 @@ tasks:
       - go test -run=^$ -fuzz=FuzzV1Frame -fuzztime=5s ./internal/wire/
       - go test -run=^$ -fuzz=FuzzV2Frame -fuzztime=5s ./internal/wire/
       - go test -run=^$ -fuzz=FuzzVersionDetection -fuzztime=5s ./internal/wire/
-
   test:web:
     desc: 运行 Web 测试
     cmds:
@@ -261,3 +260,22 @@ tasks:
     dir: apps/jrpc
     cmds:
       - go vet ./...
+
+  # 以下三项是 FR-03 的兼容性手工工具，不进 CI：
+  # 前两项需要官方 frpc 发行二进制（首次运行自动下载到忽略目录 .tmp/compat/bin），
+  # 最后一项面向真实网络目标，必须由执行者提供地址与凭据。
+  # 参数直接透传，用法见各脚本 --help 与 docs/OPERATIONS.md「官方 frpc 接入的实机验收批次」。
+  compat:matrix:
+    desc: 黑盒互操作矩阵（本机自建 jrps + 官方 frpc，手工工具）
+    cmds:
+      - node scripts/compat/run-matrix.mjs {{.CLI_ARGS}}
+
+  compat:link-fixtures:
+    desc: 链路夹具自测（反代升级透传、TCP/UDP 延迟与丢包、NAT 行为建模）
+    cmds:
+      - node scripts/compat/link-fixtures.mjs {{.CLI_ARGS}}
+
+  compat:real-network:
+    desc: 实机验收执行器（面向远端 jrps，需 --server 与凭据，--preflight-only 为只读预检）
+    cmds:
+      - node scripts/compat/real-network.mjs {{.CLI_ARGS}}

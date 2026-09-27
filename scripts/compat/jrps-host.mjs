@@ -11,7 +11,7 @@
 // 因此同一时刻只允许一个黑盒实例运行。
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, openSync, readFileSync, rmSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -30,7 +30,9 @@ const adminUsername = 'admin';
 function jrpsExecutable() {
   const executable = path.join(root, 'bin', process.platform === 'win32' ? 'jrps.exe' : 'jrps');
   if (!existsSync(executable)) {
-    throw new Error(`未找到 jrps 二进制：${executable}；请先运行 node scripts/build.mjs jrps-fallback`);
+    throw new Error(
+      `未找到 jrps 二进制：${executable}；请先运行 node scripts/build.mjs jrps-fallback`,
+    );
   }
   return executable;
 }
@@ -51,7 +53,7 @@ async function portIsFree(port) {
 }
 
 // prepareDatabase 写入黑盒用例所需的客户端与配置版本。
-function prepareDatabase(databasePath, clientId, clientToken) {
+function prepareDatabase(databasePath, clientId, clientToken, controlListen) {
   const database = new DatabaseSync(databasePath);
   try {
     database
@@ -64,7 +66,7 @@ function prepareDatabase(databasePath, clientId, clientToken) {
       .run(clientId, `黑盒互操作 ${clientId}`, digestToken(clientToken), clientToken);
     const desired = JSON.stringify({
       schemaVersion: 1,
-      controlListen: { host: '0.0.0.0', port: ControlPort },
+      controlListen,
       proxies: [],
     });
     database
@@ -82,12 +84,23 @@ function prepareDatabase(databasePath, clientId, clientToken) {
 function runJrpsInit(dataDirectory, adminPassword, logFile) {
   return new Promise((resolve, reject) => {
     const descriptor = openSync(logFile, 'a');
+    let closed = false;
+    const closeDescriptor = () => {
+      if (!closed) {
+        closed = true;
+        closeSync(descriptor);
+      }
+    };
     const child = spawn(jrpsExecutable(), ['init', '--data-dir', dataDirectory], {
       env: { ...process.env, JRP_ADMIN_PASSWORD: adminPassword },
       stdio: ['ignore', descriptor, descriptor],
     });
-    child.once('error', reject);
+    child.once('error', (error) => {
+      closeDescriptor();
+      reject(error);
+    });
     child.once('exit', (code) => {
+      closeDescriptor();
       if (code === 0) {
         resolve();
         return;
@@ -123,6 +136,7 @@ export async function startJrpsHost(options) {
     clientId,
     clientToken,
     adminPassword = 'compat-verify-password',
+    controlListen = { host: '0.0.0.0', port: ControlPort, transport: 'tcp' },
   } = options;
   // 数据目录是运行产物而不是证据（证据是日志与 result.json）：用例重跑时必须
   // 从干净状态开始，否则 jrps init 会因"管理员已初始化"拒绝执行。
@@ -135,7 +149,7 @@ export async function startJrpsHost(options) {
 
   const initLog = path.join(evidenceDirectory, 'jrps-init.log');
   await runJrpsInit(dataDirectory, adminPassword, initLog);
-  prepareDatabase(path.join(dataDirectory, 'jrps.db'), clientId, clientToken);
+  prepareDatabase(path.join(dataDirectory, 'jrps.db'), clientId, clientToken, controlListen);
 
   // 启动主进程：日志同时落证据目录，失败时可直接排障。
   const processLog = path.join(evidenceDirectory, 'jrps.log');
@@ -145,12 +159,15 @@ export async function startJrpsHost(options) {
     ['--data-dir', dataDirectory, '--listen', `127.0.0.1:${managementPort}`],
     { env: process.env, stdio: ['ignore', descriptor, descriptor] },
   );
-  child.once('error', (error) => {
-    throw error;
-  });
+  closeSync(descriptor);
 
   const managementUrl = `http://127.0.0.1:${managementPort}`;
   let exited = false;
+  let childError;
+  child.once('error', (error) => {
+    childError = error;
+    exited = true;
+  });
   child.once('exit', () => {
     exited = true;
   });
@@ -172,7 +189,14 @@ export async function startJrpsHost(options) {
   }
   if (!ready) {
     child.kill();
-    throw new Error(`jrps 未在期限内就绪，详见 ${processLog}`);
+    const stopDeadline = Date.now() + 5000;
+    while (!exited && Date.now() < stopDeadline) {
+      await delay(100);
+    }
+    if (!exited) {
+      child.kill('SIGKILL');
+    }
+    throw childError ?? new Error(`jrps 未在期限内就绪，详见 ${processLog}`);
   }
 
   const cookie = await loginSession(managementUrl, adminPassword);
@@ -213,7 +237,9 @@ export async function startJrpsHost(options) {
       try {
         const line = readFileSync(processLog, 'utf8')
           .split(/\r?\n/u)
+          .reverse()
           .find((candidate) => candidate.includes(marker));
+
         if (line !== undefined) {
           return line;
         }
