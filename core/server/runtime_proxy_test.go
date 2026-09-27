@@ -99,6 +99,11 @@ func registerProxyOfTypeForTest(t *testing.T, engine *Engine, listener net.Liste
 // workConnForRuntimeProxy 模拟客户端为运行时代理建立工作连接并声明归属，
 // 且承担客户端职责：把服务端桥接来的数据转发到本地目标（frpc 的等价行为）。
 func workConnForRuntimeProxy(t *testing.T, engine *Engine, listener net.Listener, target netip.AddrPort) net.Conn {
+	return workConnForNamedRuntimeProxy(t, engine, listener, "rt-ssh", target)
+}
+
+// workConnForNamedRuntimeProxy 为指定运行时代理建立声明式工作连接。
+func workConnForNamedRuntimeProxy(t *testing.T, engine *Engine, listener net.Listener, proxyName string, target netip.AddrPort) net.Conn {
 	t.Helper()
 	work, err := net.Dial("tcp", listener.Addr().String())
 	if err != nil {
@@ -108,7 +113,7 @@ func workConnForRuntimeProxy(t *testing.T, engine *Engine, listener net.Listener
 	payload, err := json.Marshal(map[string]string{
 		"client_id":   "rt",
 		"token":       "rt-token",
-		"proxy_name":  "rt-ssh",
+		"proxy_name":  proxyName,
 		"target_addr": target.String(),
 		"run_id":      "rt-ssh",
 	})
@@ -177,6 +182,185 @@ func TestRuntimeProxyRegistrationOpensGuestEntry(t *testing.T) {
 		t.Fatalf("访客读回失败：%v", err)
 	}
 	_ = work
+}
+
+// UDP 运行时代理创建独立数据报入口，并随控制会话释放。
+func TestRuntimeProxyRegistrationSupportsUDP(t *testing.T) {
+	engine, listener := startEngineForRuntimeProxy(t)
+	session := openTestSession(t, listener, "rt", "rt-token")
+	defer session.raw.Close()
+	port := reserveTestUDPPortForRuntime(t)
+	frame := encodeTestNewProxy(t, "rt-udp", "udp", port, netip.MustParseAddrPort("127.0.0.1:9"))
+	if _, err := session.raw.Write(frame); err != nil {
+		t.Fatalf("发送 UDP 注册失败：%v", err)
+	}
+	if err := readTestProxyResponse(t, session.raw, 5*time.Second); err != nil {
+		t.Fatalf("UDP 注册失败：%v", err)
+	}
+	addr := engine.GuestAddr("rt-udp")
+	if addr == nil {
+		t.Fatal("UDP 注册后入口地址应可用")
+	}
+	engine.mu.Lock()
+	entry := engine.currentGeneration().runtimeProxies["rt-udp"]
+	engine.mu.Unlock()
+	if entry == nil || entry.udpEntry == nil || entry.listener != nil {
+		t.Fatal("UDP 运行时资源未按数据报入口托管")
+	}
+	_ = session.raw.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && engine.GuestAddr("rt-udp") != nil {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if engine.GuestAddr("rt-udp") != nil {
+		t.Fatal("会话结束后 UDP 运行时入口未清理")
+	}
+}
+
+// HTTP 运行时代理按官方主机与路径字段解析，并共享同一端口入口。
+func TestRuntimeProxyHTTPRoutesShareEntry(t *testing.T) {
+	engine, listener := startEngineForRuntimeProxy(t)
+	target, stopEcho := startTestEcho(t)
+	defer stopEcho()
+	session := openTestSession(t, listener, "rt", "rt-token")
+	defer session.raw.Close()
+	port := reserveTestPortForRuntime(t)
+	register := func(name, host, path string) {
+		frame := encodeTestNewProxyWithFields(t, name, "http", port, map[string]any{
+			"custom_domains": []string{host},
+			"locations":      []string{path},
+		})
+		if _, err := session.raw.Write(frame); err != nil {
+			t.Fatalf("发送 HTTP 注册失败：%v", err)
+		}
+		if err := readTestProxyResponse(t, session.raw, 5*time.Second); err != nil {
+			t.Fatalf("HTTP %s 注册失败：%v", name, err)
+		}
+	}
+	register("rt-http-a", "a.example.com", "/api")
+	register("rt-http-b", "b.example.com", "/")
+	if engine.GuestAddr("rt-http-a").String() != engine.GuestAddr("rt-http-b").String() {
+		t.Fatal("共享端口的 HTTP 代理应复用同一入口")
+	}
+	workConnForNamedRuntimeProxy(t, engine, listener, "rt-http-a", target)
+	guest, err := net.Dial("tcp", engine.GuestAddr("rt-http-a").String())
+	if err != nil {
+		t.Fatalf("HTTP 访客连接失败：%v", err)
+	}
+	defer guest.Close()
+	_ = guest.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, guestPort, err := net.SplitHostPort(engine.GuestAddr("rt-http-a").String())
+	if err != nil {
+		t.Fatalf("解析 HTTP 入口地址失败：%v", err)
+	}
+	request := "GET /api/item?x=1 HTTP/1.1\r\nHost: A.EXAMPLE.COM:" + guestPort + "\r\n\r\n"
+	if _, err := guest.Write([]byte(request)); err != nil {
+		t.Fatalf("发送 HTTP 请求失败：%v", err)
+	}
+	response := make([]byte, len(request))
+	if _, err := io.ReadFull(guest, response); err != nil {
+		t.Fatalf("读取 HTTP 回显失败：%v", err)
+	}
+	if string(response) != request {
+		t.Fatalf("HTTP 路由回显不一致：%q", string(response))
+	}
+}
+
+// HTTPS 运行时代理只建立独占透传入口，不解析主机或路径。
+func TestRuntimeProxyHTTPSIsTransparent(t *testing.T) {
+	engine, listener := startEngineForRuntimeProxy(t)
+	target, stopEcho := startTestEcho(t)
+	defer stopEcho()
+	session := openTestSession(t, listener, "rt", "rt-token")
+	defer session.raw.Close()
+	port := reserveTestPortForRuntime(t)
+	frame := encodeTestNewProxy(t, "rt-https", "https", port, target)
+	if _, err := session.raw.Write(frame); err != nil {
+		t.Fatalf("发送 HTTPS 注册失败：%v", err)
+	}
+	if err := readTestProxyResponse(t, session.raw, 5*time.Second); err != nil {
+		t.Fatalf("HTTPS 注册失败：%v", err)
+	}
+	workConnForNamedRuntimeProxy(t, engine, listener, "rt-https", target)
+	guest, err := net.Dial("tcp", engine.GuestAddr("rt-https").String())
+	if err != nil {
+		t.Fatalf("HTTPS 访客连接失败：%v", err)
+	}
+	defer guest.Close()
+	payload := []byte("\x16\x03\x01透传字节")
+	if _, err := guest.Write(payload); err != nil {
+		t.Fatalf("发送 HTTPS 透传数据失败：%v", err)
+	}
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(guest, got); err != nil {
+		t.Fatalf("读取 HTTPS 透传数据失败：%v", err)
+	}
+	if string(got) != string(payload) {
+		t.Fatalf("HTTPS 透传数据被修改：%q", string(got))
+	}
+}
+
+// 工作连接声明未知代理时必须关闭连接且不产生配对副作用。
+func TestRuntimeProxyRejectsUnknownWorkConnection(t *testing.T) {
+	engine, listener := startEngineForRuntimeProxy(t)
+	session := openTestSession(t, listener, "rt", "rt-token")
+	defer session.raw.Close()
+	port := reserveTestPortForRuntime(t)
+	target, stopEcho := startTestEcho(t)
+	defer stopEcho()
+	if err := session.registerProxy("known", port, target); err != nil {
+		t.Fatalf("注册测试代理失败：%v", err)
+	}
+	work, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("工作连接拨号失败：%v", err)
+	}
+	defer work.Close()
+	payload, err := json.Marshal(map[string]string{
+		"client_id":   "rt",
+		"token":       "rt-token",
+		"proxy_name":  "unknown",
+		"target_addr": target.String(),
+	})
+	if err != nil {
+		t.Fatalf("编码工作连接声明失败：%v", err)
+	}
+	frame, err := wire.EncodeV1Frame(wire.Frame{Type: wire.MessageTypeNewWorkConn, Payload: payload})
+	if err != nil {
+		t.Fatalf("编码工作连接帧失败：%v", err)
+	}
+	if _, err := work.Write(frame); err != nil {
+		t.Fatalf("发送工作连接声明失败：%v", err)
+	}
+	_ = work.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := work.Read(make([]byte, 1)); err == nil || isReadDeadline(err) {
+		t.Fatal("未知代理的工作连接应被立即拒绝并关闭")
+	}
+	if engine.Err() != nil {
+		t.Fatalf("工作连接拒绝不应停止引擎：%v", engine.Err())
+	}
+}
+
+// 心跳失活应清理该会话的运行时代理，但不能停止整个引擎。
+func TestRuntimeProxyHeartbeatExpiryCleansResources(t *testing.T) {
+	engine, listener := startEngineForRuntimeProxy(t)
+	target, stopEcho := startTestEcho(t)
+	defer stopEcho()
+	session := openTestSession(t, listener, "rt", "rt-token")
+	port := reserveTestPortForRuntime(t)
+	if err := session.registerProxy("idle", port, target); err != nil {
+		t.Fatalf("注册失活测试代理失败：%v", err)
+	}
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) && engine.GuestAddr("idle") != nil {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if engine.GuestAddr("idle") != nil {
+		t.Fatal("心跳失活后运行时代理未清理")
+	}
+	if err := engine.Err(); err != nil {
+		t.Fatalf("心跳失活不应停止引擎：%v", err)
+	}
 }
 
 // 端口冲突：注册失败返回稳定错误，已有代理不受影响，无半注册监听器。
@@ -283,6 +467,18 @@ func TestRuntimeProxiesCleanedOnSessionEnd(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("会话断开后运行时代理未被清理")
+}
+
+// reserveTestUDPPortForRuntime 申请一个可用 UDP 端口并立即释放。
+func reserveTestUDPPortForRuntime(t *testing.T) int {
+	t.Helper()
+	probe, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("申请 UDP 端口失败：%v", err)
+	}
+	port := probe.LocalAddr().(*net.UDPAddr).Port
+	_ = probe.Close()
+	return port
 }
 
 // reserveTestPortForRuntime 申请一个可用端口并立即释放。

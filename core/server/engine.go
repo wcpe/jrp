@@ -99,9 +99,13 @@ type generation struct {
 	// wg 跟踪本代的访客入口循环、数据桥接与 UDP 循环。
 	wg    sync.WaitGroup
 	conns map[*transport.Conn]struct{}
+	// pendingUDP 标记正在等待官方工作连接的 UDP 代理。UDP 首个数据报没有可暂存的
+	// TCP 访客连接，因此不能复用 pending guest 判据，必须单独记录请求归属。
+	pendingUDP map[string]bool
+
 	// 控制连接刻意**不在**代里：它们是登录与心跳通道，跨代存活。drain 旧代时
-	// 关闭它们会断掉客户端的控制会话，maintain 循环停摆后新工作连接补不上，
-	// 新访客永远等不到配对（端到端实测复现）。控制连接的生命周期只到 Shutdown。
+	// 关闭它们会断掉客户端的控制会话，maintain 循环补不上，新访客永远等不到配对。
+	// 控制连接的生命周期只到 Shutdown。
 }
 
 // newGeneration 构造一代的空资源集合；监听器与入口由调用方在 prepare 阶段填入。
@@ -114,6 +118,7 @@ func newGeneration(engine *Engine, revision uint64, config core.ServerConfig) *g
 		reused:   make(map[string]bool),
 
 		runtimeProxies: make(map[string]*runtimeProxy),
+		pendingUDP:     make(map[string]bool),
 		donated:        make(map[string]bool),
 	}
 }
@@ -247,13 +252,28 @@ func (engine *Engine) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	selfCreated := false
 	if listener == nil {
-		engine.releaseStartSlot()
-		return fmt.Errorf("服务端引擎缺少宿主注入的监听器：%w", ErrNotStarted)
+		listener, err = engine.openControlListener(engine.config.Listen())
+		if err != nil {
+			engine.releaseStartSlot()
+			return fmt.Errorf("打开控制入口失败：%w", err)
+		}
+		selfCreated = true
+		engine.mu.Lock()
+		engine.controlListener = listener
+		engine.mu.Unlock()
+		// 自建控制入口（非 TCP 传输）必须留下绑定证据：绑定失败的表现为
+		// "客户端连不上"，没有这条日志就只能靠抓包区分"没绑定"与"绑定但握手失败"。
+		engine.log().Info("控制入口已就绪",
+			"传输", string(engine.config.Listen().Transport), "地址", listener.Addr().String())
 	}
 	if !listenerUsable(listener.Listener()) {
+		if selfCreated {
+			_ = listener.Release()
+		}
 		engine.releaseStartSlot()
-		return fmt.Errorf("宿主注入的监听器已关闭或不可用：%w", ErrNotStarted)
+		return fmt.Errorf("服务端控制入口不可用：%w", ErrNotStarted)
 	}
 
 	// 首次应用建立第 0 代。revision 取 SnapshotRevisionUnknown：版本号由宿主
@@ -267,6 +287,9 @@ func (engine *Engine) Start(ctx context.Context) error {
 
 	gen.publishRegistry()
 	if err := engine.openGuestEntries(gen, engine.config, nil); err != nil {
+		if selfCreated {
+			_ = listener.Release()
+		}
 		engine.releaseStartSlot()
 		return fmt.Errorf("打开代理入口失败：%w", err)
 	}
@@ -313,10 +336,50 @@ func (engine *Engine) startGeneration(gen *generation) {
 	}
 }
 
+// openControlListener 按服务端监听端点创建控制入口。
+// TCP 继续使用 WithListener 注入的宿主监听器；非 TCP 由 Core 自建底层监听器。
+func (engine *Engine) openControlListener(endpoint core.BindEndpoint) (*transport.Listener, error) {
+	address := endpoint.Address.String()
+	switch endpoint.Transport {
+	case core.TransportTCP:
+		return nil, fmt.Errorf("TCP 控制入口必须由宿主注入监听器")
+	case core.TransportWebSocket, core.TransportWSS:
+		options, err := transport.WebSocketOptionsFromConfig(
+			endpoint.TransportConfig.WebSocket, endpoint.Transport == core.TransportWSS,
+		)
+		if err != nil {
+			return nil, err
+		}
+		raw, err := net.Listen("tcp", address)
+		if err != nil {
+			return nil, err
+		}
+		return transport.TakeOverListener(transport.NewWebSocketListener(raw, options)), nil
+	case core.TransportKCP:
+		options, err := transport.KCPOptionsFromConfig(endpoint.TransportConfig.KCP)
+		if err != nil {
+			return nil, err
+		}
+		return transport.ListenKCP(address, options)
+	case core.TransportQUIC:
+		options, err := transport.QUICOptionsFromConfig(endpoint.TransportConfig.QUIC, true)
+		if err != nil {
+			return nil, err
+		}
+		raw, err := transport.ListenQUIC(address, options)
+		if err != nil {
+			return nil, err
+		}
+		return transport.TakeOverListener(raw), nil
+	default:
+		return nil, fmt.Errorf("不支持的服务端传输：%s", endpoint.Transport)
+	}
+}
+
 // claimStartSlot 校验配置并原子认领启动位。
 //
 // 认领即把状态置为 starting，后续失败由调用方回滚到 idle。重复启动返回哨兵
-// 错误而不触碰任何资源。返回宿主注入的监听器句柄。
+// 错误而不触碰任何资源。TCP 返回宿主注入的监听器，非 TCP 返回空句柄由 Core 自建。
 func (engine *Engine) claimStartSlot() (*transport.Listener, error) {
 	if err := engine.config.Validate(); err != nil {
 		return nil, err
@@ -330,6 +393,9 @@ func (engine *Engine) claimStartSlot() (*transport.Listener, error) {
 		return nil, ErrStopped
 	}
 	engine.state = stateStarting
+	if engine.config.Listen().Transport != core.TransportTCP {
+		return nil, nil
+	}
 	return engine.controlListener, nil
 }
 
@@ -747,7 +813,11 @@ func (engine *Engine) untrackControl(conn *transport.Conn) {
 		}
 		// 官方会话登记与运行 ID 索引同属该会话：控制连接结束即失效，
 		// 否则后续工作连接可能按已退出的会话被接纳。
-		if session, ok := engine.officialSessions[clientID]; ok {
+		//
+		// 只在登记仍属于本连接时删除：被接管替换的旧连接退出时，新会话可能已经
+		// 完成登记，无条件删除会把新会话的写出通道与运行 ID 索引一并抹掉，表现为
+		// 「登录与注册都成功，但访客永远等不到工作连接」（真实链路下已复现）。
+		if session, ok := engine.officialSessions[clientID]; ok && session.conn == conn {
 			delete(engine.sessionRunIDs, session.runID)
 			delete(engine.officialSessions, clientID)
 		}
@@ -1380,6 +1450,9 @@ type officialControlSession struct {
 	writer sessionWriter
 	// runID 是登录时分配给该会话的运行 ID：官方客户端在 new-work-conn 里回传它。
 	runID string
+	// conn 是承载该会话的控制连接：清理时据此判断登记是否仍属于本连接，
+	// 避免被接管替换的旧连接抹掉新会话的登记。
+	conn *transport.Conn
 }
 
 // registerOfficialSession 登记官方形态控制会话，并建立运行 ID 反向索引。
@@ -1389,7 +1462,15 @@ type officialControlSession struct {
 func (engine *Engine) registerOfficialSession(clientID string, writer sessionWriter, runID string) {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
-	engine.officialSessions[clientID] = officialControlSession{writer: writer, runID: runID}
+	// 被替换会话的运行 ID 索引在这里失效：接管后旧运行 ID 不该再能定位会话
+	// （FR-03 §7.5「过期会话」）。旧连接的清理路径只清属于自己的登记，因此这一步
+	// 必须发生在登记新会话之时。
+	if previous, ok := engine.officialSessions[clientID]; ok && previous.runID != runID {
+		if engine.sessionRunIDs[previous.runID] == clientID {
+			delete(engine.sessionRunIDs, previous.runID)
+		}
+	}
+	engine.officialSessions[clientID] = officialControlSession{writer: writer, runID: runID, conn: writer.conn}
 	if runID != "" {
 		engine.sessionRunIDs[runID] = clientID
 	}
@@ -1436,6 +1517,7 @@ func (engine *Engine) requestWorkConn(clientID string) {
 		engine.log().Warn("请求工作连接失败", "客户端", clientID, "错误", err)
 		return
 	}
+	engine.log().Info("已请求工作连接", "客户端", clientID)
 	engine.log().Info("已请求工作连接", "客户端", clientID)
 }
 
@@ -1662,6 +1744,9 @@ func (engine *Engine) serveGuest(gen *generation, name string, listener *transpo
 		conn, action, err := listener.Accept(transport.PurposeWork, name)
 		if err != nil {
 			if action == transport.AcceptFatal {
+				if !gen.ownsGuestListener(listener) {
+					return
+				}
 				engine.reportAcceptFatal(gen, listener, err)
 				return
 			}
@@ -1683,6 +1768,9 @@ func (engine *Engine) serveHTTPGuest(gen *generation, port int, listener *transp
 		conn, action, err := listener.Accept(transport.PurposeWork, httpEntryName(port))
 		if err != nil {
 			if action == transport.AcceptFatal {
+				if !gen.ownsGuestListener(listener) {
+					return
+				}
 				engine.reportAcceptFatal(gen, listener, err)
 				return
 			}
@@ -1692,6 +1780,7 @@ func (engine *Engine) serveHTTPGuest(gen *generation, port int, listener *transp
 			time.Sleep(transport.AcceptBackoff(action))
 			continue
 		}
+		engine.log().Info("HTTP 访客连接到达", "端口", port)
 		gen.wg.Add(1)
 		go engine.handleHTTPGuest(gen, port, conn)
 	}
@@ -1704,17 +1793,53 @@ func (engine *Engine) serveHTTPGuest(gen *generation, port int, listener *transp
 func (engine *Engine) pendingProxyFor(gen *generation, clientID string) string {
 	broker := engine.activeBroker()
 	gen.engine.mu.Lock()
-	names := make([]string, 0, len(gen.runtimeProxies))
+	names := make([]string, 0, len(gen.runtimeProxies)+len(gen.pendingUDP))
+	pendingUDP := make(map[string]bool, len(gen.pendingUDP))
 	for name, entry := range gen.runtimeProxies {
 		if entry.clientID == clientID {
 			names = append(names, name)
+			pendingUDP[name] = gen.pendingUDP[name]
+		}
+	}
+	for _, binding := range gen.config.UDPBindings() {
+		if binding.ClientID == clientID && gen.pendingUDP[binding.Name] {
+			names = append(names, binding.Name)
+			pendingUDP[binding.Name] = true
 		}
 	}
 	gen.engine.mu.Unlock()
 	for _, name := range names {
-		if broker.hasStagedGuest(name) {
+		if pendingUDP[name] || broker.hasStagedGuest(name) {
 			return name
 		}
+	}
+	return ""
+}
+
+// preopenedUDPProxyFor 返回唯一可预热的 UDP 代理。
+//
+// 官方 frpc 会在首个数据报前主动建立 UDP 工作连接；该连接没有待处理访客，
+// 因此不能走 TCP/HTTP 的 pending guest 判定。只有客户端名下恰好一个 UDP 代理时
+// 才能安全预先指派，否则等首个数据报建立明确的 pendingUDP 归属。
+func (engine *Engine) preopenedUDPProxyFor(gen *generation, clientID string) string {
+	name := ""
+	count := 0
+	gen.engine.mu.Lock()
+	for proxyName, runtime := range gen.runtimeProxies {
+		if runtime.clientID == clientID && runtime.proxyType == "udp" {
+			name = proxyName
+			count++
+		}
+	}
+	for _, binding := range gen.config.UDPBindings() {
+		if binding.ClientID == clientID {
+			name = binding.Name
+			count++
+		}
+	}
+	gen.engine.mu.Unlock()
+	if count == 1 {
+		return name
 	}
 	return ""
 }
@@ -1765,19 +1890,38 @@ func (engine *Engine) serveOfficialWorkConn(gen *generation, raw *transport.Conn
 		}
 	}
 	name := engine.pendingProxyFor(gen, clientID)
+	preopenedUDP := false
+	if name == "" {
+		name = engine.preopenedUDPProxyFor(gen, clientID)
+		preopenedUDP = name != ""
+	}
 	if name == "" {
 		engine.log().Warn("工作连接到达时该客户端没有待处理访客，已拒绝", "客户端", clientID)
 		_ = raw.Close()
 		return
 	}
-	summary, _ := engine.activeBroker().stagingSummaryFor(name)
-	payload, err := json.Marshal(startWorkConnPayload{
-		ProxyName: name,
-		SrcAddr:   summary.srcAddr,
-		SrcPort:   summary.srcPort,
-		DstAddr:   summary.dstAddr,
-		DstPort:   summary.dstPort,
-	})
+	engine.mu.Lock()
+	_, configuredUDP := gen.udpEntries[name]
+	runtime := gen.runtimeProxies[name]
+	isUDP := configuredUDP || (runtime != nil && runtime.proxyType == "udp")
+	engine.mu.Unlock()
+	if preopenedUDP {
+		engine.log().Info("官方 UDP 工作连接预热", "客户端", clientID, "代理", name)
+	}
+	var payload []byte
+	var err error
+	if isUDP {
+		payload, err = json.Marshal(startWorkConnPayload{ProxyName: name})
+	} else {
+		summary, _ := engine.activeBroker().stagingSummaryFor(name)
+		payload, err = json.Marshal(startWorkConnPayload{
+			ProxyName: name,
+			SrcAddr:   summary.srcAddr,
+			SrcPort:   summary.srcPort,
+			DstAddr:   summary.dstAddr,
+			DstPort:   summary.dstPort,
+		})
+	}
 	if err != nil {
 		_ = raw.Close()
 		return
@@ -1792,6 +1936,11 @@ func (engine *Engine) serveOfficialWorkConn(gen *generation, raw *transport.Conn
 	if _, err := raw.Write(encoded); err != nil {
 		_ = raw.Close()
 		return
+	}
+	if isUDP {
+		engine.mu.Lock()
+		gen.pendingUDP[name] = false
+		engine.mu.Unlock()
 	}
 	gen.track(raw)
 	accepted, pair := engine.activeBroker().park(name, raw)
@@ -1962,8 +2111,13 @@ func (gen *generation) publishHTTPRoutes() {
 	gen.engine.mu.Unlock()
 }
 
-// openUDPEntry 按监听端点的地址族打开一个 UDP 入口。
+// openUDPEntry 按监听端点的地址族打开一个 JRP 自有 UDP 入口。
 func (engine *Engine) openUDPEntry(config core.ServerConfig, name string, remotePort int) (*proxy.UDPProxy, error) {
+	return engine.openUDPEntryWithProtocol(config, name, remotePort, false, wire.VersionV1)
+}
+
+// openUDPEntryWithProtocol 打开 UDP 入口并选择 JRP 或官方 frpc 数据报消息。
+func (engine *Engine) openUDPEntryWithProtocol(config core.ServerConfig, name string, remotePort int, official bool, version wire.Version) (*proxy.UDPProxy, error) {
 	port, err := transport.ListenUDP(entryBindAddr(config, remotePort))
 	if err != nil {
 		return nil, err
@@ -1974,6 +2128,8 @@ func (engine *Engine) openUDPEntry(config core.ServerConfig, name string, remote
 		Idle:        config.UDPSessionIdle(),
 		MaxSessions: config.UDPSessionLimit(),
 		MaxDatagram: config.UDPDatagramSize(),
+		Official:    official,
+		Wire:        version,
 		Work:        engine.udpWorkFactory(name),
 	}), nil
 }
@@ -1987,6 +2143,14 @@ func (engine *Engine) udpWorkFactory(name string) func() (net.Conn, bool) {
 	return func() (net.Conn, bool) {
 		work := engine.activeBroker().takeStaged(name)
 		if work == nil {
+			engine.mu.Lock()
+			if active := engine.active; active != nil {
+				active.pendingUDP[name] = true
+			}
+			engine.mu.Unlock()
+			if owner := engine.proxyOwner(name); owner != "" {
+				engine.requestWorkConn(owner)
+			}
 			return nil, false
 		}
 		return work, true
@@ -2018,12 +2182,14 @@ func (engine *Engine) handleHTTPGuest(gen *generation, port int, guest *transpor
 
 	host, path, pending, err := readRequestTarget(guest)
 	if err != nil {
+		engine.log().Warn("HTTP 访客请求解析失败", "端口", port, "错误", err)
 		gen.untrack(guest)
 		_ = guest.Close()
 		return
 	}
 	proxyName, ok := engine.selectHTTPProxy(port, host, path)
 	if !ok {
+		engine.log().Info("HTTP 访客路由未命中", "端口", port, "主机", host, "路径", path)
 		_ = writeUnmatchedResponse(guest)
 		gen.untrack(guest)
 		_ = guest.Close()
@@ -2050,6 +2216,10 @@ func (engine *Engine) bridgeHTTPGuest(gen *generation, proxyName string, guest *
 		// 已移交桥接，记账由 pairing.start 接管。
 	case parkStaged:
 		// 访客与首部都留在配对中心，等后续工作连接到达时配对。
+		// 官方客户端不会主动送来工作连接，必须在 HTTP 访客暂存后请求一条。
+		if owner := engine.proxyOwner(proxyName); owner != "" {
+			engine.requestWorkConn(owner)
+		}
 		// 配对中心会在配对或关闭时接管访客的记账，因此这里同样撤掉调用方的登记。
 		gen.untrack(guest)
 	case parkRejected:

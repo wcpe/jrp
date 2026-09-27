@@ -167,15 +167,15 @@ func mustServerConfig(t *testing.T) core.ServerConfig {
 // 偶发 bind: address already in use（Web 构建矩阵的 core/server 已实测）。
 // 改为从三平台动态端口范围之外的固定区间游标取号，与 core 根包测试的
 // freePort 助手同一策略，不依赖释放-重绑的时序。
-// 复用 core 根包的测试端口区间策略：20000–30000 落在三平台动态端口范围
-// 之外（Windows 1024–15000、Linux 32768–60999、macOS 49152–65535），
-// 与出站临时端口互不相撞。游标只增不减并加锁，保证并发取号不重复。
+// 使用独立测试端口区间：30001–31000 落在三平台动态端口范围之外
+// （Windows 1024–15000、Linux 32768–60999、macOS 49152–65535），
+// 并与 core 根包的 20000–30000 区间隔离。游标只增不减并加锁，保证并发取号不重复。
 var (
 	reproPortMutex  sync.Mutex
-	reproPortCursor = 20000
+	reproPortCursor = 30001
 )
 
-const reproPortRangeEnd = 30000
+const reproPortRangeEnd = 31000
 
 func freeReproPort(t *testing.T) int {
 	t.Helper()
@@ -185,7 +185,7 @@ func freeReproPort(t *testing.T) int {
 		candidate := reproPortCursor
 		reproPortCursor++
 		if reproPortCursor > reproPortRangeEnd {
-			reproPortCursor = 20000
+			reproPortCursor = 30001
 		}
 		probe, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(candidate)))
 		if err != nil {

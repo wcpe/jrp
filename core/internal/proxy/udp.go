@@ -36,6 +36,10 @@ type udpDatagram struct {
 type UDPSessionConfig struct {
 	// Peer 是会话的对端地址；同一对端地址的数据报归属同一会话。
 	Peer netip.AddrPort
+	// Official 表示工作连接使用官方 frpc 的 udp-packet JSON 消息。
+	Official bool
+	// Wire 是官方消息所在的 wire 版本。
+	Wire wire.Version
 	// Work 是送达客户端侧目标的工作连接。
 	Work net.Conn
 	// Send 把响应数据报写回对端。
@@ -57,6 +61,8 @@ type UDPSession struct {
 	send        func(peer netip.AddrPort, datagram []byte) error
 	idle        time.Duration
 	maxDatagram int
+	official    bool
+	wireVersion wire.Version
 
 	inbound chan []byte
 	done    chan struct{}
@@ -79,6 +85,8 @@ func NewUDPSession(config UDPSessionConfig) *UDPSession {
 		send:        config.Send,
 		idle:        config.Idle,
 		maxDatagram: config.MaxDatagram,
+		official:    config.Official,
+		wireVersion: config.Wire,
 		inbound:     make(chan []byte, inboundQueueSize),
 		done:        make(chan struct{}),
 		cancel:      cancel,
@@ -164,6 +172,26 @@ func (session *UDPSession) Serve(ctx context.Context) {
 
 // readResponses 读取工作连接回传的数据报并写回对端，结束或出错时报告一次。
 func (session *UDPSession) readResponses(report chan<- error) {
+	if session.official && session.wireVersion == wire.VersionV2 {
+		reader := wire.NewV2Reader(session.work, udpDatagramFrameLimit)
+		for {
+			frame, err := reader.ReadFrame()
+			if err != nil {
+				report <- err
+				return
+			}
+			datagram, peer, decoded := decodeOfficialDatagram(frame.Message.Payload)
+			validType := frame.Message.Type == wire.MessageTypeUDPPacket
+			frame.Release()
+			if !validType || !decoded {
+				report <- errDatagramInvalid
+				return
+			}
+			if !session.deliverResponse(peer, datagram) {
+				return
+			}
+		}
+	}
 	reader := wire.NewV1Reader(session.work, udpDatagramFrameLimit)
 	for {
 		frame, err := reader.ReadFrame()
@@ -171,28 +199,47 @@ func (session *UDPSession) readResponses(report chan<- error) {
 			report <- err
 			return
 		}
-		datagram, decoded := decodeDatagram(frame)
+		var datagram []byte
+		var peer = session.peer
+		var decoded bool
+		if session.official {
+			datagram, peer, decoded = decodeOfficialDatagram(frame.Payload)
+			decoded = decoded && frame.Type == wire.MessageTypeUDPPacket
+		} else {
+			datagram, decoded = decodeDatagram(frame)
+		}
 		frame.Release()
 		if !decoded {
 			report <- errDatagramInvalid
 			return
 		}
-		// 回传方向同样受数据报上限约束：规格要求数据报大小受上限约束、超限丢弃
-		// 并计数，而该约束若只作用于入口方向，超过配置上限的数据报仍会被写入
-		// UDP 对端（可能触发 EMSGSIZE，或超出对端预期的缓冲区大小），且不被计数。
-		if len(datagram) > session.maxDatagram {
-			session.dropped.Add(1)
-			continue
-		}
-		if err := session.send(session.peer, datagram); err != nil {
-			report <- err
+		if !session.deliverResponse(peer, datagram) {
 			return
 		}
 	}
 }
 
-// sendDatagram 把一个数据报编码为 wire 帧写入工作连接。
+// deliverResponse 校验并写回一个数据报。
+func (session *UDPSession) deliverResponse(peer netip.AddrPort, datagram []byte) bool {
+	if len(datagram) > session.maxDatagram {
+		session.dropped.Add(1)
+		return true
+	}
+	if err := session.send(peer, datagram); err != nil {
+		return false
+	}
+	return true
+}
+
+// sendDatagram 把一个数据报编码为工作连接上的 wire 消息。
 func (session *UDPSession) sendDatagram(datagram []byte) error {
+	if session.official {
+		frame, err := encodeOfficialDatagram(datagram, session.peer, session.wireVersion)
+		if err != nil {
+			return err
+		}
+		return writeDatagramFrame(session.work, frame)
+	}
 	frame, err := encodeDatagram(datagram)
 	if err != nil {
 		return err
@@ -224,6 +271,10 @@ type UDPProxyConfig struct {
 	MaxSessions int
 	// MaxDatagram 是单个数据报的字节上限。
 	MaxDatagram int
+	// Official 表示工作连接使用官方 frpc 的 udp-packet 消息。
+	Official bool
+	// Wire 是官方消息所在的 wire 版本。
+	Wire wire.Version
 	// Work 为新建会话提供一条工作连接；返回假表示无法建立。
 	Work func() (net.Conn, bool)
 }
@@ -238,6 +289,8 @@ type UDPProxy struct {
 	idle        time.Duration
 	maxSessions int
 	maxDatagram int
+	official    bool
+	wireVersion wire.Version
 	work        func() (net.Conn, bool)
 
 	mu        sync.Mutex
@@ -267,6 +320,8 @@ func NewUDPProxy(config UDPProxyConfig) *UDPProxy {
 		idle:        config.Idle,
 		maxSessions: config.MaxSessions,
 		maxDatagram: config.MaxDatagram,
+		official:    config.Official,
+		wireVersion: config.Wire,
 		work:        config.Work,
 		sessions:    make(map[netip.AddrPort]*UDPSession),
 		cancel:      cancel,
@@ -418,6 +473,8 @@ func (entry *UDPProxy) dispatch(ctx context.Context, peer netip.AddrPort, datagr
 			Send:        entry.writeBack,
 			Idle:        entry.idle,
 			MaxDatagram: entry.maxDatagram,
+			Official:    entry.official,
+			Wire:        entry.wireVersion,
 		})
 		entry.sessions[peer] = session
 		entry.serve.Add(1)

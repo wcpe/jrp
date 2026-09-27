@@ -66,6 +66,28 @@ func encodeTestNewProxy(t *testing.T, name, proxyType string, remotePort int, ta
 	return frame
 }
 
+// encodeTestNewProxyWithFields 构造带官方可选字段的 new-proxy 帧。
+func encodeTestNewProxyWithFields(t *testing.T, name, proxyType string, remotePort int, fields map[string]any) []byte {
+	t.Helper()
+	bodyFields := map[string]any{
+		"proxy_name":  name,
+		"proxy_type":  proxyType,
+		"remote_port": remotePort,
+	}
+	for key, value := range fields {
+		bodyFields[key] = value
+	}
+	body, err := json.Marshal(bodyFields)
+	if err != nil {
+		t.Fatalf("编码注册失败：%v", err)
+	}
+	frame, err := wire.EncodeV1Frame(wire.Frame{Type: wire.MessageTypeNewProxy, Payload: body})
+	if err != nil {
+		t.Fatalf("编码注册帧失败：%v", err)
+	}
+	return frame
+}
+
 // encodeTestCloseProxy 构造 close-proxy 帧（测试辅助）。
 func encodeTestCloseProxy(t *testing.T, name string) []byte {
 	t.Helper()
