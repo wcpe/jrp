@@ -279,3 +279,8 @@ tasks:
     desc: 实机验收执行器（面向远端 jrps，需 --server 与凭据，--preflight-only 为只读预检）
     cmds:
       - node scripts/compat/real-network.mjs {{.CLI_ARGS}}
+
+  compat:nat-probe:
+    desc: NAT 探测（判定客户端侧映射方式；需两个以上 STUN 端点，--serve 为离线自测）
+    cmds:
+      - node scripts/compat/nat-probe.mjs {{.CLI_ARGS}}
