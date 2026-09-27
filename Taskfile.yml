@@ -114,6 +114,15 @@ tasks:
       - task: vet:jrps
       - task: vet:jrpc
       - node scripts/check-dependencies.mjs
+      - task: lint:privacy
+
+  lint:privacy:
+    desc: 扫描隐私信息（公网地址、私钥、凭据明文不得入库）
+    cmds:
+      # 实机验收会把服务器地址与凭据带到工作区，靠人记得不写进文档不牢靠：
+      # 本仓库就发生过一次，最后只能靠改写历史清除。文档只需拓扑描述即可支撑
+      # 结论，具体地址不提供信息量，却会泄露一台可定位的主机。
+      - node scripts/scan-privacy.mjs
 
   lint:web:
     desc: 检查 Web 格式与 ESLint 规则
