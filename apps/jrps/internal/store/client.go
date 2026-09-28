@@ -89,6 +89,7 @@ func (tx *Tx) CreateClient(input ClientInput) (uint64, error) {
 			ID:              input.ID,
 			Name:            name,
 			TokenDigest:     DigestToken(input.Token),
+			TokenCompat:     input.Token,
 			EnrollmentState: EnrollmentStatePending,
 			ConnectionState: ConnectionStateOffline,
 			CreatedAt:       time.Now().UTC(),
@@ -213,4 +214,29 @@ func (tx *Tx) Clients() ([]ClientView, error) {
 		})
 	}
 	return views, nil
+}
+
+// ClientCredentialMaterial 是数据面凭证的装配材料。
+//
+// 摘要用于摘要链（jrpc 送明文，服务端摘要后比对）；兼容明文用于官方链
+// （官方 frpc 送 md5(token ∥ 时间戳)，服务端用明文复算）。两者可以只有其一。
+type ClientCredentialMaterial struct {
+	Digest      string
+	CompatToken string
+}
+
+// ActiveClientCredentials 返回 active 客户端的凭证装配材料。
+func (tx *Tx) ActiveClientCredentials() (map[string]ClientCredentialMaterial, error) {
+	var clients []Client
+	if err := tx.db.Find(&clients, "enrollment_state = ?", EnrollmentStateActive).Error; err != nil {
+		return nil, fmt.Errorf("读取 active 客户端失败：%w", translateSQLError(err))
+	}
+	credentials := make(map[string]ClientCredentialMaterial, len(clients))
+	for _, client := range clients {
+		credentials[client.ID] = ClientCredentialMaterial{
+			Digest:      client.TokenDigest,
+			CompatToken: client.TokenCompat,
+		}
+	}
+	return credentials, nil
 }

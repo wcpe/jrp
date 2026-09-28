@@ -94,7 +94,7 @@ func sliceConfigs(t *testing.T, control netip.AddrPort, target netip.AddrPort, g
 	serverConfig, err := core.NewServerConfig(
 		core.WithListen(core.BindEndpoint{Address: control, Transport: core.TransportTCP}),
 		core.WithWire(core.WireV1),
-		core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: testClientToken}),
+		core.WithClientCredential(core.ClientCredential{ClientID: testClientID, Token: server.DigestToken(testClientToken)}),
 		core.WithTCPProxyBinding(core.TCPProxyBinding{
 			Name:       testProxyName,
 			ClientID:   testClientID,

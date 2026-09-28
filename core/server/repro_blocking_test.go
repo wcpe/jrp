@@ -12,9 +12,13 @@ import (
 	"github.com/wcpe/jrp/core"
 )
 
-// B1 复现：控制连接异常断开后，Err() 应返回非 nil 且 Done 应关闭。
-// 当前行为：Err() 恒 nil，Done 在 Shutdown 前不关闭。
-func TestReproServerAbnormalStopSetsErr(t *testing.T) {
+// B1（FR-03 修订）：控制连接异常断开不停止引擎。
+//
+// 原语义（FR-25 垂直切片）：单条控制连接断开 = 引擎异常终止（Done 关闭、
+// Err 非 nil）。FR-03 引入多客户端语义后该行为已修订（见 §3.4/§3.5）：
+// 会话级错误只关闭本会话，引擎停止只由 Accept 致命失败与 Shutdown 触发——
+// 否则一个客户端掉线会杀死全部会话，官方 frpc 的断线重连会反复触发停机。
+func TestSessionDropDoesNotStopEngine(t *testing.T) {
 	config := mustServerConfig(t)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -33,23 +37,23 @@ func TestReproServerAbnormalStopSetsErr(t *testing.T) {
 	}
 	_ = raw.Close()
 
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		select {
-		case <-engine.Done():
-			goto CHECKED
-		default:
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("复现确认：异常连接断开后 Done 未关闭（当前行为）")
-		}
-		time.Sleep(20 * time.Millisecond)
+	// 会话断开后引擎必须保持运行：Done 不关闭、Err 保持 nil。
+	time.Sleep(300 * time.Millisecond)
+	select {
+	case <-engine.Done():
+		t.Fatalf("会话断开不应停止引擎，实际 Done 已关闭：%v", engine.Err())
+	default:
 	}
-CHECKED:
-	if err := engine.Err(); err == nil {
-		t.Fatalf("复现确认 B1：Done 已关闭但 Err() 为 nil（当前行为）")
+	if err := engine.Err(); err != nil {
+		t.Fatalf("会话断开后 Err() 应为 nil，实际：%v", err)
 	}
-	_ = engine.Shutdown(context.Background())
+	// 正常 Shutdown 后 Err() 仍为 nil（正常路径不受此路径污染）。
+	if err := engine.Shutdown(context.Background()); err != nil {
+		t.Fatalf("关闭失败：%v", err)
+	}
+	if err := engine.Err(); err != nil {
+		t.Fatalf("正常 Shutdown 后 Err() 应为 nil，实际：%v", err)
+	}
 }
 
 // B2 复现：N 个 goroutine 并发 Start，只应有一个成功。
@@ -140,7 +144,7 @@ func mustServerConfig(t *testing.T) core.ServerConfig {
 	config, err := core.NewServerConfig(
 		core.WithListen(core.BindEndpoint{Address: listen, Transport: core.TransportTCP}),
 		core.WithWire(core.WireV1),
-		core.WithClientCredential(core.ClientCredential{ClientID: "repro", Token: "repro-token"}),
+		core.WithClientCredential(core.ClientCredential{ClientID: "repro", Token: DigestToken("repro-token")}),
 		core.WithTCPProxyBinding(core.TCPProxyBinding{
 			Name:       "repro-proxy",
 			ClientID:   "repro",
@@ -163,15 +167,15 @@ func mustServerConfig(t *testing.T) core.ServerConfig {
 // 偶发 bind: address already in use（Web 构建矩阵的 core/server 已实测）。
 // 改为从三平台动态端口范围之外的固定区间游标取号，与 core 根包测试的
 // freePort 助手同一策略，不依赖释放-重绑的时序。
-// 复用 core 根包的测试端口区间策略：20000–30000 落在三平台动态端口范围
-// 之外（Windows 1024–15000、Linux 32768–60999、macOS 49152–65535），
-// 与出站临时端口互不相撞。游标只增不减并加锁，保证并发取号不重复。
+// 使用独立测试端口区间：30001–31000 落在三平台动态端口范围之外
+// （Windows 1024–15000、Linux 32768–60999、macOS 49152–65535），
+// 并与 core 根包的 20000–30000 区间隔离。游标只增不减并加锁，保证并发取号不重复。
 var (
 	reproPortMutex  sync.Mutex
-	reproPortCursor = 20000
+	reproPortCursor = 30001
 )
 
-const reproPortRangeEnd = 30000
+const reproPortRangeEnd = 31000
 
 func freeReproPort(t *testing.T) int {
 	t.Helper()
@@ -181,7 +185,7 @@ func freeReproPort(t *testing.T) int {
 		candidate := reproPortCursor
 		reproPortCursor++
 		if reproPortCursor > reproPortRangeEnd {
-			reproPortCursor = 20000
+			reproPortCursor = 30001
 		}
 		probe, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(candidate)))
 		if err != nil {

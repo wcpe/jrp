@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -276,6 +277,25 @@ func (broker *workBroker) takeStaged(proxyName string) *transport.Conn {
 	return broker.works.Take(proxyName)
 }
 
+// stagedWorkConns 返回该代理暂存（未配对）的工作连接数量。
+func (broker *workBroker) stagedWorkConns(proxyName string) int {
+	broker.mu.Lock()
+	defer broker.mu.Unlock()
+	return broker.works.Len(proxyName)
+}
+
+// closeStagedWorks 只关闭尚未配对的待命工作连接，保留等待配对的访客。
+//
+// 换代重建配对中心时调用：被替换掉的旧中心里的待命连接不再被任何一代引用，
+// 若只是丢弃引用而不关闭，客户端的维持循环会认为仍有待命连接而不补建，
+// 新访客于是一直暂存到失活超时（实测：等价配置二次应用后，新访客全部暂存，
+// 直到排空上限才恢复）。关闭后客户端会立刻补建一条新的待命连接。
+func (broker *workBroker) closeStagedWorks() {
+	broker.mu.Lock()
+	defer broker.mu.Unlock()
+	_ = broker.works.Close()
+}
+
 // closeStaged 关闭尚未配对的暂存连接并拒绝后续配对。
 //
 // 已配对并进入桥接的连接不在此处理：它们承载活动流，由 Engine 按排水上限
@@ -308,7 +328,65 @@ func (broker *workBroker) closeStaged() {
 type workConnRequest struct {
 	ClientID string `json:"client_id"`
 	Token    string `json:"token"`
-	RunID    string `json:"run_id"`
-	Proxy    string `json:"proxy_name"`
-	Target   string `json:"target_addr"`
+	// PrivilegeKey 是官方形态的鉴权材料（md5(token ∥ timestamp)）。
+	//
+	// 官方客户端的工作连接只声明运行 ID 与鉴权材料，不带客户端标识、代理名与
+	// 目标：服务端按运行 ID 定位控制会话，并在配对那一刻指派它服务哪个代理
+	// （PROTOCOL §7 第 2、3 步）。jrpc 走声明式路径，使用上面的既有字段。
+	PrivilegeKey string `json:"privilege_key"`
+	// Timestamp 是官方鉴权材料的组成部分：官方 frpc 送 md5(token ∥ timestamp)，
+	// 服务端复算需要同一时间戳。
+	Timestamp int64  `json:"timestamp"`
+	RunID     string `json:"run_id"`
+	Proxy     string `json:"proxy_name"`
+	Target    string `json:"target_addr"`
+}
+
+// stagingSummary 是暂存访客的源/目标摘要，用于填充 start-work-conn。
+type stagingSummary struct {
+	srcAddr string
+	srcPort uint16
+	dstAddr string
+	dstPort uint16
+}
+
+// startWorkConnPayload 是服务端向工作连接指派代理与源/目标摘要的载荷（官方形状）。
+type startWorkConnPayload struct {
+	ProxyName string `json:"proxy_name,omitempty"`
+	SrcAddr   string `json:"src_addr,omitempty"`
+	SrcPort   uint16 `json:"src_port,omitempty"`
+	DstAddr   string `json:"dst_addr,omitempty"`
+	DstPort   uint16 `json:"dst_port,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// hasStagedGuest 报告该代理是否有暂存访客等待工作连接。
+func (broker *workBroker) hasStagedGuest(proxyName string) bool {
+	broker.mu.Lock()
+	defer broker.mu.Unlock()
+	return len(broker.guests[proxyName]) > 0
+}
+
+// stagingSummaryFor 返回该代理最早暂存访客的地址摘要。
+//
+// 摘要只是信息性的（官方对端用它做日志与观测），因此这里与配对之间存在竞争
+// 窗口是可接受的：真正的归属决策由 park 在锁内完成。
+func (broker *workBroker) stagingSummaryFor(proxyName string) (stagingSummary, bool) {
+	broker.mu.Lock()
+	staged := broker.guests[proxyName]
+	broker.mu.Unlock()
+	if len(staged) == 0 {
+		return stagingSummary{}, false
+	}
+	guest := staged[0].conn
+	summary := stagingSummary{}
+	if remote, err := netip.ParseAddrPort(guest.RemoteAddr().String()); err == nil {
+		summary.srcAddr = remote.Addr().String()
+		summary.srcPort = remote.Port()
+	}
+	if local, err := netip.ParseAddrPort(guest.LocalAddr().String()); err == nil {
+		summary.dstAddr = local.Addr().String()
+		summary.dstPort = local.Port()
+	}
+	return summary, true
 }

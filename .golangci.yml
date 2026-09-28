@@ -32,6 +32,16 @@ linters:
           - unused
         text: withCopiedTargets is unused
 
+      # kcp-go v5.6.72 把 UDPSession.SetStreamMode 标注为废弃，但未提供替代 API。
+      # 该调用是 frp 兼容的前提：官方客户端与服务端都以流模式（kcp.stream=1）承载
+      # 字节流，不设置会退回消息模式、与官方实现无法互操作（已用官方二进制黑盒
+      # 验证过流模式下的端到端回显）。官方实现同样调用该方法，故按「无替代 API 的
+      # 必需调用」豁免，范围限定到传输适配文件。
+      - path: (^|[/\\])internal[/\\]transport[/\\]adapters\.go$
+        linters:
+          - staticcheck
+        text: 'SA1019: session\.SetStreamMode is deprecated'
+
       # 客户端侧日志注入点已由规格 docs/specs/core-engine-facade.md 约定，
       # 但日志事件尚未落地，属规格未落地而非可删代码：保留公共面，
       # 并在代码内标注待办，待事件落地后一并移除豁免。

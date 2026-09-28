@@ -20,10 +20,32 @@ const DesiredSchemaVersion = 1
 // 热更），默认值与 docs/OPERATIONS.md 的示例端口一致。
 const DefaultControlListenPort = 7200
 
+// ControlTransport 是控制监听传输方式的枚举。
+type ControlTransport string
+
+const (
+	// ControlTransportTCP 是默认的 TCP 控制监听传输。
+	ControlTransportTCP ControlTransport = "tcp"
+	// ControlTransportWebSocket 是明文 WebSocket 控制监听传输。
+	ControlTransportWebSocket ControlTransport = "websocket"
+	// ControlTransportWSS 是 TLS 加密的 WebSocket 控制监听传输。
+	ControlTransportWSS ControlTransport = "wss"
+	// ControlTransportKCP 是 KCP 控制监听传输。
+	ControlTransportKCP ControlTransport = "kcp"
+	// ControlTransportQUIC 是 QUIC 控制监听传输。
+	ControlTransportQUIC ControlTransport = "quic"
+)
+
+const defaultControlListenPath = "/frp"
+
 // ControlListen 是 desired 文档中的控制监听设置。
 type ControlListen struct {
-	Host string
-	Port int
+	Host        string           `json:"host"`
+	Port        int              `json:"port"`
+	Transport   ControlTransport `json:"transport,omitempty"`
+	Path        string           `json:"path,omitempty"`
+	TLSCertFile string           `json:"tlsCertFile,omitempty"`
+	TLSKeyFile  string           `json:"tlsKeyFile,omitempty"`
 }
 
 // AddrPort 把监听设置转换为 Core 可接受的地址端口值。
@@ -40,6 +62,43 @@ func (listen ControlListen) AddrPort() (netip.AddrPort, error) {
 		return netip.AddrPort{}, fmt.Errorf("控制监听地址非法 %q：%w", host, err)
 	}
 	return netip.AddrPortFrom(addr, uint16(listen.Port)), nil
+}
+
+func validateControlListen(listen *ControlListen) error {
+	if listen.Transport == "" {
+		listen.Transport = ControlTransportTCP
+	}
+	switch listen.Transport {
+	case ControlTransportTCP, ControlTransportWebSocket, ControlTransportWSS, ControlTransportKCP, ControlTransportQUIC:
+	default:
+		return fmt.Errorf("控制监听传输方式未支持：%s", listen.Transport)
+	}
+	if listen.Port <= 0 || listen.Port > 65535 {
+		return fmt.Errorf("控制监听端口越界：%d", listen.Port)
+	}
+	if listen.Path != "" {
+		if listen.Path[0] != '/' || strings.ContainsAny(listen.Path, "?#") {
+			return fmt.Errorf("控制监听路径非法")
+		}
+	}
+	if listen.Transport == ControlTransportWebSocket || listen.Transport == ControlTransportWSS {
+		if listen.Path == "" {
+			listen.Path = defaultControlListenPath
+		}
+	} else if listen.Path != "" {
+		return fmt.Errorf("控制监听传输方式不支持路径配置")
+	}
+	if (listen.TLSCertFile == "") != (listen.TLSKeyFile == "") {
+		return fmt.Errorf("控制监听 TLS 证书与私钥文件必须同时配置")
+	}
+	if listen.Transport == ControlTransportWSS || listen.Transport == ControlTransportQUIC {
+		if listen.TLSCertFile == "" {
+			return fmt.Errorf("控制监听 TLS 证书与私钥文件不能为空")
+		}
+	} else if listen.TLSCertFile != "" {
+		return fmt.Errorf("控制监听传输方式不支持 TLS 文件配置")
+	}
+	return nil
 }
 
 // DesiredProxy 是文档中的单个代理条目。
@@ -93,8 +152,8 @@ func ParseDesiredDocument(content string) (DesiredDocument, error) {
 	if doc.SchemaVersion != DesiredSchemaVersion {
 		return DesiredDocument{}, fmt.Errorf("desired 文档版本不支持：%d（当前 %d）", doc.SchemaVersion, DesiredSchemaVersion)
 	}
-	if doc.ControlListen.Port <= 0 || doc.ControlListen.Port > 65535 {
-		return DesiredDocument{}, fmt.Errorf("控制监听端口越界：%d", doc.ControlListen.Port)
+	if err := validateControlListen(&doc.ControlListen); err != nil {
+		return DesiredDocument{}, err
 	}
 	known := make(map[string]bool, len(doc.Proxies))
 	names := make(map[string]bool, len(doc.Proxies))
@@ -148,7 +207,7 @@ func (tx *Tx) DesiredDocument() (DesiredDocument, error) {
 	}
 	doc := DesiredDocument{
 		SchemaVersion: DesiredSchemaVersion,
-		ControlListen: ControlListen{Host: "", Port: DefaultControlListenPort},
+		ControlListen: ControlListen{Host: "", Port: DefaultControlListenPort, Transport: ControlTransportTCP},
 		Proxies:       make([]DesiredProxy, 0, len(proxies)),
 	}
 	for _, proxy := range proxies {

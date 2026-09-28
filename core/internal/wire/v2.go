@@ -2,6 +2,7 @@ package wire
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 )
 
@@ -193,7 +194,9 @@ func (reader *V2Reader) ReadFrame() (V2Frame, error) {
 		if err == io.EOF {
 			return V2Frame{}, io.EOF
 		}
-		return V2Frame{}, protocolError(CategoryPayloadTruncated, StageMessage, "帧头在流结束前被截断")
+		// 保留底层错误：加密通道下"截断"的原因可能是认证失败、流未对齐或
+		// 对端提前关闭，原样丢掉会让三类原因在日志里长得一模一样。
+		return V2Frame{}, protocolError(CategoryPayloadTruncated, StageMessage, fmt.Sprintf("帧头在流结束前被截断：%v", err))
 	}
 	frameType := binary.BigEndian.Uint16(reader.header[0:2])
 	if !isDefinedV2FrameType(frameType) {

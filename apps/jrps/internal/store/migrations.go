@@ -8,7 +8,7 @@ import (
 )
 
 // currentSchemaVersion 是当前程序期望的数据库架构版本，落库到 PRAGMA user_version。
-const currentSchemaVersion = 4
+const currentSchemaVersion = 5
 
 // migration 是一次架构迁移步骤；apply 在同一事务中被调用。
 type migration struct {
@@ -24,7 +24,23 @@ func migrations() []migration {
 		{version: 2, name: "新增保留策略对象并放开审计清理", apply: applyRetentionPolicy},
 		{version: 3, name: "补齐通知目标与 outbox 的投递字段", apply: applyNotificationDelivery},
 		{version: 4, name: "建立一次性 enrollment 凭据表", apply: applyEnrollmentCredential},
+		{version: 5, name: "新增客户端兼容凭证列", apply: applyClientCompatToken},
 	}
+}
+
+// applyClientCompatToken 为客户端表增加兼容凭证列（FR-03 §3.4 登记的例外）。
+//
+// 官方 frpc 的登录、心跳与工作连接都只送 md5(token ∥ 时间戳) 的摘要前处理材料，
+// 服务端必须持有 token 明文才能复算比对，因此该列随本次迁移引入。
+//
+// 既有行迁移后该列为空字符串：它们的 token 摘要仍然有效（jrpc 摘要链不受影响），
+// 但官方 frpc 无法用旧 token 登录——需要管理员轮换 token 或重新走 enrollment，
+// 新写入的明文会随轮换/兑换落入该列。
+func applyClientCompatToken(tx *gorm.DB) error {
+	if err := tx.AutoMigrate(&Client{}); err != nil {
+		return fmt.Errorf("新增客户端兼容凭证列失败：%w", err)
+	}
+	return nil
 }
 
 // applyEnrollmentCredential 建立一次性 enrollment 凭据表（FR-07）。

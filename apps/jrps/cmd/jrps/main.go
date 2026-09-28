@@ -128,7 +128,7 @@ func serve(listen, tlsCert, tlsKey string, database *store.Store, logger *slog.L
 
 	// 数据面引擎装配（FR-10）：控制监听失败或引擎启动失败都按致命错误处理，
 	// 不降级为"只有管理面没有数据面"的半可用状态——后者让管理员误以为服务正常。
-	engine, err := startEngine(ctx, logger)
+	engine, err := startEngine(ctx, database, logger)
 	if err != nil {
 		logger.Error("数据面引擎启动失败，拒绝启动", "错误", err)
 		return 1

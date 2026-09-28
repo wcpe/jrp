@@ -7,10 +7,15 @@ package apply
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,6 +51,9 @@ var ErrStaleRevision = errors.New("请求应用的版本已过期")
 
 // ErrInvalidDesired 表示 desired 内容无法转换为合法的 Core 快照。
 var ErrInvalidDesired = errors.New("desired 内容非法")
+
+// ErrBootstrapIdentityChanged 表示控制入口身份发生变化，必须重启后应用。
+var ErrBootstrapIdentityChanged = errors.New("控制入口身份变化，需要重启")
 
 // CredentialProvider 是数据面凭证集合的来源。
 //
@@ -180,6 +188,17 @@ func (service *Service) runPhases(ctx context.Context, revision uint64, content 
 		logger.Warn("desired 内容无法转换为快照，按 validate 阶段失败处理",
 			"版本", revision, "错误", err)
 		return service.recordValidateFailure(ctx, revision, actor, requestID, err)
+	}
+	// 控制入口身份只在热更路径上有意义：启动时引擎已按最新 desired 建立了监听
+	// 套接字，此时拿"上次记录的 active"与新快照比较，会把重启生效的新身份判定为
+	// 非法变更并拒绝——自己把自己卡在旧传输上（实测：desired 从 tcp 改为 websocket
+	// 后重启，恢复被拒、入口永远停在 tcp）。恢复路径因此跳过该守卫。
+	if requestID != "recover" {
+		if err := service.ensureBootstrapIdentity(ctx, content, config.Listen()); err != nil {
+			logger.Warn("控制入口身份变化，拒绝热更并保留旧 active",
+				"版本", revision, "错误", err)
+			return service.recordValidateFailure(ctx, revision, actor, requestID, err)
+		}
 	}
 
 	// 每个阶段有独立超时（规格 §3.3）；Core 的 drain 自带排空上限，此处不再叠加。
@@ -437,11 +456,11 @@ func (applier *recoverApplier) Apply(ctx context.Context, _ string) store.ApplyO
 // AllowedTargets 取代理自身目标——P1 的允许集合就是"该代理声明的那个目标"，
 // 更细粒度的集合管理属 FR-11 的代理编辑语义。
 func (service *Service) buildSnapshot(ctx context.Context, content string) (core.ServerConfig, error) {
-	document, err := store.ParseDesiredDocument(content)
+	document, control, err := parseDesiredContent(content)
 	if err != nil {
 		return core.ServerConfig{}, fmt.Errorf("%w：%w", ErrInvalidDesired, err)
 	}
-	listen, err := document.ControlListen.AddrPort()
+	endpoint, err := buildControlEndpoint(document.ControlListen, control)
 	if err != nil {
 		return core.ServerConfig{}, fmt.Errorf("%w：%w", ErrInvalidDesired, err)
 	}
@@ -454,7 +473,7 @@ func (service *Service) buildSnapshot(ctx context.Context, content string) (core
 	}
 
 	options := []core.ServerOption{
-		core.WithListen(core.BindEndpoint{Address: listen, Transport: core.TransportTCP}),
+		core.WithListen(endpoint),
 		core.WithWire(core.WireV1),
 		core.WithClientCredentials(credentials),
 	}
@@ -487,4 +506,177 @@ func (service *Service) buildSnapshot(ctx context.Context, content string) (core
 		return core.ServerConfig{}, fmt.Errorf("%w：%w", ErrInvalidDesired, err)
 	}
 	return config, nil
+}
+
+type desiredControlListen struct {
+	Transport   string `json:"transport"`
+	Path        string `json:"path"`
+	TLSCertFile string `json:"tlsCertFile"`
+	TLSKeyFile  string `json:"tlsKeyFile"`
+}
+
+type bootstrapIdentity struct {
+	Address       netip.AddrPort
+	Transport     core.Transport
+	CertificateID string
+	PrivateKeyID  string
+}
+
+func parseDesiredContent(content string) (store.DesiredDocument, desiredControlListen, error) {
+	var raw map[string]json.RawMessage
+	decoder := json.NewDecoder(strings.NewReader(content))
+	if err := decoder.Decode(&raw); err != nil {
+		return store.DesiredDocument{}, desiredControlListen{}, err
+	}
+	controlRaw, ok := raw["controlListen"]
+	if !ok {
+		return store.DesiredDocument{}, desiredControlListen{}, errors.New("desired 缺少 controlListen")
+	}
+	var control desiredControlListen
+	if err := json.Unmarshal(controlRaw, &control); err != nil {
+		return store.DesiredDocument{}, desiredControlListen{}, err
+	}
+	var controlFields map[string]json.RawMessage
+	if err := json.Unmarshal(controlRaw, &controlFields); err != nil {
+		return store.DesiredDocument{}, desiredControlListen{}, err
+	}
+	for key := range controlFields {
+		switch strings.ToLower(key) {
+		case "transport", "path", "tlscertfile", "tlskeyfile":
+			delete(controlFields, key)
+		}
+	}
+	stripped, err := json.Marshal(controlFields)
+	if err != nil {
+		return store.DesiredDocument{}, desiredControlListen{}, err
+	}
+	raw["controlListen"] = stripped
+	normalized, err := json.Marshal(raw)
+	if err != nil {
+		return store.DesiredDocument{}, desiredControlListen{}, err
+	}
+	document, err := store.ParseDesiredDocument(string(normalized))
+	if err != nil {
+		return store.DesiredDocument{}, desiredControlListen{}, err
+	}
+	return document, control, nil
+}
+
+func buildControlEndpoint(listen store.ControlListen, control desiredControlListen) (core.BindEndpoint, error) {
+	address, err := listen.AddrPort()
+	if err != nil {
+		return core.BindEndpoint{}, err
+	}
+	transport := strings.ToLower(strings.TrimSpace(control.Transport))
+	if transport == "" {
+		transport = string(core.TransportTCP)
+	}
+	endpoint := core.BindEndpoint{Address: address, Transport: core.Transport(transport)}
+	switch endpoint.Transport {
+	case core.TransportTCP, core.TransportKCP:
+		return endpoint, nil
+	case core.TransportWebSocket, core.TransportWSS:
+		endpoint.TransportConfig.WebSocket.Path = control.Path
+		if endpoint.Transport == core.TransportWSS {
+			certificate, privateKey, err := readTLSFiles(control)
+			if err != nil {
+				return core.BindEndpoint{}, err
+			}
+			endpoint.TransportConfig.WebSocket.TLS.CertificatePEM = string(certificate)
+			endpoint.TransportConfig.WebSocket.TLS.PrivateKeyPEM = string(privateKey)
+		}
+		return endpoint, nil
+	case core.TransportQUIC:
+		certificate, privateKey, err := readTLSFiles(control)
+		if err != nil {
+			return core.BindEndpoint{}, err
+		}
+		endpoint.TransportConfig.QUIC.TLS.CertificatePEM = string(certificate)
+		endpoint.TransportConfig.QUIC.TLS.PrivateKeyPEM = string(privateKey)
+		return endpoint, nil
+	default:
+		return core.BindEndpoint{}, fmt.Errorf("控制传输不支持：%s", transport)
+	}
+}
+
+func readTLSFiles(control desiredControlListen) ([]byte, []byte, error) {
+	if control.TLSCertFile == "" || control.TLSKeyFile == "" {
+		return nil, nil, errors.New("WSS/QUIC 必须同时配置 TLS 证书与私钥文件")
+	}
+	certificate, err := os.ReadFile(control.TLSCertFile)
+	if err != nil {
+		return nil, nil, errors.New("读取 TLS 证书文件失败")
+	}
+	privateKey, err := os.ReadFile(control.TLSKeyFile)
+	if err != nil {
+		return nil, nil, errors.New("读取 TLS 私钥文件失败")
+	}
+	if len(certificate) == 0 || len(privateKey) == 0 {
+		return nil, nil, errors.New("TLS 证书与私钥文件不能为空")
+	}
+	return certificate, privateKey, nil
+}
+
+func (service *Service) ensureBootstrapIdentity(ctx context.Context, content string, endpoint core.BindEndpoint) error {
+	var activeRevision uint64
+	err := service.store.View(ctx, func(tx *store.Tx) error {
+		state, err := tx.RevisionState(store.ScopeServer)
+		if err != nil {
+			return err
+		}
+		activeRevision = state.ActiveRevision
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if engineRevision := service.engine.ActiveRevision(); engineRevision != 0 {
+		activeRevision = engineRevision
+	}
+	if activeRevision == 0 {
+		return nil
+	}
+	var activeContent string
+	err = service.store.View(ctx, func(tx *store.Tx) error {
+		revision, err := tx.Revision(activeRevision)
+		if err != nil {
+			return err
+		}
+		activeContent = revision.Content
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	activeDocument, activeControl, err := parseDesiredContent(activeContent)
+	if err != nil {
+		return err
+	}
+	activeEndpoint, err := buildControlEndpoint(activeDocument.ControlListen, activeControl)
+	if err != nil {
+		return err
+	}
+	if bootstrapIdentityOf(activeEndpoint) != bootstrapIdentityOf(endpoint) {
+		return ErrBootstrapIdentityChanged
+	}
+	return nil
+}
+
+func bootstrapIdentityOf(endpoint core.BindEndpoint) bootstrapIdentity {
+	identity := bootstrapIdentity{Address: endpoint.Address, Transport: endpoint.Transport}
+	var tlsConfig core.TLSConfig
+	switch endpoint.Transport {
+	case core.TransportWSS:
+		tlsConfig = endpoint.TransportConfig.WebSocket.TLS
+	case core.TransportQUIC:
+		tlsConfig = endpoint.TransportConfig.QUIC.TLS
+	}
+	identity.CertificateID = contentDigest(tlsConfig.CertificatePEM)
+	identity.PrivateKeyID = contentDigest(tlsConfig.PrivateKeyPEM)
+	return identity
+}
+
+func contentDigest(content string) string {
+	digest := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(digest[:])
 }

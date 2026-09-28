@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -83,6 +84,23 @@ func latestRevision(t *testing.T, database *store.Store) uint64 {
 		return nil
 	}); err != nil {
 		t.Fatalf("读取最新版本失败：%v", err)
+	}
+	return revision
+}
+
+func appendDesiredContent(t *testing.T, database *store.Store, content string) uint64 {
+	t.Helper()
+	var revision uint64
+	if err := database.Transaction(context.Background(), func(tx *store.Tx) error {
+		var err error
+		revision, err = tx.AppendRevision(store.RevisionInput{
+			Content: content,
+			Actor:   store.ActorAdmin("admin"),
+			Origin:  store.OriginProxyUpdate,
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("追加 desired 内容失败：%v", err)
 	}
 	return revision
 }
@@ -345,6 +363,128 @@ func (engine *blockingEngine) LastGoodRevision() uint64 { return 0 }
 
 func (engine *blockingEngine) run(service *Service, revision uint64, actor store.Actor) error {
 	return service.ApplyDesired(context.Background(), revision, actor, "req-1")
+}
+
+func TestBuildSnapshotReadsControlTransportAndTLS(t *testing.T) {
+	engine := &stubEngine{result: core.ApplyResult{Stage: core.StageDrained}}
+	service, _ := newTestService(t, engine, testCredentials())
+	directory := t.TempDir()
+	certificatePath := filepath.Join(directory, "server.crt")
+	privateKeyPath := filepath.Join(directory, "server.key")
+	if err := os.WriteFile(certificatePath, []byte("certificate"), 0o600); err != nil {
+		t.Fatalf("写入测试证书失败：%v", err)
+	}
+	if err := os.WriteFile(privateKeyPath, []byte("private-key"), 0o600); err != nil {
+		t.Fatalf("写入测试私钥失败：%v", err)
+	}
+	content := fmt.Sprintf(`{"schemaVersion":1,"controlListen":{"host":"127.0.0.1","port":7300,"transport":"wss","path":"/control","tlsCertFile":%q,"tlsKeyFile":%q},"proxies":[]}`,
+		certificatePath, privateKeyPath)
+
+	config, err := service.buildSnapshot(context.Background(), content)
+	if err != nil {
+		t.Fatalf("构建 WSS 快照失败：%v", err)
+	}
+	listen := config.Listen()
+	if listen.Transport != core.TransportWSS || listen.Address.Port() != 7300 {
+		t.Fatalf("控制入口不符：%+v", listen)
+	}
+	if listen.TransportConfig.WebSocket.Path != "/control" {
+		t.Fatalf("WebSocket 路径不符：%q", listen.TransportConfig.WebSocket.Path)
+	}
+	if listen.TransportConfig.WebSocket.TLS.CertificatePEM != "certificate" ||
+		listen.TransportConfig.WebSocket.TLS.PrivateKeyPEM != "private-key" {
+		t.Fatalf("TLS 材料不符：证书=%q 私钥=%q",
+			listen.TransportConfig.WebSocket.TLS.CertificatePEM,
+			listen.TransportConfig.WebSocket.TLS.PrivateKeyPEM)
+	}
+}
+
+func TestApplyDesiredRejectsBootstrapIdentityChange(t *testing.T) {
+	engine := &stubEngine{result: core.ApplyResult{Stage: core.StageDrained}}
+	service, database := newTestService(t, engine, testCredentials())
+	firstRevision := latestRevision(t, database)
+	if err := service.ApplyDesired(context.Background(), firstRevision, store.ActorAdmin("admin"), "req-first"); err != nil {
+		t.Fatalf("初次应用失败：%v", err)
+	}
+	secondRevision := appendDesiredContent(t, database,
+		`{"schemaVersion":1,"controlListen":{"host":"127.0.0.1","port":7200,"transport":"websocket","path":"/control"},"proxies":[]}`)
+
+	err := service.ApplyDesired(context.Background(), secondRevision, store.ActorAdmin("admin"), "req-second")
+	if !errors.Is(err, ErrBootstrapIdentityChanged) {
+		t.Fatalf("控制入口身份变化应拒绝热更，实际：%v", err)
+	}
+	if len(engine.revisions) != 1 {
+		t.Fatalf("拒绝引导身份变化时不应再次调用引擎，实际调用 %d 次", len(engine.revisions))
+	}
+	var state store.RevisionState
+	if err := database.View(context.Background(), func(tx *store.Tx) error {
+		var err error
+		state, err = tx.RevisionState(store.ScopeServer)
+		return err
+	}); err != nil {
+		t.Fatalf("读取版本状态失败：%v", err)
+	}
+	if state.ActiveRevision != firstRevision || state.LastGoodRevision != firstRevision {
+		t.Fatalf("拒绝后应保留旧 active：状态=%+v 期望版本=%d", state, firstRevision)
+	}
+}
+
+// TestRecoverAppliesChangedBootstrapIdentity 固定「重启后新控制入口身份必须生效」。
+//
+// 曾经缺陷：恢复路径也做引导身份比较，而它比的是"上次记录的 active"——重启时
+// 引擎已按最新 desired 建立了新监听，于是把重启生效的新身份判成非法变更并拒绝，
+// 入口永远停在旧传输上（desired 从 tcp 改为 websocket 后重启，恢复被拒）。
+func TestRecoverAppliesChangedBootstrapIdentity(t *testing.T) {
+	engine := &stubEngine{result: core.ApplyResult{Stage: core.StageDrained}}
+	service, database := newTestService(t, engine, testCredentials())
+	firstRevision := latestRevision(t, database)
+	if err := service.ApplyDesired(context.Background(), firstRevision, store.ActorAdmin("admin"), "req-first"); err != nil {
+		t.Fatalf("初次应用失败：%v", err)
+	}
+	// 模拟管理员改了控制入口传输并重启：desired 推进到新版本。
+	secondRevision := appendDesiredContent(t, database,
+		`{"schemaVersion":1,"controlListen":{"host":"127.0.0.1","port":7200,"transport":"websocket","path":"/control"},"proxies":[]}`)
+
+	// 热更仍必须拒绝（这是引导参数的既定语义）。
+	if err := service.ApplyDesired(context.Background(), secondRevision, store.ActorAdmin("admin"), "req-second"); !errors.Is(err, ErrBootstrapIdentityChanged) {
+		t.Fatalf("热更路径仍应拒绝身份变化，实际：%v", err)
+	}
+	// 恢复路径必须放行：重启就是为了让新身份生效。
+	outcome := service.RecoverApplier(store.ActorAdmin("server")).Apply(context.Background(), "")
+	for _, phase := range outcome.Phases {
+		if !phase.Succeeded {
+			t.Fatalf("恢复不应因引导身份变化而失败：阶段 %s 详情 %s", phase.Phase, phase.ErrorDetail)
+		}
+	}
+	if len(engine.revisions) != 2 {
+		t.Fatalf("恢复应把新版本交给引擎，实际已应用版本=%v", engine.revisions)
+	}
+}
+
+func TestApplyDesiredProxyChangeKeepsBootstrapHotApply(t *testing.T) {
+	engine := &stubEngine{result: core.ApplyResult{Stage: core.StageDrained}}
+	service, database := newTestService(t, engine, testCredentials())
+	firstRevision := latestRevision(t, database)
+	if err := service.ApplyDesired(context.Background(), firstRevision, store.ActorAdmin("admin"), "req-first"); err != nil {
+		t.Fatalf("初次应用失败：%v", err)
+	}
+	var secondRevision uint64
+	if err := database.Transaction(context.Background(), func(tx *store.Tx) error {
+		var err error
+		secondRevision, err = tx.SaveProxy(store.Proxy{
+			ID: "p2", ClientID: "c1", Name: "web", Type: "tcp",
+			RemotePort: 26080, Target: "127.0.0.1:80",
+		}, store.ActorAdmin("admin"), store.OriginProxyCreate)
+		return err
+	}); err != nil {
+		t.Fatalf("写入第二个代理失败：%v", err)
+	}
+	if err := service.ApplyDesired(context.Background(), secondRevision, store.ActorAdmin("admin"), "req-second"); err != nil {
+		t.Fatalf("代理普通变化应继续热更：%v", err)
+	}
+	if len(engine.revisions) != 2 {
+		t.Fatalf("代理普通变化应调用引擎两次，实际调用 %d 次", len(engine.revisions))
+	}
 }
 
 // 快照转换：合法文档生成包含控制监听与代理绑定的快照，凭证来自 Provider。

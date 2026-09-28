@@ -17,5 +17,6 @@
 | 0011 | [产品版本与 Core module 版本双轨](0011-dual-version-tracks.md) | 已接受 |
 | 0012 | [Core 公共包布局与嵌入契约](0012-core-public-api-layout.md) | 已接受 |
 | 0013 | [以 pnpm + Turbo 编排前端包并保留 Taskfile 编排 Go](0013-pnpm-turbo-orchestration.md) | 已接受 |
+| 0014 | [QUIC 连接迁移在传输包内消化，不放宽类型隔离](0014-quic-connection-migration.md) | 已接受 |
 
 每条 ADR 使用“状态、背景、决策、理由、后果、备选方案”结构。已接受 ADR 的正文不可修改；决策变化时新增 ADR 取代旧决策，旧文件只更新状态与取代链接。编号永久递增，不删除、不复用。

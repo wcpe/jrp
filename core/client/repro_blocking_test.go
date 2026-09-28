@@ -146,7 +146,7 @@ func serveFakeLogin(conn net.Conn) {
 	if _, err := conn.Read(buffer); err != nil {
 		return
 	}
-	response := []byte(`{"ok":true}`)
+	response := []byte(`{"run_id":"test-run"}`)
 	header := make([]byte, 9)
 	header[0] = '1'
 	putUint64(header[1:], uint64(len(response)))

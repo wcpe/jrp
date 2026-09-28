@@ -24,6 +24,9 @@ type Binding struct {
 	OwnerClientID string
 	// Targets 是该代理允许转发到的目标地址集合。
 	Targets []netip.AddrPort
+	// UnrestrictedTargets 表示目标不受服务端约束：官方客户端自行决定转发目标，
+	// 官方协议不把它告知服务端，因此这类代理只按属主与会话归属设防。
+	UnrestrictedTargets bool
 }
 
 // TargetAllowed 判定目标地址是否在允许集合内。
@@ -32,6 +35,11 @@ type Binding struct {
 func (binding *Binding) TargetAllowed(target netip.AddrPort) bool {
 	if !target.IsValid() {
 		return false
+	}
+	// 官方客户端自行决定转发目标、服务端不预知：这类代理的目标不受服务端约束，
+	// 安全边界落在 token 鉴权与会话归属校验上（FR-03 §3.7）。
+	if binding.UnrestrictedTargets {
+		return true
 	}
 	for _, allowed := range binding.Targets {
 		if allowed == target {
@@ -55,6 +63,16 @@ func (view *RegistryView) Publish(registry Registry) {
 	view.mu.Lock()
 	defer view.mu.Unlock()
 	view.registry = registry
+}
+
+// Current 返回注册表的当前完整快照（引用共享，调用方不得修改）。
+//
+// 供增量并入场景读取全表：运行时代理注册（FR-03）在既有快照表上追加条目后
+// 整体发布，保持「整表替换」的原子语义。
+func (view *RegistryView) Current() Registry {
+	view.mu.RLock()
+	defer view.mu.RUnlock()
+	return view.registry
 }
 
 // Binding 返回指定代理的绑定；未注册时返回 nil。

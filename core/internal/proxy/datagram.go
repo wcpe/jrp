@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"net/netip"
 	"time"
 
 	"github.com/wcpe/jrp/core/internal/wire"
@@ -57,4 +58,41 @@ func writeDatagramFrame(target net.Conn, frame []byte) error {
 		return errors.New("数据报帧写入不完整")
 	}
 	return nil
+}
+
+// officialUDPPacket 是官方 frpc 的 UDP 消息形状；地址字段只用于保留对端身份，
+// 目标地址仍由客户端自身配置决定。
+type officialUDPPacket struct {
+	Content    []byte       `json:"c,omitempty"`
+	LocalAddr  *net.UDPAddr `json:"l,omitempty"`
+	RemoteAddr *net.UDPAddr `json:"r,omitempty"`
+}
+
+// encodeOfficialDatagram 编码官方 frpc 可识别的 udp-packet 消息。
+func encodeOfficialDatagram(datagram []byte, peer netip.AddrPort, version wire.Version) ([]byte, error) {
+	body, err := json.Marshal(officialUDPPacket{
+		Content:    datagram,
+		RemoteAddr: &net.UDPAddr{IP: peer.Addr().AsSlice(), Port: int(peer.Port())},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if version == wire.VersionV2 {
+		return wire.EncodeV2MessageFrame(wire.MessageTypeUDPPacket, body)
+	}
+	return wire.EncodeV1FrameWithLimit(
+		wire.Frame{Type: wire.MessageTypeUDPPacket, Payload: body}, udpDatagramFrameLimit)
+}
+
+// decodeOfficialDatagram 解码官方 frpc 的 udp-packet 消息。
+func decodeOfficialDatagram(payload []byte) ([]byte, netip.AddrPort, bool) {
+	var packet officialUDPPacket
+	if err := json.Unmarshal(payload, &packet); err != nil || packet.RemoteAddr == nil {
+		return nil, netip.AddrPort{}, false
+	}
+	addr, err := netip.ParseAddrPort(packet.RemoteAddr.String())
+	if err != nil {
+		return nil, netip.AddrPort{}, false
+	}
+	return packet.Content, addr, true
 }

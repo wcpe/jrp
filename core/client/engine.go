@@ -212,23 +212,56 @@ func (engine *Engine) Start(ctx context.Context) error {
 //
 // 超时来自配置快照：拨号必须带超时，禁止无超时拨号（规格 §3.4）。
 func (engine *Engine) dialControl(ctx context.Context, endpoint core.ServerEndpoint) (*controlSession, error) {
-	conn, err := engine.dial(ctx, endpoint.Address.String(), transport.PurposeControl)
+	conn, err := engine.dial(ctx, endpoint, transport.PurposeControl)
 	if err != nil {
 		return nil, fmt.Errorf("客户端拨号失败：%w", err)
 	}
 	return &controlSession{conn: conn, done: make(chan struct{})}, nil
 }
 
-// dial 拨号一条带用途标记的工作连接。
+// dial 按端点传输选择拨号适配器，并返回带用途标记的工作连接。
 //
-// 超时来自配置快照，由传输层强制门禁：禁止无超时拨号（规格 §3.4）。
+// TCP 继续复用原有带超时拨号器；其余传输由 internal/transport 适配器负责。
 func (engine *Engine) dial(
 	ctx context.Context,
-	address string,
+	endpoint core.ServerEndpoint,
 	purpose transport.Purpose,
 	proxy ...string,
 ) (*transport.Conn, error) {
-	return engine.dialer.Dial(ctx, address, purpose, proxy...)
+	address := endpoint.Address.String()
+	switch endpoint.Transport {
+	case core.TransportTCP:
+		return engine.dialer.Dial(ctx, address, purpose, proxy...)
+	case core.TransportWebSocket, core.TransportWSS:
+		options, err := transport.WebSocketOptionsFromConfig(
+			endpoint.TransportConfig.WebSocket, endpoint.Transport == core.TransportWSS,
+		)
+		if err != nil {
+			return nil, err
+		}
+		return transport.DialWebSocket(ctx, address, options, purpose, firstProxy(proxy))
+	case core.TransportKCP:
+		options, err := transport.KCPOptionsFromConfig(endpoint.TransportConfig.KCP)
+		if err != nil {
+			return nil, err
+		}
+		return transport.DialKCP(ctx, address, options, purpose, firstProxy(proxy))
+	case core.TransportQUIC:
+		options, err := transport.QUICOptionsFromConfig(endpoint.TransportConfig.QUIC, false)
+		if err != nil {
+			return nil, err
+		}
+		return transport.DialQUIC(ctx, address, options, purpose, firstProxy(proxy))
+	default:
+		return nil, fmt.Errorf("不支持的客户端传输：%s", endpoint.Transport)
+	}
+}
+
+func firstProxy(proxy []string) string {
+	if len(proxy) == 0 {
+		return ""
+	}
+	return proxy[0]
 }
 
 // claimStartSlot 校验配置并原子认领启动位，返回服务端端点。
@@ -274,6 +307,8 @@ func (engine *Engine) commitRunning(control *controlSession, gen *generation) {
 // 它们归 Engine 而不是某一代：控制会话跨代存活，换代不重拨控制连接。
 func (engine *Engine) startControl(control *controlSession) {
 	engine.controlWG.Add(2)
+	// 迁移观测挂在控制会话上：控制连接跨代存活，换代不重拨，因此只需注册一次。
+	control.conn.SetMigrationObserver(engine.observeMigration)
 	go engine.serveControl(control)
 	go engine.heartbeatLoop(control)
 }
@@ -416,11 +451,20 @@ func (engine *Engine) log() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// track 登记本代的一条活动连接。
-func (gen *generation) track(conn *transport.Conn) {
+// trackIfActive 在本代尚未停止时登记连接，返回是否登记成功。
+//
+// 与 stop() 的清扫必须互斥：stop 先在锁内置位停止标记，随后关闭本代全部待命连接；
+// 若调用方先复查停止、再登记，两步之间的窗口会让连接在本代清扫之后才进表，成为
+// 无人清理的待命桥接——它挂着桥接 goroutine，使换代排空只能等满上限。返回 false
+// 时调用方必须立即关闭该连接。
+func (gen *generation) trackIfActive(conn *transport.Conn) bool {
 	gen.engine.mu.Lock()
 	defer gen.engine.mu.Unlock()
+	if gen.stopping {
+		return false
+	}
 	gen.conns[conn] = struct{}{}
+	return true
 }
 
 // untrack 移除本代的一条活动连接。
@@ -614,16 +658,26 @@ func (gen *generation) trackedConns() []*transport.Conn {
 	return conns
 }
 
-// clientLogin 是 wire v1 登录载荷的最小形态。
+// clientLogin 是登录载荷。
+//
+// 字段名与官方兼容消息族一致（FR-03 §3.3：官方 frpc 与 jrpc 共用同一条协议
+// 路径）：client_id、privilege_key、timestamp（Unix 秒）、run_id、version。
 type clientLogin struct {
-	ClientID string `json:"clientID"`
-	Token    string `json:"token"`
+	ClientID  string `json:"client_id"`
+	Token     string `json:"privilege_key"`
+	Timestamp int64  `json:"timestamp"`
+	RunID     string `json:"run_id,omitempty"`
+	Version   string `json:"version,omitempty"`
 }
 
-// loginResponse 是登录响应载荷的最小形态。
+// loginResponse 是登录响应载荷的客户端视图。
+//
+// 官方形状为 {version, run_id, error}：error 为空即成功，run_id 是本会话的
+// 运行 ID，工作连接声明要回传它。
 type loginResponse struct {
-	OK    bool   `json:"ok"`
-	Error string `json:"error,omitempty"`
+	Version string `json:"version,omitempty"`
+	RunID   string `json:"run_id,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 // controlSession 封装一条控制连接的读写状态。
@@ -635,6 +689,21 @@ type controlSession struct {
 	done chan struct{}
 
 	mu sync.Mutex
+	// runID 是本会话的运行 ID：登录成功后由服务端分配，工作连接声明需回传它。
+	runID string
+}
+
+// observeMigration 把传输层的对端地址迁移转成 Core 事件（规格 §3.6）。
+//
+// 只观测不决策：对端身份由登录时的会话层鉴权决定，地址变化不改变身份。
+func (engine *Engine) observeMigration(migration transport.Migration) {
+	engine.events.Publish(core.PeerMigrated{
+		Purpose:   migration.Purpose.String(),
+		Proxy:     migration.Proxy,
+		Previous:  migration.Previous,
+		Current:   migration.Current,
+		EventMeta: core.NewEventMeta(),
+	})
 }
 
 // loginControl 在控制连接上完成登录握手。
@@ -647,7 +716,11 @@ func loginControl(ctx context.Context, control *controlSession, config core.Clie
 
 // writeLogin 编码并发送登录帧。
 func (control *controlSession) writeLogin(config core.ClientConfig) error {
-	body, err := json.Marshal(clientLogin{ClientID: config.ClientID(), Token: config.Auth().Token})
+	body, err := json.Marshal(clientLogin{
+		ClientID:  config.ClientID(),
+		Token:     config.Auth().Token,
+		Timestamp: time.Now().Unix(),
+	})
 	if err != nil {
 		return err
 	}
@@ -690,9 +763,13 @@ func (control *controlSession) readLoginResponse(timeout time.Duration) error {
 	if err := json.Unmarshal(frame.Payload, &response); err != nil {
 		return fmt.Errorf("登录响应载荷非法：%w", err)
 	}
-	if !response.OK {
+	if response.Error != "" {
 		return errors.New("服务端拒绝客户端登录")
 	}
+	if response.RunID == "" {
+		return errors.New("登录响应缺少运行 ID")
+	}
+	control.runID = response.RunID
 	return nil
 }
 
@@ -849,8 +926,8 @@ func (engine *Engine) maintainOneProxy(gen *generation, proxy core.ClientProxy) 
 // 声明载荷携带本地目标地址：服务端据此判定目标是否在该客户端被允许的地址
 // 集合内，越权即拒绝（FR-06a §3.3）。
 func (engine *Engine) serveOneWorkConn(gen *generation, proxy core.ClientProxy) {
-	work, err := gen.dialer.Dial(
-		context.Background(), gen.config.ServerEndpoint().Address.String(), transport.PurposeWork, proxy.ProxyName())
+	work, err := engine.dial(
+		context.Background(), gen.config.ServerEndpoint(), transport.PurposeWork, proxy.ProxyName())
 	if err != nil {
 		select {
 		case <-gen.stopCh:
@@ -858,22 +935,20 @@ func (engine *Engine) serveOneWorkConn(gen *generation, proxy core.ClientProxy) 
 		}
 		return
 	}
-	// 停止复查：拨号期间本代可能已被停（drain/Shutdown）。此时连接尚未登记，
-	// closeStandby 的清理覆盖不到它，直接关闭并返回，否则它会作为"漏网待命"
-	// 桥接挂进旧代等待组，让 drain 永远等不满。
-	select {
-	case <-gen.stopCh:
-		_ = work.Close()
-		return
-	default:
-	}
 	auth := gen.config.Auth()
 	if err := declareWorkConn(work, gen.config.ClientID(), auth.Token, proxy.ProxyName(), proxy.ProxyLocalAddr()); err != nil {
 		_ = work.Close()
 		return
 	}
+	// 登记与停止必须原子：只在拨号后复查一次停止标记不够——复查与登记之间要写
+	// 网络（声明），落在窗口里的连接会在本代清扫之后才进表，成为无人清理的待命
+	// 桥接，挂着桥接 goroutine 让 drain 只能等满上限（重载实测 200 次命中 24 次）。
+	// trackIfActive 在同一把锁内判定停止状态，停止后一律拒绝登记并立即关闭连接。
+	if !gen.trackIfActive(work) {
+		_ = work.Close()
+		return
+	}
 	// 声明已发送：服务端暂存该连接等待访客，本端拨号本地目标后进入转发。
-	gen.track(work)
 	engine.serveWorkConn(gen, work, proxy)
 	gen.untrack(work)
 	_ = work.Close()

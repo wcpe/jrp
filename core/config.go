@@ -5,6 +5,93 @@ import (
 	"time"
 )
 
+// TLSConfig 是 WSS 与 QUIC 共用的 TLS 配置表达。
+//
+// PEM 字段由宿主提供，Core 不读取证书文件。客户端默认执行系统信任链校验；
+// 指纹固定只作为额外约束，不会自动关闭证书校验。
+type TLSConfig struct {
+	// ServerName 是客户端校验证书时使用的名称。
+	ServerName string
+	// RootCAPEM 是额外信任根证书的 PEM 内容。
+	RootCAPEM string
+	// CertificatePEM 是服务端证书链的 PEM 内容。
+	CertificatePEM string
+	// PrivateKeyPEM 是服务端私钥的 PEM 内容。
+	PrivateKeyPEM string
+	// FingerprintSHA256 是可选的证书 SHA-256 指纹十六进制值。
+	FingerprintSHA256 string
+}
+
+// WebSocketConfig 是 WebSocket 与 WSS 的连接参数。
+type WebSocketConfig struct {
+	// Path 是 HTTP 升级路径，默认值为 /frp。
+	Path string
+	// Header 是握手时附加的单个路由提示头，格式为名称和值以冒号分隔；不得放入凭证或正文。
+	Header string
+	// MaxPayloadBytes 是单个 WebSocket 消息的最大字节数，零值使用 Core 默认值。
+	MaxPayloadBytes int
+	// TLS 是 WSS 使用的 TLS 配置；WebSocket 明文传输忽略该字段。
+	TLS TLSConfig
+}
+
+// KCPConfig 是 KCP 传输参数。
+type KCPConfig struct {
+	// MTU 是 KCP 最大传输单元，零值使用实现默认值。
+	MTU int
+	// SendWindow 是发送窗口大小，零值使用实现默认值。
+	SendWindow int
+	// ReceiveWindow 是接收窗口大小，零值使用实现默认值。
+	ReceiveWindow int
+	// DataShards 是 FEC 数据分片数，零值表示关闭 FEC。
+	DataShards int
+	// ParityShards 是 FEC 冗余分片数，零值表示关闭 FEC。
+	ParityShards int
+	// NoDelay 表示是否启用低延迟模式。
+	NoDelay bool
+	// Interval 是 KCP 刷新间隔，零值使用实现默认值。
+	Interval time.Duration
+	// Resend 是快速重传阈值，零值使用实现默认值。
+	Resend int
+	// NoCongestion 表示是否关闭拥塞控制。
+	NoCongestion bool
+	// Key 是可选的 KCP AES 密钥；为空表示不启用数据包加密。
+	Key string
+}
+
+// QUICConfig 是 QUIC 流传输参数。
+type QUICConfig struct {
+	// TLS 是 QUIC 内建 TLS 的配置。
+	TLS TLSConfig
+	// ALPN 是可选的应用协议标识。
+	ALPN string
+	// HandshakeTimeout 是握手空闲超时，零值使用实现默认值。
+	HandshakeTimeout time.Duration
+	// MaxIdleTimeout 是握手完成后的最大空闲超时，零值使用实现默认值。
+	MaxIdleTimeout time.Duration
+	// KeepAlivePeriod 是保活周期，零值表示关闭保活。
+	KeepAlivePeriod time.Duration
+	// InitialStreamReceiveWindow 是流初始接收窗口，零值使用实现默认值。
+	InitialStreamReceiveWindow uint64
+	// MaxStreamReceiveWindow 是流最大接收窗口，零值使用实现默认值。
+	MaxStreamReceiveWindow uint64
+	// InitialConnectionReceiveWindow 是连接初始接收窗口，零值使用实现默认值。
+	InitialConnectionReceiveWindow uint64
+	// MaxConnectionReceiveWindow 是连接最大接收窗口，零值使用实现默认值。
+	MaxConnectionReceiveWindow uint64
+	// MaxIncomingStreams 是允许对端打开的双向流数量，零值使用实现默认值。
+	MaxIncomingStreams int64
+}
+
+// TransportConfig 是所有连接传输的 Core 自有配置表达。
+type TransportConfig struct {
+	// WebSocket 是 WebSocket 与 WSS 共用的配置。
+	WebSocket WebSocketConfig
+	// KCP 是 KCP 传输配置。
+	KCP KCPConfig
+	// QUIC 是 QUIC 传输配置。
+	QUIC QUICConfig
+}
+
 // ServerEndpoint 是客户端连接服务端所用的端点。
 type ServerEndpoint struct {
 	// Address 是服务端控制连接地址，必须是带明确主机与端口的地址。
@@ -13,6 +100,8 @@ type ServerEndpoint struct {
 	Transport Transport
 	// Wire 是控制连接使用的 wire 版本。
 	Wire WireVersion
+	// TransportConfig 是该端点的传输参数。
+	TransportConfig TransportConfig
 }
 
 // TokenAuth 是客户端的鉴权材料。
@@ -139,8 +228,14 @@ func (proxy HTTPSProxy) ProxyRemotePort() int { return proxy.RemotePort }
 type ClientCredential struct {
 	// ClientID 是客户端标识。
 	ClientID string
-	// Token 是该客户端的 token 明文；错误、日志与状态快照必须脱敏。
+	// Token 是该客户端 token 的 SHA-256 摘要（十六进制）。快照持有摘要而不是
+	// 明文：错误、日志与状态快照一律脱敏，明文只在宿主存储与客户端配置中存在。
 	Token string
+	// CompatToken 是该客户端 token 的明文，专供官方 frpc 的鉴权材料校验使用：
+	// 官方客户端只发送 `md5(token + 时间戳)` 的摘要前处理材料，服务端必须持有
+	// 明文才能复算比对（FR-03 规格登记的兼容例外）。为空表示该客户端只接受
+	// 摘要语义登录（纯 jrpc 场景）。
+	CompatToken string
 }
 
 // BindEndpoint 是服务端的监听端点。
@@ -149,6 +244,8 @@ type BindEndpoint struct {
 	Address netip.AddrPort
 	// Transport 是监听使用的传输方式。
 	Transport Transport
+	// TransportConfig 是该监听端点的传输参数。
+	TransportConfig TransportConfig
 }
 
 // TCPProxyBinding 是服务端为某个客户端声明的 TCP 代理绑定。
@@ -364,7 +461,7 @@ func (config ClientConfig) ClientID() string {
 
 // ServerEndpoint 返回服务端端点副本。
 func (config ClientConfig) ServerEndpoint() ServerEndpoint {
-	return config.endpoint
+	return cloneServerEndpoint(config.endpoint)
 }
 
 // Auth 返回鉴权材料副本。
@@ -452,7 +549,7 @@ func (config ClientConfig) IdleWorkConnLimit() int {
 
 // Listen 返回监听端点副本。
 func (config ServerConfig) Listen() BindEndpoint {
-	return config.listen
+	return cloneBindEndpoint(config.listen)
 }
 
 // Wire 返回 wire 版本。

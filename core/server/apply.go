@@ -203,7 +203,14 @@ func (engine *Engine) prepareGeneration(
 ) error {
 	// 配对中心随快照换代：指针原子替换，读取方经 activeBroker 无锁取引用，
 	// 旧 broker 由在途调用安全地用到结束。
-	engine.workConns.Store(newWorkBroker(deployment.Config.IdleWorkConnLimit()))
+	//
+	// 旧中心里的待命工作连接必须关闭而不是只丢引用：它们不再被任何一代引用，
+	// 留着会让客户端的维持循环误以为仍有待命连接而不补建，新访客会一直暂存
+	// 到失活超时。访客不在此列——等待配对的访客属于当前状态，换代不应掐断。
+	newBroker := newWorkBroker(deployment.Config.IdleWorkConnLimit())
+	if oldBroker := engine.workConns.Swap(newBroker); oldBroker != nil {
+		oldBroker.closeStagedWorks()
+	}
 
 	if err := engine.openGuestEntries(gen, deployment.Config, previous); err != nil {
 		return err

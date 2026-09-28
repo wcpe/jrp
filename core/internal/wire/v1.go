@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 )
 
@@ -50,7 +51,10 @@ func DecodeV1Frame(raw []byte, limit int) (Frame, error) {
 	}
 	messageType, ok := MessageTypeByV1Byte(raw[0])
 	if !ok {
-		return Frame{}, protocolError(CategoryTypeInvalid, StageMessage, "消息类型字节未登记")
+		// 带上收到的字节值：它是协议诊断信息（不是对端载荷），
+		// 缺了它只能靠抓包定位"哪个字节未登记"。
+		return Frame{}, protocolError(CategoryTypeInvalid, StageMessage,
+			fmt.Sprintf("消息类型字节未登记：%#02x", raw[0]))
 	}
 
 	declared := int64(binary.BigEndian.Uint64(raw[1:V1HeaderSize]))
@@ -101,7 +105,8 @@ func (reader *V1Reader) ReadFrame() (Frame, error) {
 	}
 	messageType, ok := MessageTypeByV1Byte(reader.buffer[0])
 	if !ok {
-		return Frame{}, protocolError(CategoryTypeInvalid, StageMessage, "消息类型字节未登记")
+		return Frame{}, protocolError(CategoryTypeInvalid, StageMessage,
+			fmt.Sprintf("消息类型字节未登记：%#02x", reader.buffer[0]))
 	}
 
 	declared := int64(binary.BigEndian.Uint64(reader.buffer[1:V1HeaderSize]))

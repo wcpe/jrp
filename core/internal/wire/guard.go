@@ -1,6 +1,8 @@
 package wire
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -61,6 +63,11 @@ type ConnectionGuard struct {
 	reader  *PeekReader
 	v1      *V1Reader
 	v2      *V2Reader
+
+	// v2ClientHello 与 v2ServerHello 是 v2 协商记录的两段原始载荷：
+	// 控制通道密钥由它们共同派生，任一段被篡改都会导致首帧认证失败。
+	v2ClientHello []byte
+	v2ServerHello []byte
 }
 
 // NewConnectionGuard 建立连接守卫。
@@ -195,6 +202,8 @@ func (guard *ConnectionGuard) Negotiate() (NegotiationResult, error) {
 	}
 
 	request, frameErr := guard.decodeClientHello(helloFrame)
+	// 协商记录要参与密钥派生，必须在归还缓冲前留下副本。
+	guard.v2ClientHello = append([]byte(nil), helloFrame.Message.Payload...)
 	helloFrame.Release()
 	if frameErr != nil {
 		return NegotiationResult{}, guard.fail(frameErr)
@@ -307,4 +316,126 @@ func stageOr(err error, fallback Stage) Stage {
 		return stage
 	}
 	return fallback
+}
+
+// EnableV1Cipher 在 v1 连接上把消息读取切换到加密通道。
+//
+// 切换前提是登录握手已经完成（登录消息与其响应都是明文）；调用后读取器先消费
+// 对端的 16 字节 IV，再解密其后的所有消息。写侧由宿主在写出目标上套同一算法的
+// 加密写入器——两个方向的 IV 各自独立，不存在先后依赖。
+func (guard *ConnectionGuard) EnableV1Cipher(key []byte) error {
+	if err := guard.requireVersion(VersionV1); err != nil {
+		return err
+	}
+	guard.mu.Lock()
+	stream := guard.reader
+	guard.mu.Unlock()
+	if stream == nil {
+		return protocolError(CategoryTransportFailure, StageMessage, "v1 读取流尚未绑定，无法切换加密通道")
+	}
+	reader := NewV1Reader(NewV1CipherReader(stream, key), DefaultV1PayloadLimit)
+	reader.SetPool(guard.pool)
+	guard.bindReader(reader)
+	return nil
+}
+
+// RecordV2ServerHello 记录服务端 hello 的原始载荷，供协商记录派生使用。
+func (guard *ConnectionGuard) RecordV2ServerHello(payload []byte) {
+	guard.mu.Lock()
+	defer guard.mu.Unlock()
+	guard.v2ServerHello = append([]byte(nil), payload...)
+}
+
+// V2Transcript 返回协商记录哈希；两段载荷都已记录时才可用。
+func (guard *ConnectionGuard) V2Transcript() ([]byte, bool) {
+	guard.mu.Lock()
+	clientHello := guard.v2ClientHello
+	serverHello := guard.v2ServerHello
+	guard.mu.Unlock()
+	if len(clientHello) == 0 || len(serverHello) == 0 {
+		return nil, false
+	}
+	return V2CryptoTranscript(clientHello, serverHello), true
+}
+
+// V2HelloDigests 返回两段协商载荷各自的 SHA-256 摘要（诊断用）。
+//
+// 协商记录不一致时，用它区分是客户端 hello 还是服务端 hello 的内容在传递中
+// 被改写——直接对比最终哈希无法定位到具体一段。
+func (guard *ConnectionGuard) V2HelloDigests() (client, server [32]byte, ok bool) {
+	guard.mu.Lock()
+	defer guard.mu.Unlock()
+	if len(guard.v2ClientHello) == 0 || len(guard.v2ServerHello) == 0 {
+		return client, server, false
+	}
+	return sha256.Sum256(guard.v2ClientHello), sha256.Sum256(guard.v2ServerHello), true
+}
+
+// PeekV2FirstFrameType 窥视 v2 连接的首帧类型，不消费任何字节。
+//
+// v2 下两种连接的起始形状不同：控制连接以 client hello 帧开头并进入协商与加密，
+// 而客户端建立的工作连接只发魔数后直接发消息帧，既不协商也不加密。宿主据此分流，
+// 窥视后流位置不变，控制连接仍可按原路径读取 hello。
+func (guard *ConnectionGuard) PeekV2FirstFrameType() (uint16, error) {
+	guard.mu.Lock()
+	peeker := guard.reader
+	guard.mu.Unlock()
+	if peeker == nil {
+		return 0, protocolError(CategoryTransportFailure, StageDetect, "v2 预读流尚未绑定")
+	}
+	header, err := peeker.Peek(V2HeaderSize)
+	if err != nil {
+		return 0, protocolError(CategoryPayloadTruncated, StageDetect, "v2 首帧帧头不可读")
+	}
+	return binary.BigEndian.Uint16(header[0:2]), nil
+}
+
+// BindV2PlainReader 在未协商的 v2 连接上绑定明文消息读取器。
+//
+// 客户端建立的工作连接只发版本魔数后直接发消息帧：它既不参与 hello 协商，
+// 也不启用 AEAD，因此协商路径建立的读取器对它不存在。宿主在判定连接种类后
+// 调用本方法为该连接绑定明文读取器，其后的读取与 v1 的明文语义一致。
+func (guard *ConnectionGuard) BindV2PlainReader() error {
+	if err := guard.requireVersion(VersionV2); err != nil {
+		return err
+	}
+	guard.mu.Lock()
+	stream := guard.reader
+	guard.mu.Unlock()
+	if stream == nil {
+		return protocolError(CategoryTransportFailure, StageMessage, "v2 预读流尚未绑定")
+	}
+	reader := NewV2Reader(stream, DefaultV2PayloadLimit)
+	reader.SetPool(guard.pool)
+	guard.mu.Lock()
+	guard.v2 = reader
+	guard.mu.Unlock()
+	return nil
+}
+
+// EnableV2Cipher 在 v2 连接上把消息读取切换到分帧 AEAD 通道。
+//
+// 切换前提是登录握手已完成（登录消息与其响应在 v2 下同样是明文）；调用后读取器
+// 先消费对端的明文流随机数，再逐帧认证解密。写侧的加密由宿主在写出目标上套同一
+// 算法的分帧写入器，两个方向使用各自派生的密钥。
+func (guard *ConnectionGuard) EnableV2Cipher(key []byte) error {
+	if err := guard.requireVersion(VersionV2); err != nil {
+		return err
+	}
+	guard.mu.Lock()
+	stream := guard.reader
+	guard.mu.Unlock()
+	if stream == nil {
+		return protocolError(CategoryTransportFailure, StageMessage, "v2 读取流尚未绑定，无法切换加密通道")
+	}
+	encrypted, err := NewV2AEADReader(stream, key)
+	if err != nil {
+		return err
+	}
+	reader := NewV2Reader(encrypted, DefaultV2PayloadLimit)
+	reader.SetPool(guard.pool)
+	guard.mu.Lock()
+	guard.v2 = reader
+	guard.mu.Unlock()
+	return nil
 }

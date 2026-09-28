@@ -9,8 +9,8 @@
   "scripts": {
     "build": "turbo run build",
     "dev:web": "turbo run dev --filter @jrp/web",
-    "format": "prettier --write package.json turbo.json pnpm-workspace.yaml Taskfile.yml .github/workflows/ci.yml \"scripts/*.mjs\" \"apps/web/**/*.{html,ts,tsx,css,json}\" \"packages/**/*.{js,ts,tsx,json}\" \"!apps/web/public/**\"",
-    "format:check": "prettier --check package.json turbo.json pnpm-workspace.yaml Taskfile.yml .github/workflows/ci.yml \"scripts/*.mjs\" \"apps/web/**/*.{html,ts,tsx,css,json}\" \"packages/**/*.{js,ts,tsx,json}\" \"!apps/web/public/**\"",
+    "format": "prettier --write package.json turbo.json pnpm-workspace.yaml Taskfile.yml .github/workflows/ci.yml \"scripts/**/*.mjs\" \"apps/web/**/*.{html,ts,tsx,css,json}\" \"packages/**/*.{js,ts,tsx,json}\" \"!apps/web/public/**\"",
+    "format:check": "prettier --check package.json turbo.json pnpm-workspace.yaml Taskfile.yml .github/workflows/ci.yml \"scripts/**/*.mjs\" \"apps/web/**/*.{html,ts,tsx,css,json}\" \"packages/**/*.{js,ts,tsx,json}\" \"!apps/web/public/**\"",
     "lint": "turbo run lint",
     "test": "turbo run test",
     "typecheck": "turbo run typecheck"

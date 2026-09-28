@@ -239,7 +239,7 @@ func TestNewServerConfigValidationErrors(t *testing.T) {
 	emptyTransport := validListenEndpoint()
 	emptyTransport.Transport = ""
 	unsupportedTransport := validListenEndpoint()
-	unsupportedTransport.Transport = "quic"
+	unsupportedTransport.Transport = "unsupported"
 	unknownClientBinding := validBinding("ssh", "client-b", 6000)
 	longNameBinding := validBinding(strings.Repeat("a", core.MaxProxyNameLength+1), testCredentialName, 6000)
 	emptyNameBinding := validBinding("", testCredentialName, 6000)

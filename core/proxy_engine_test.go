@@ -98,7 +98,7 @@ func fr06aServerConfigWithHTTPTarget(
 	config, err := core.NewServerConfig(
 		core.WithListen(core.BindEndpoint{Address: control, Transport: core.TransportTCP}),
 		core.WithWire(core.WireV1),
-		core.WithClientCredential(core.ClientCredential{ClientID: fr06aClientID, Token: fr06aClientToken}),
+		core.WithClientCredential(core.ClientCredential{ClientID: fr06aClientID, Token: server.DigestToken(fr06aClientToken)}),
 		core.WithTCPProxyBinding(core.TCPProxyBinding{
 			Name: "tcp-echo", ClientID: fr06aClientID, RemotePort: ports[0],
 			AllowedTargets: []netip.AddrPort{tcpTarget},
@@ -550,7 +550,7 @@ func TestFR06aTargetOutsideAllowedSetIsRejected(t *testing.T) {
 	serverConfig, err := core.NewServerConfig(
 		core.WithListen(core.BindEndpoint{Address: control, Transport: core.TransportTCP}),
 		core.WithWire(core.WireV1),
-		core.WithClientCredential(core.ClientCredential{ClientID: fr06aClientID, Token: fr06aClientToken}),
+		core.WithClientCredential(core.ClientCredential{ClientID: fr06aClientID, Token: server.DigestToken(fr06aClientToken)}),
 		core.WithTCPProxyBinding(core.TCPProxyBinding{
 			Name:           "tcp-echo",
 			ClientID:       fr06aClientID,

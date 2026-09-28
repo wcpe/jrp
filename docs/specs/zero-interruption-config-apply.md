@@ -119,7 +119,7 @@ drain（旧资源不再接新流量，已有流跑到自然结束或排空上限
 - [x] 实现 publish 后异常不回切的约束与告警审计路径。（Core Apply，FR-26；drain 未完成在结果里标记 `DrainIncomplete`）
 - [x] 实现并发互斥、等待队列、409 冲突与幂等键。（P1 取"进行中直接 409"分支，不实现等待队列；幂等键暂以进程内受理记录 + Core 同 revision 幂等兜底，持久化幂等键随 FR-11 Web 管理台再评估）
 - [x] 实现 restore：以历史内容创建新 desired revision 并复用同一状态机。（store `RestoreRevision` 已有；jrps 侧 `:restore` 端点已接线，应用路径与普通 desired 一致）
-- [x] 明确引导参数重启清单，并禁止任何以重启冒充热更的路径。（重启清单登记于 OPERATIONS；控制监听端口是 desired 的一部分，属可热更项）
+- [x] 明确引导参数重启清单，并禁止任何以重启冒充热更的路径。（重启清单登记于 OPERATIONS；控制入口的地址、端口、传输方式与 TLS 材料属引导身份，变更需重启——此前该字段会被应用流程静默忽略，现改为显式拒绝并保留旧 active，见 OPERATIONS §1.4）
 - [ ] 在 jrpc 侧接入同一阶段编排并回报 apply result。**随 FR-08 交付**（依赖 desired state 下发通道与 `/agent/v1/apply-results` 回执端点）。
 - [x] 运行 jrps、jrpc 测试、竞态检测与构建；同步 PRD、ARCHITECTURE、API、OPERATIONS、SECURITY、CHANGELOG 中受影响内容。（jrpc 侧无行为变化，其测试与构建随本批 CI 覆盖）
 - [ ] 实机验收（分批）：管理 API 触发应用与 restore 的完整链路、长连接跨应用不中断。**随 FR-11 交付**——Web 管理台的代理编辑是"改配置→应用"的常规写入端，交付前 desired 版本只能由测试与后续 FR 写入，实机条款不具备触发条件。
@@ -143,6 +143,10 @@ drain（旧资源不再接新流量，已有流跑到自然结束或排空上限
 
 - **已定（jrps 批次）**：凭证与数据面的边界——jrps 只存 token 摘要（FR-07），Core 的 wire v1 登录按明文比对（FR-25 最小实现），两者之间暂无可用桥。jrps 装配的快照使用由客户端标识派生的占位凭证集合（仅保留归属关系与通过构建器校验），真实数据面鉴权随 FR-03 兼容登录链交付，届时按 `apply.CredentialProvider` 接口位替换实现，编排层不变。此前提下本批交付的应用编排、状态推进、审计与查询语义均完整可用。
 - **风险**：drain 上限设置过短会切断正常长业务流，过长会长期占用资源。缓解方式是默认上限在此规格交付前定稿，管理员可在 Web 查看当前排空状态，超限释放必须留审计记录。
+- **已定位并修复其一（客户端待命连接漏入旧代等待组）**：现象是客户端换代偶发把 `Apply` 从毫秒级拖到 `drainTimeout` 上限（默认 10s）并返回 `DrainIncomplete: true`。**根因证据**：在并发重载下循环事件订阅用例 200 次，出现 24 次排空超 1 秒，用 goroutine 栈转储（`generation.waitDrained` 处埋点，临时注入、已还原）抓到被等待的对象——`startGeneration` 计入代等待组的是维持循环 goroutine，而它此时**停在 `transport.Bridge` 的 `select` 上**（栈：`maintainWorkConns → maintainOneProxy → serveOneWorkConn → serveWorkConn → transport.Bridge`），即等待的是**仍存活的工作连接桥接**，不是内部空转的循环。同一批转储里服务端侧没有任何排空或等待中的 goroutine（控制循环与访客服务都停在 IO wait），所以停滞不是两端互等。
+  - **可修的那部分**：客户端 `serveOneWorkConn` 原先「拨号后复查停止标记 → 写网络声明 → 登记」三步之间没有互斥，落在这个窗口里的连接会在本代清扫之后才进表，成为无人清理的待命桥接，把等待组永久挂住。改为 **`trackIfActive`：在同一把锁内判定停止状态并登记**，停止后一律拒绝登记并立即关闭连接；回归用例 `TestGenerationTrackRefusedAfterStop`（含变异验证）+ 重载对照（修复前 200 次命中 24 次 → 修复后 0 次），整轮耗时从 150–250s 降到 13s。等待「活着的桥接」本身是正确语义（TCP/UDP 代理下一条工作连接就是一条用户连接），不在本次改动范围内。
+  - **仍未处置**：对端不主动收尾时的收敛（①对端在切换时结束旧代工作连接读侧／②排空与 `Apply` 解耦／③工作连接池跨代共享）三条建议保留待定，涉及 Core 客户端代生命周期与 FR-26 中已回滚的池重设计。
+- **已定位并修复其二（换代重建配对中心丢弃待命连接）**：现象是服务端应用一个等价的新 revision 后，新访客在配对中心一直暂存到失活超时（`-race` 下 12–13/15 必现，`origin/main` 0/15——main 只是被时序掩盖）。**机制**：`prepareGeneration` 每次换代都用 `workConns.Store` 原子替换配对中心，旧中心里的待命工作连接只丢引用、不关闭；客户端的维持循环因此误以为仍有待命连接而不再补建，新访客无人可配。**修复**：换代时用 `Swap` 取出旧中心并调用新增的 `closeStagedWorks` 关闭其中的待命连接（访客不在此列——等待配对的访客属于当前状态，换代不应掐断），客户端随即补建。回归用例 `TestApplyKeepsStagedWorkConnUsable`（含变异验证）+ jrps 集成用例 `-race` 15/15 通过（修复前 12–13/15）。
 - **风险**：health-check 无法覆盖所有运行期故障，例如依赖在 publish 后才不可达。该类故障归入 publish 后异常，只告警不回切，可能导致短时降级。
 - **风险**：端口冲突型 health-check 失败在并发应用时可能与其他进程竞争，需要确保释放顺序与重试提示明确。
 - **待定**：STCP 与 XTCP 等代理类型在 drain 阶段的自然结束判定标准需结合 FR-06b 的实现结果细化。

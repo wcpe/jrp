@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/wcpe/jrp/core"
+	"github.com/wcpe/jrp/core/internal/transport"
 	"github.com/wcpe/jrp/core/internal/wire"
 )
 
@@ -146,7 +147,7 @@ func serveFakeControlConn(conn net.Conn) {
 		if frame.Type.Name == wire.MessageTypeLogin.Name {
 			encoded, encodeErr := wire.EncodeV1Frame(wire.Frame{
 				Type:    wire.MessageTypeLoginResponse,
-				Payload: []byte(`{"ok":true}`),
+				Payload: []byte(`{"run_id":"test-run"}`),
 			})
 			if encodeErr != nil {
 				frame.Release()
@@ -590,5 +591,59 @@ func TestApplyRejectsMissingRevision(t *testing.T) {
 	var typed *core.ApplyError
 	if !errors.As(applyErr, &typed) || typed.Stage != core.StageValidate {
 		t.Fatalf("缺失 revision 应在 validate 阶段拒绝，实际 %v", applyErr)
+	}
+}
+
+// dialLoopbackTransportConn 返回一条真实的传输连接句柄，供「登记与停止互斥」用例使用。
+func dialLoopbackTransportConn(t *testing.T) *transport.Conn {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("监听回环端口失败：%v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	wrapped := transport.TakeOverListener(listener)
+	dialed, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("回环拨号失败：%v", err)
+	}
+	t.Cleanup(func() { _ = dialed.Close() })
+	accepted, _, err := wrapped.Accept(transport.PurposeWork, testApplyProxy)
+	if err != nil {
+		t.Fatalf("接受回环连接失败：%v", err)
+	}
+	t.Cleanup(func() { _ = accepted.Close() })
+	return accepted
+}
+
+// TestGenerationTrackRefusedAfterStop 固定「登记与停止互斥」这条契约。
+//
+// 曾经的实现只在拨号后复查一次停止标记，复查与登记之间要写网络（工作连接声明），
+// 落在该窗口里的连接会在本代清扫之后才进表：它挂着桥接 goroutine，使换代排空只能
+// 等满 drainTimeout（重载实测 200 次换代命中 24 次，Apply 从毫秒级变十秒级）。
+// 因此停止后登记必须被拒绝。
+func TestGenerationTrackRefusedAfterStop(t *testing.T) {
+	fixture := newClientFixture(t)
+	proxy := core.TCPProxy{Name: testApplyProxy, LocalAddr: fixture.target, RemotePort: 6155}
+	if _, err := fixture.engine.Apply(context.Background(), Deployment{Revision: 1, Config: fixture.snapshot(t, proxy)}); err != nil {
+		t.Fatalf("首次应用失败：%v", err)
+	}
+	gen := fixture.engine.activeGeneration()
+	waitForAnyConn(t, gen)
+
+	// 未停止：登记必须成功，否则维持循环的连接全都进不了表。
+	active := dialLoopbackTransportConn(t)
+	if !gen.trackIfActive(active) {
+		t.Fatal("未停止时登记应成功")
+	}
+	gen.untrack(active)
+	_ = active.Close()
+
+	gen.stop(false)
+
+	// 已停止：登记必须被拒绝，且调用方立即关闭该连接。
+	late := dialLoopbackTransportConn(t)
+	if gen.trackIfActive(late) {
+		t.Fatal("停止后登记必须被拒绝：否则连接会在清扫之后进表，让换代排空等满上限")
 	}
 }

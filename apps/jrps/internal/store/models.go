@@ -69,6 +69,12 @@ type Client struct {
 	TokenDigest     string `gorm:"size:128;uniqueIndex;not null"`
 	EnrollmentState string `gorm:"size:32;not null"`
 	ConnectionState string `gorm:"size:32;not null"`
+	// TokenCompat 是该客户端 token 的明文副本，专供官方 frpc 的鉴权材料复算
+	// （md5(token ∥ 时间戳)）使用：官方客户端只送摘要前处理材料，服务端必须持有
+	// 明文才能验证——这是 FR-03 规格登记的唯一例外（FR-07 摘要真源在数据面兼容
+	// 路径上的收窄）。该列只参与本地复算：管理面展示、日志、审计与本结构体的
+	// 读取视图一律走摘要前缀，绝不回显该列。
+	TokenCompat string `gorm:"size:128;not null;default:''"`
 	// DesiredRevision 是服务端为该客户端表达的期望版本，属持久状态。
 	DesiredRevision uint64
 	// ActiveRevision 是最近一次成功 publish 的 Apply 结果记录，仅供审计与展示（ADR-0012）。

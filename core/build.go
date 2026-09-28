@@ -14,7 +14,7 @@ func NewClientConfig(options ...ClientOption) (ClientConfig, error) {
 
 	config := ClientConfig{
 		clientID:     draft.clientID,
-		endpoint:     draft.endpoint,
+		endpoint:     cloneServerEndpoint(draft.endpoint),
 		auth:         draft.auth,
 		tcpProxies:   copySlice(draft.tcpProxies),
 		udpProxies:   copySlice(draft.udpProxies),
@@ -46,7 +46,7 @@ func NewServerConfig(options ...ServerOption) (ServerConfig, error) {
 	draft.withDefaults()
 
 	config := ServerConfig{
-		listen:        draft.listen,
+		listen:        cloneBindEndpoint(draft.listen),
 		wire:          draft.wire,
 		credentials:   copySlice(draft.credentials),
 		tcpBindings:   withCopiedTargets(draft.tcpBindings),
@@ -71,6 +71,20 @@ func NewServerConfig(options ...ServerOption) (ServerConfig, error) {
 
 // withCopiedTargets 深复制 TCP/UDP/HTTPS 绑定集合：逐条复制目标地址切片，
 // 使宿主持有的切片在构建后无法影响配置值。
+func cloneServerEndpoint(endpoint ServerEndpoint) ServerEndpoint {
+	endpoint.TransportConfig = cloneTransportConfig(endpoint.TransportConfig)
+	return endpoint
+}
+
+func cloneBindEndpoint(endpoint BindEndpoint) BindEndpoint {
+	endpoint.TransportConfig = cloneTransportConfig(endpoint.TransportConfig)
+	return endpoint
+}
+
+func cloneTransportConfig(config TransportConfig) TransportConfig {
+	return config
+}
+
 func withCopiedTargets[T interface {
 	withCopiedTargets() T
 }](bindings []T) []T {

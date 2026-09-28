@@ -114,6 +114,15 @@ tasks:
       - task: vet:jrps
       - task: vet:jrpc
       - node scripts/check-dependencies.mjs
+      - task: lint:privacy
+
+  lint:privacy:
+    desc: 扫描隐私信息（公网地址、私钥、凭据明文不得入库）
+    cmds:
+      # 实机验收会把服务器地址与凭据带到工作区，靠人记得不写进文档不牢靠：
+      # 本仓库就发生过一次，最后只能靠改写历史清除。文档只需拓扑描述即可支撑
+      # 结论，具体地址不提供信息量，却会泄露一台可定位的主机。
+      - node scripts/scan-privacy.mjs
 
   lint:web:
     desc: 检查 Web 格式与 ESLint 规则
@@ -186,7 +195,6 @@ tasks:
       - go test -run=^$ -fuzz=FuzzV1Frame -fuzztime=5s ./internal/wire/
       - go test -run=^$ -fuzz=FuzzV2Frame -fuzztime=5s ./internal/wire/
       - go test -run=^$ -fuzz=FuzzVersionDetection -fuzztime=5s ./internal/wire/
-
   test:web:
     desc: 运行 Web 测试
     cmds:
@@ -261,3 +269,27 @@ tasks:
     dir: apps/jrpc
     cmds:
       - go vet ./...
+
+  # 以下三项是 FR-03 的兼容性手工工具，不进 CI：
+  # 前两项需要官方 frpc 发行二进制（首次运行自动下载到忽略目录 .tmp/compat/bin），
+  # 最后一项面向真实网络目标，必须由执行者提供地址与凭据。
+  # 参数直接透传，用法见各脚本 --help 与 docs/OPERATIONS.md「官方 frpc 接入的实机验收批次」。
+  compat:matrix:
+    desc: 黑盒互操作矩阵（本机自建 jrps + 官方 frpc，手工工具）
+    cmds:
+      - node scripts/compat/run-matrix.mjs {{.CLI_ARGS}}
+
+  compat:link-fixtures:
+    desc: 链路夹具自测（反代升级透传、TCP/UDP 延迟与丢包、NAT 行为建模）
+    cmds:
+      - node scripts/compat/link-fixtures.mjs {{.CLI_ARGS}}
+
+  compat:real-network:
+    desc: 实机验收执行器（面向远端 jrps，需 --server 与凭据，--preflight-only 为只读预检）
+    cmds:
+      - node scripts/compat/real-network.mjs {{.CLI_ARGS}}
+
+  compat:nat-probe:
+    desc: NAT 探测（判定客户端侧映射方式；需两个以上 STUN 端点，--serve 为离线自测）
+    cmds:
+      - node scripts/compat/nat-probe.mjs {{.CLI_ARGS}}

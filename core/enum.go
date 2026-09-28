@@ -2,15 +2,30 @@ package core
 
 // Transport 是连接传输方式的具名枚举。
 //
-// 只定义已按各自功能规格交付的取值：KCP、QUIC、WebSocket、WSS 等取值待对应功能交付后加入，
-// 此处不预留空枚举。宿主不得用裸字符串字面量构造，避免拼写漂移。
+// 只定义已按各自功能规格交付的取值。宿主不得用裸字符串字面量构造，避免拼写漂移。
 type Transport string
 
-// TransportTCP 是 TCP 连接传输，对应 FR-05a。
-const TransportTCP Transport = "tcp"
+const (
+	// TransportTCP 是 TCP 连接传输，对应 FR-05a。
+	TransportTCP Transport = "tcp"
+	// TransportWebSocket 是明文 WebSocket 连接传输，对应 FR-05b。
+	TransportWebSocket Transport = "websocket"
+	// TransportWSS 是 TLS 加密的 WebSocket 连接传输，对应 FR-05b。
+	TransportWSS Transport = "wss"
+	// TransportKCP 是 KCP 可靠数据报连接传输，对应 FR-05c。
+	TransportKCP Transport = "kcp"
+	// TransportQUIC 是 QUIC 流连接传输，对应 FR-05c。
+	TransportQUIC Transport = "quic"
+)
 
 // supportedTransports 列出当前已交付的传输取值。
-var supportedTransports = []Transport{TransportTCP}
+var supportedTransports = []Transport{
+	TransportTCP,
+	TransportWebSocket,
+	TransportWSS,
+	TransportKCP,
+	TransportQUIC,
+}
 
 // WireVersion 是控制协议线上封装版本的具名枚举。
 //

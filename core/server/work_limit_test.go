@@ -259,6 +259,18 @@ func TestUnauthorizedTargetPathUntracksGuests(t *testing.T) {
 // assertGuestDropUntracks 发送越权声明并断言访客的记账被完整撤销。
 func assertGuestDropUntracks(t *testing.T, engine *Engine, controlAddr string) {
 	t.Helper()
+	// 先建立活跃控制会话：工作连接声明要求客户端有活跃会话（FR-03 §7.5），
+	// 否则会在"过期会话"分支被拒，触达不到越权释放路径。
+	session, err := net.Dial("tcp", controlAddr)
+	if err != nil {
+		t.Fatalf("建立控制会话失败：%v", err)
+	}
+	defer session.Close()
+	if _, err := session.Write(encodeTestLogin(t, "repro", "repro-token")); err != nil {
+		t.Fatalf("发送登录失败：%v", err)
+	}
+	readLoginResponse(t, session)
+
 	engine.mu.Lock()
 	before := len(engine.currentGeneration().conns)
 	engine.mu.Unlock()
