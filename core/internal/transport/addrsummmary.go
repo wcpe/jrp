@@ -4,8 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net"
-	"net/netip"
-	"strconv"
 	"strings"
 )
 
@@ -32,22 +30,4 @@ func summarizeAddr(address string) string {
 	}
 	digest := sha256.Sum256([]byte(trimmed))
 	return hex.EncodeToString(digest[:])[:8]
-}
-
-// addrKey 从地址串中解析出 IP 与端口，供需要区分"同地址不同端口"的场景使用。
-//
-// 解析失败返回原始串与端口 0，不报错：地址形态由传输层决定，摘要层不应因此失败。
-func addrKey(address string) (string, int) {
-	host, portText, err := net.SplitHostPort(address)
-	if err != nil {
-		return address, 0
-	}
-	port, err := strconv.Atoi(portText)
-	if err != nil {
-		return address, 0
-	}
-	if parsed, parseErr := netip.ParseAddr(host); parseErr == nil {
-		return parsed.String(), port
-	}
-	return host, port
 }

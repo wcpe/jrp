@@ -48,7 +48,7 @@ frp 以配置文件为中心，适合直接部署，但个人与小团队在多�
 | FR-04 | Core 支持 wire v1 与 wire v2，具备明确协商、降级和拒绝行为 | P1 | 已交付@0.1.0 |
 | FR-05a | 支持 TCP 连接传输（不引入第三方依赖） | P1 | 已交付@0.2.0 |
 | FR-05b | 支持 WebSocket 与 WSS 连接传输（依赖 `golang.org/x/net`，已获批准并已接入 Core） | P1 | 已交付@0.3.0 |
-| FR-05c | 支持 KCP 与 QUIC 连接传输（依赖 `kcp-go`、`quic-go`，已获批准并已接入 Core） | P1 | 开发中 |
+| FR-05c | 支持 KCP 与 QUIC 连接传输（依赖 `kcp-go`、`quic-go`，已获批准并已接入 Core） | P1 | 已交付@0.3.0 |
 | FR-06a | 支持 TCP、UDP、HTTP、HTTPS 四种代理模式 | P1 | 已交付@0.2.0 |
 | FR-06b | 支持 STCP 与 XTCP 代理，含访客连接与 NAT 打洞 | P1 | 计划 |
 | FR-07 | 每个客户端使用独立 token，支持创建、轮换、吊销和审计 | P1 | 开发中 |
