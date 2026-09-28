@@ -102,7 +102,7 @@ WebSocket 需要占用一个 HTTP 入口的升级路径。设计选择：
 - [x] 校验传输抽象签名未泄漏第三方类型；适配器竞态测试通过
 - [x] 以固定基线官方 frpc 执行 WebSocket/WSS 黑盒矩阵：登录与 TCP 代理端到端回显在 wire v1/v2 下各 4/4 通过（升级路径 `/~!frp` 与官方客户端一致）
 - [x] 运行 Core 测试与 `go test -race ./internal/transport`
-- [ ] 完成公网/反向代理实机验收后同步最终交付状态
+- [x] 完成公网/反向代理实机验收后同步最终交付状态：公网批次（2026-09-27）在原生公网地址的 Linux 服务端与 NAT 后的 Windows 客户端之间完成，WebSocket × wire v1/v2 全部通过；反向代理由真实 nginx 1.28.3 在三种拓扑（L4 stream 透传、L7 明文、L7 终结 TLS）下实测。
 
 ## 5. 验收标准
 
