@@ -1,6 +1,6 @@
 # 功能规格：无中断配置应用
 
-> 状态：开发中（jrps 侧已交付，jrpc 侧随 FR-08） · 关联 PRD：FR-10 · 分支：feature/zero-interruption-config-apply
+> 状态：开发中（jrps 侧已交付@0.3.0，jrpc 侧随 FR-08） · 关联 PRD：FR-10 · 分支：feature/zero-interruption-config-apply
 
 ## 1. 背景与目标
 

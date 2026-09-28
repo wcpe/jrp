@@ -1,6 +1,6 @@
 # 功能规格：单管理员认证
 
-> 状态：草拟 · 关联 PRD：FR-02 · 分支：feature/single-admin-auth
+> 状态：已交付@0.3.0 · 关联 PRD：FR-02/FR-07 · 分支：feature/single-admin-auth
 
 ## 1. 背景与目标
 

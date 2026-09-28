@@ -1,6 +1,6 @@
 # 功能规格：客户端令牌管理
 
-> 状态：草拟 · 关联 PRD：FR-07 · 分支：feature/client-token-management
+> 状态：开发中（主体已交付，一条验收标准随 FR-08 补验） · 关联 PRD：FR-07 · 分支：feature/client-token-management
 
 ## 1. 背景与目标
 

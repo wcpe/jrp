@@ -51,12 +51,12 @@ frp 以配置文件为中心，适合直接部署，但个人与小团队在多�
 | FR-05c | 支持 KCP 与 QUIC 连接传输（依赖 `kcp-go`、`quic-go`，已获批准并已接入 Core） | P1 | 已交付@0.3.0 |
 | FR-06a | 支持 TCP、UDP、HTTP、HTTPS 四种代理模式 | P1 | 已交付@0.2.0 |
 | FR-06b | 支持 STCP 与 XTCP 代理，含访客连接与 NAT 打洞 | P1 | 计划 |
-| FR-07 | 每个客户端使用独立 token，支持创建、轮换、吊销和审计 | P1 | 开发中 |
+| FR-07 | 每个客户端使用独立 token，支持创建、轮换、吊销和审计 | P1 | 开发中（主体已交付，鉴权失败审计随 FR-08 补验） |
 | FR-08 | jrpc 通过独立 HTTPS/WSS 管理通道 enrollment 并接收版本化 desired state | P1 | 计划 |
 | FR-09 | jrps 与 jrpc 分别以 SQLite 保存配置、revision 与必要运行元数据 | P1 | 已交付@0.1.0 |
-| FR-10 | 配置按 prepare、health-check、atomic publish、drain 无中断应用，失败保留 last-good | P1 | 开发中 |
+| FR-10 | 配置按 prepare、health-check、atomic publish、drain 无中断应用，失败保留 last-good | P1 | 开发中（jrps 侧已交付@0.3.0，jrpc 侧随 FR-08） |
 | FR-11 | 提供单管理员 React Web 管理客户端、代理、配置版本、采集与通知 | P1 | 计划 |
-| FR-12 | 记录请求与运行日志，并对敏感凭证和正文实施脱敏与访问控制 | P1 | 开发中 |
+| FR-12 | 记录请求与运行日志，并对敏感凭证和正文实施脱敏与访问控制 | P1 | 开发中（运行日志通道已交付@0.3.0，请求日志随 FR-13，双平台实机需用户） |
 | FR-13 | 仅对明文 HTTP 按代理开启正文采集，元数据存 SQLite、正文存压缩分段文件 | P1 | 计划 |
 | FR-14 | 提供客户端、代理、连接、流量、错误、配置应用和采集容量监控 | P1 | 计划 |
 | FR-15 | 支持 Webhook 与邮件通知，通知副作用在事务提交后触发 | P1 | 已交付@0.2.0 |
