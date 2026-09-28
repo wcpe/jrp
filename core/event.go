@@ -315,6 +315,36 @@ func (event ApplyResultEvent) Published() bool {
 	return event.Stage == StageApplied || event.Stage == StageDrained
 }
 
+// PeerMigrated 事件：传输层观测到对端地址发生变化（规格 §3.3/§3.6）。
+//
+// 只承载**脱敏后的地址摘要**而非完整地址：事件用于观测与告警，完整地址会把
+// 网络拓扑带进事件流，既无必要也会泄露可定位信息。摘要足以区分"是否变化"与
+// "变化成什么"。
+//
+// 身份判定不依赖本事件：对端身份由会话层鉴权在登录时确定并绑定运行 ID，地址
+// 变化不改变身份，因此地址伪装无法被当作合法身份。
+//
+// 注意 Purpose 在此是 Core 自有值类型，不复用 internal/transport.Purpose——后者
+// 未导出且属传输包内部，公共事件载荷不得依赖它。
+type PeerMigrated struct {
+	EventMeta
+	// Purpose 是发生迁移的连接用途。
+	Purpose string
+	// Proxy 是工作连接绑定的代理名；控制连接为空字符串。
+	Proxy string
+	// Previous 是迁移前的对端地址摘要。
+	Previous string
+	// Current 是迁移后的对端地址摘要。
+	Current string
+}
+
+// Type 返回事件类型标识。
+func (PeerMigrated) Type() Type { return "peer-migrated" }
+
+// Level 返回事件等级：迁移本身不是故障（QUIC 的设计目标就是抗路径变化），
+// 但它是运维需要看见的路径变化，故为常规级。
+func (PeerMigrated) Level() Level { return LevelNormal }
+
 // State 是只读状态快照（规格 §3.5）。
 //
 // 返回值为深复制：宿主修改返回值不影响 Core，Core 后续变化也不影响已取到的值。

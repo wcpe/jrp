@@ -174,6 +174,11 @@ type Engine struct {
 
 	// events 是事件中枢：承载订阅登记与事件发布（FR-27）。
 	events *core.EventHub
+	// migrationObserver 把传输层的对端地址迁移转成 Core 事件（规格 §3.6）。
+	//
+	// 只观测不决策：对端身份由会话层鉴权在登录时确定并绑定运行 ID，地址变化
+	// 不改变身份，因此地址伪装无法被当作合法身份。
+	migrationObserver transport.MigrationObserver
 	// controlClients 记录控制连接的客户端标识：登录成功时登记，供状态快照聚合。
 	controlClients map[*transport.Conn]string
 	// officialSessions 是官方形态控制会话的登记（clientID → 会话写出通道与运行 ID）。
@@ -236,6 +241,16 @@ func New(config core.ServerConfig, options ...Option) *Engine {
 		controlClients:   make(map[*transport.Conn]string),
 		officialSessions: make(map[string]officialControlSession),
 		sessionRunIDs:    make(map[string]string),
+	}
+	// 迁移观测挂在引擎上：传输层只产出迁移事实，是否发布成事件由引擎决定。
+	engine.migrationObserver = func(migration transport.Migration) {
+		engine.events.Publish(core.PeerMigrated{
+			Purpose:   migration.Purpose.String(),
+			Proxy:     migration.Proxy,
+			Previous:  migration.Previous,
+			Current:   migration.Current,
+			EventMeta: core.NewEventMeta(),
+		})
 	}
 	for _, option := range options {
 		option(engine)
@@ -1029,6 +1044,9 @@ func (engine *Engine) serveControl(listener *transport.Listener) {
 			continue
 		}
 		engine.controlWG.Add(1)
+		// 迁移观测只对支持迁移的传输生效（QUIC）；其余传输的地址在连接生命周期内
+		// 固定，注册只是空转。
+		conn.SetMigrationObserver(engine.migrationObserver)
 		go engine.handleControl(gen, conn)
 	}
 }

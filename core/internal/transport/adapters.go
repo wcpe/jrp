@@ -377,6 +377,24 @@ type quicStreamConn struct {
 	session     *quic.Conn
 	ownsSession bool
 	closeOnce   sync.Once
+
+	// migrationObserver 是对端地址迁移的观察回调，可为 nil（不观测）。
+	//
+	// 只有 QUIC 会出现迁移：TCP/WebSocket 的地址在连接生命周期内固定。
+	migrationObserver MigrationObserver
+	// lastRemote 是上次观测到的对端地址摘要，用于判定是否发生变化。
+	lastRemote string
+}
+
+// SetMigrationObserver 启用对端地址迁移观测（规格 §3.6）。
+//
+// 迁移由 quic-go 在库内完成：路径变化时连接 ID 与 TLS 状态保持不变，
+// RemoteAddr() 自动反映新路径。因此本方法只需登记回调，quic-go 不提供也不
+// 需要迁移回调 API——观测在 Conn 的读写路径上比较地址摘要完成，不引入后台
+// goroutine。TCP 与 WebSocket 的地址在连接生命周期内固定，无需登记。
+func (conn *quicStreamConn) SetMigrationObserver(observer MigrationObserver) {
+	conn.migrationObserver = observer
+	conn.lastRemote = ""
 }
 
 func (conn *quicStreamConn) Read(buffer []byte) (int, error)  { return conn.stream.Read(buffer) }

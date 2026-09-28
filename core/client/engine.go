@@ -307,6 +307,8 @@ func (engine *Engine) commitRunning(control *controlSession, gen *generation) {
 // 它们归 Engine 而不是某一代：控制会话跨代存活，换代不重拨控制连接。
 func (engine *Engine) startControl(control *controlSession) {
 	engine.controlWG.Add(2)
+	// 迁移观测挂在控制会话上：控制连接跨代存活，换代不重拨，因此只需注册一次。
+	control.conn.SetMigrationObserver(engine.observeMigration)
 	go engine.serveControl(control)
 	go engine.heartbeatLoop(control)
 }
@@ -689,6 +691,19 @@ type controlSession struct {
 	mu sync.Mutex
 	// runID 是本会话的运行 ID：登录成功后由服务端分配，工作连接声明需回传它。
 	runID string
+}
+
+// observeMigration 把传输层的对端地址迁移转成 Core 事件（规格 §3.6）。
+//
+// 只观测不决策：对端身份由登录时的会话层鉴权决定，地址变化不改变身份。
+func (engine *Engine) observeMigration(migration transport.Migration) {
+	engine.events.Publish(core.PeerMigrated{
+		Purpose:   migration.Purpose.String(),
+		Proxy:     migration.Proxy,
+		Previous:  migration.Previous,
+		Current:   migration.Current,
+		EventMeta: core.NewEventMeta(),
+	})
 }
 
 // loginControl 在控制连接上完成登录握手。
