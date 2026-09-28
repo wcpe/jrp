@@ -1,6 +1,6 @@
 # 功能规格：KCP 与 QUIC 连接传输
 
-> 状态：草拟 · 关联 PRD：FR-05c · 分支：feature/transport-kcp-quic
+> 状态：已交付@0.3.0 · 关联 PRD：FR-05c · 分支：feature/transport-kcp-quic
 
 ## 1. 背景与目标
 
