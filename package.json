@@ -16,8 +16,8 @@
     "typecheck": "turbo run typecheck"
   },
   "devDependencies": {
-    "prettier": "3.9.5",
-    "turbo": "2.10.13"
+    "prettier": "3.9.9",
+    "turbo": "2.11.6"
   },
   "prettier": {
     "printWidth": 100,
